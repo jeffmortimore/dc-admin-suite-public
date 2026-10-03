@@ -1,0 +1,33 @@
+{
+  "README": [
+    "The institution profile: what makes an install 'ours'. It supplies the",
+    "DEFAULTS behind config/settings.json — what a first launch starts from,",
+    "and what 'Reset to default branding' restores.",
+    "",
+    "THIS file is the shipped example and is deliberately neutral: it names",
+    "no institution, so a fresh install of the suite belongs to nobody until",
+    "someone says otherwise. To set an institution up, copy a filled-in",
+    "profile to config/profile.json (see profiles/ for a ready-made one) and",
+    "restart the shell; config/ is gitignored, so your copy stays local.",
+    "",
+    "Everything here can also be edited in the UI (splash Step 1 and the",
+    "Settings page) — the profile is only what those start from.",
+    "",
+    "NOT here on purpose: the Crossref DEPOSIT IDENTITY (depositor name and",
+    "email, registrant, publisher). A deposit credited to the wrong",
+    "organization is hard to notice and awkward to undo, so it is never a",
+    "default — set it in Settings > Crossref deposit identity."
+  ],
+  "base_url": "",
+  "crossref_prefix": "",
+  "branding": {
+    "suite_name": "DC Admin Suite",
+    "institution": "",
+    "logo": "",
+    "colors": {
+      "primary": "#1F4E79",
+      "accent": "#946B2D",
+      "neutral": "#9AA5AD"
+    }
+  }
+}

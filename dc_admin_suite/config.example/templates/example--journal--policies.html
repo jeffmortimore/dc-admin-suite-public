@@ -1,0 +1,37 @@
+<!-- DC-TEMPLATE
+status: Active
+structures: Journal
+field: Policies
+-->
+<!-- REQUIRED : Menu heading. -->
+<h3>Contents</h3>
+<ul>
+<li><a href="#open">Open Access Policy</a></li>
+<li><a href="#accessibility">Accessibility Requirements</a></li>
+<li><a href="#copyright">Copyright &amp; Licensing Terms</a></li>
+{{<li><a href="#charges">Charges &amp; Fees</a></li>}}
+</ul>
+
+<!-- REQUIRED : Open Access Policy. -->
+<h3 id="open">Open Access Policy</h3>
+<p>{{The }}<cite><macro publication.title></macro></cite> {{is an open-access journal; describe your institution's open-access terms here.}}</p>
+
+<!-- REQUIRED : Accessibility Requirements. Adjust the standard cited below to match your institution's policy. -->
+<h3 id="accessibility">Accessibility Requirements</h3>
+<p>By submitting their work, author(s) must affirm that:</p>
+<ol><!-- Begin parent -->
+<li>{{The work has been reviewed against [Your Institution]'s accessibility requirements.}}</li>
+<li>The work makes a good-faith effort to meet the <a href="https://www.w3.org/TR/WCAG21/" target="_blank" rel="noopener noreferrer">Web Content Accessibility Guidelines (WCAG) 2.1, Level AA (opens in new tab)</a>.</li>
+</ol><!-- End parent -->
+
+<!-- REQUIRED : Copyright & Licensing Terms. -->
+<h3 id="copyright">Copyright &amp; Licensing Terms</h3>
+<p>All works published in {{the }}<cite><macro publication.title></macro></cite> are made available under a <a href="{{[Your license URL]}}" target="_blank" rel="noopener noreferrer">{{[Your license name]}} (opens in new tab)</a>.</p>
+
+<!-- CONDITIONAL : Charges & Fees, required only if the journal charges any fee. -->
+{{<h3 id="charges">Charges &amp; Fees</h3>
+<p>Describe any submission, publication, or processing charges, or state that there are none.</p>}}
+
+<!-- REQUIRED : "Need Help" section. Replace the bracketed link with your own. -->
+<h3>Need Help?</h3>
+<p>Have a question about this policy, or need this content in an accessible format? <a href="[Your accessibility request form or contact page URL]" target="_blank" rel="noopener noreferrer">Contact us (opens in new tab)</a>.</p>

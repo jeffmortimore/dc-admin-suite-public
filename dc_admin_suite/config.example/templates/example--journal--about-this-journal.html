@@ -1,0 +1,16 @@
+<!-- DC-TEMPLATE
+status: Active
+structures: Journal
+field: About this Journal
+-->
+<!-- REQUIRED : Short description of the journal. -->
+<p>{{The }}<cite><macro publication.title></macro></cite> {{is a [peer-reviewed / open-access] journal publishing work on [subject area].}}</p>
+
+<!-- OPTIONAL : Indexing / abstracting services. -->
+{{<p>This journal is indexed in [indexing service names].</p>}}
+
+<!-- REQUIRED : Cross-link to the other journal pages. -->
+<p>For more about {{the }}<cite><macro publication.title></macro></cite>, <a href="<macro publication.link>/aimsandscope.html">visit the Aims &amp; Scope page</a>. For journal policies and submission guidelines, <a href="<macro publication.link>/policies.html">visit the Policies page</a>.</p>
+
+<!-- CONDITIONAL : ISSN, required once one has been assigned. -->
+{{<p>ISSN: [XXXX-XXXX]</p>}}

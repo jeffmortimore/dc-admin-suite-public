@@ -1,0 +1,31 @@
+# Runtime configuration (created on first launch; contains your instance
+# URL, branding, journal registry, and templates — never commit it)
+config/
+dc_admin_suite/config/
+
+# Removed modules parked by the Settings page
+modules/_removed/
+dc_admin_suite/modules/_removed/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Working backups kept beside the suite, not part of the product
+# (make_distribution.py skips these too)
+dc_admin_suite/_backup*/
+_backup*/
+_to_delete/
+
+# Module run artifacts written into the suite folder
+DC_*.xlsx
+DC_*.xml
+DC_*.log
+DC_ImageDescriptions_*/
+DC_OCR_Output_*/
+DC_FileDownloads_*/

@@ -1,0 +1,103 @@
+# Identity refactor Step 5. The four checks below were run by hand at every
+# release and all passed every time — that was never the problem. The problem
+# was the generic distribution, which nobody re-ran anything against: it
+# drifted for six weeks, lost four modules and a whole subsystem, and no one
+# found out until an audit. CI is what would have caught that.
+#
+# So this runs the release checklist on every push, and adds the one check
+# that speaks to how the drift happened: a --generic build must still come out
+# clean, or the build fails.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: dc_admin_suite
+    # bash on every runner. PowerShell has no heredoc, so the
+    # inline `python - <<'PY'` steps are a parse error on Windows —
+    # and a portability check that runs different commands per
+    # platform is not the check it claims to be.
+    shell: bash
+
+jobs:
+  checks:
+    name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the floor the project brief promises; the newest is what
+        # most people will actually have. A break at either end is worth
+        # knowing about before staff hit it.
+        python-version: ["3.9", "3.13"]
+        # The brief promises Windows and macOS. Nothing has ever
+        # tested the Windows half — not CI, not a live run.
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Install what the verification suites need
+        # The suite's shell is pure standard library; these are third-party
+        # dependencies of the modules under test — bs4 for the downloader's
+        # listing parsers, openpyxl for the report round-trips.
+        run: python -m pip install --quiet beautifulsoup4 openpyxl
+
+      - name: Compile every file
+        run: python -m compileall -q app modules launch.py docs
+
+      - name: Batch File Downloader verification
+        # No version and no test count in these step names: both were
+        # hand-maintained numbers, and the filenames they pointed at had
+        # already drifted two releases. Each suite prints the version it
+        # read from MANIFEST along with its own count.
+        run: python modules/_verify_file_downloader.py
+
+      - name: Image Description Generator verification
+        run: python modules/_verify_image_describer.py
+
+      - name: OCR & Accessibility Toolkit verification
+        # No pymupdf/pikepdf/ocrmypdf here on purpose: the module imports
+        # them lazily inside the functions that need them, and this suite
+        # stubs them, so the check stays cheap and keeps that laziness
+        # honest.
+        run: python modules/_verify_ocr_toolkit.py
+
+      - name: Served pages parse, and their element ids exist
+        run: python modules/_verify_pages.py
+
+      - name: Every module still scans
+        # The shell reads each MANIFEST with ast; a malformed one takes the
+        # module off the Main Menu without any other symptom.
+        run: |
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, ".")
+          from app import module_registry
+          mods = module_registry.scan_modules()
+          bad = [m for m in mods if m.get("error")]
+          for m in mods:
+              print("  %-24s v%-5s %s" % (m["id"], m["version"], m["error"] or "ok"))
+          if bad or len(mods) != 10:
+              print("FAIL: %d module(s) scanned, %d with errors" % (len(mods), len(bad)))
+              sys.exit(1)
+          print("all %d modules scan clean" % len(mods))
+          PY
+      - name: The documents describe the code that is here
+        run: python docs/check_docs.py
+      - name: A shareable build is still clean
+        # In the public copy: no named profile, so --staff, which still
+        # fails on any API key, session file or cache in the copy.
+        run: python docs/make_distribution.py --staff --out "${{ runner.temp }}/staff-${{ matrix.python-version }}"

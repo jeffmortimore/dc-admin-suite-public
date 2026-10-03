@@ -1,0 +1,27 @@
+<!-- DC-TEMPLATE
+status: Active
+structures: Book Gallery | Community | ETD | Event Community | Image Gallery | Journal | Series
+field: Introduction
+-->
+<!-- REQUIRED : Heading. The h2 must be the first element in the field. -->
+<h2>{{About <cite><macro publication.title></macro></cite>}}</h2>
+{{<!-- Write a short introduction to this collection here. -->}}
+
+<!-- OPTIONAL : A short list of highlights or featured items. -->
+{{<h3>Highlights</h3>
+<ul>
+<li>Replace this with a featured item, or delete this section.</li>
+</ul>}}
+
+<!-- REQUIRED : "Need Help" section. Replace the bracketed link with your own. -->
+<h3>Need Help?</h3>
+<p>Have a question, or need this content in an accessible format? <a href="[Your accessibility request form or contact page URL]" target="_blank" rel="noopener noreferrer">Contact us (opens in new tab)</a>.</p>
+
+<!-- CONDITIONAL : Readership Activity Map description, required only if a map is enabled for this structure. -->
+<div id="map-accessibility-info">
+{{<h3>Readership Activity Map Description</h3>
+<p>Describe what the map shows, and where the same statistics appear in text form.</p>}}
+</div>
+
+<!-- REQUIRED : Empty magic element. -->
+<magic ignore></magic>
