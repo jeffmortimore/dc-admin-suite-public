@@ -102,7 +102,7 @@ MANIFEST = {
     "id": "image-describer",
     "name": "Image Description Generator",
     "description": "Generate reviewable alt-text and transcription sidecar files for folders of scanned images, using a Gemini, OpenAI, or Claude endpoint.",
-    "version": "1.7.0",
+    "version": "1.8.0",
     "requires": ["openpyxl", "pymupdf"],
 }
 
@@ -168,7 +168,7 @@ DEFAULT_MAX_DIM = 2000
 # the long edge is bandwidth paid for and tokens not counted.
 #
 # These are SHOWN, not applied: the shipped default stays 2000 px until the
-# A/B on the densest pages in the Jesuits corpus says small print survives
+# A/B on the densest archival pages says small print survives
 # the cut. Transcription quality on this material is the product.
 RECOMMENDED_MAX_DIM = {"gemini": 1536, "anthropic": 1470, "openai": 2000}
 MAX_SEND_BYTES = 3_500_000  # re-encode anything larger than this
@@ -363,13 +363,6 @@ FACTORY_PROFILES = [
                         "manuscripts, and catalogue cards."),
         "prompt": ARCHIVAL_PROMPT,
         "max_alt_chars": 125,
-        # 8,000, not the 4,000 this shipped with. On a thinking model the
-        # ceiling counts the reasoning trace as well as the answer, and the
-        # reasoning is NOT in the output figure the report shows — so a run
-        # can look like it has 40% headroom while pages are being refused.
-        # Four of the 78 Jesuits scans hit 4,000 that way; the worst needed
-        # somewhere past it while showing only ~2,180 tokens of visible text.
-        "max_tokens": 8000,
     },
     {
         "name": "Alt text only",
@@ -388,27 +381,52 @@ FACTORY_PROFILES = [
             "that text into the description. Do not invent detail that is "
             "not visible."),
         "max_alt_chars": 125,
-        # A ceiling matched to the job. Archival needs room for a dense
-        # page; one alt sentence does not, and a model that misreads the
-        # instruction should not be able to spend 4,000 output tokens on a
-        # blank endpaper.
-        "max_tokens": 300,
     },
 ]
 
 # The ceiling the request builders fall back to when none is supplied.
 DEFAULT_MAX_TOKENS = 4000
-# What a profile that predates the field should get. A factory profile is
-# backfilled to ITS factory value rather than the generic default, so an
-# untouched "Alt text only" saved before v1.3 comes back with the 300-token
-# ceiling the release exists to give it — this fills in a field that never
-# had a value, so nothing the user chose is being overridden.
-_FACTORY_MAX_TOKENS = {p["name"]: p["max_tokens"] for p in FACTORY_PROFILES}
+# The REPLY LIMIT is a setting of the run, on the job form, not of the
+# profile (1.0.1, decided after a measurement on a managed computer). On a
+# thinking model the limit counts the reasoning trace as well as the
+# answer, and the trace varies a great deal: one short alt text took 199
+# thinking tokens in one run and 877 on the SAME image, profile and model
+# minutes later. A limit set near typical consumption therefore fails
+# unpredictably - the factory "Alt text only" at 300 refused 6 of 8 images
+# in one run and 0 of 8 at 2,000 in the next. So the default is generous,
+# and the operator can lower it for a first run and adjust it between runs
+# on the form, where a run's settings belong. A profile saved by an older
+# version may still carry a max_tokens key; it is ignored and dropped on
+# the next save.
+DEFAULT_REPLY_LIMIT = 8000
 MIN_MAX_TOKENS = 64
 # The validator, not the provider, was the binding constraint once the
 # Archival default moved to 8,000. Gemini 3.x and Claude both accept far
 # more than this; the cap exists to catch a typo, not to ration output.
 MAX_MAX_TOKENS = 32000
+
+
+def parse_reply_limit(raw):
+    """(limit, error) for the job form's Reply limit. ONE function, called by
+    /api/start and /api/preview alike (contract 11). Absent from the request
+    means the default; present but blank or out of range is an error that
+    names the field."""
+    if raw is None:
+        return DEFAULT_REPLY_LIMIT, ""
+    field = "Reply limit (output tokens)"
+    if str(raw).strip() == "":
+        return None, ("{} is empty - enter a number from {} to {:,} "
+                      "({:,} suits most runs).".format(
+                          field, MIN_MAX_TOKENS, MAX_MAX_TOKENS,
+                          DEFAULT_REPLY_LIMIT))
+    try:
+        limit = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None, "{} must be a whole number of tokens.".format(field)
+    if not MIN_MAX_TOKENS <= limit <= MAX_MAX_TOKENS:
+        return None, ("{} must be between {} and {:,}.".format(
+            field, MIN_MAX_TOKENS, MAX_MAX_TOKENS))
+    return limit, ""
 
 DEFAULT_PROFILE_CONFIG = {"profiles": FACTORY_PROFILES,
                           "default": "Archival"}
@@ -472,11 +490,6 @@ def backfill_profiles(cfg, migrate=False) -> dict:
             budget = 125
         prompt = str(p.get("prompt", ""))
         name = str(p.get("name", "")).strip()
-        fallback = _FACTORY_MAX_TOKENS.get(name, DEFAULT_MAX_TOKENS)
-        try:
-            ceiling = int(p.get("max_tokens", fallback))
-        except (TypeError, ValueError):
-            ceiling = fallback
         # The factory Archival prompt, and ONLY the factory Archival prompt,
         # is upgraded in place. The comparison is byte-exact: anything the
         # user has touched — including by a single space — is left alone and
@@ -492,7 +505,6 @@ def backfill_profiles(cfg, migrate=False) -> dict:
             "description": str(p.get("description", "")).strip(),
             "prompt": prompt,
             "max_alt_chars": budget,
-            "max_tokens": ceiling,
         })
     names = [p["name"] for p in out["profiles"]]
     out["default"] = default if default in names else (names[0] if names
@@ -569,15 +581,6 @@ def validate_profiles(cfg) -> str:
         if not 40 <= budget <= 500:
             return ("Profile '{}': alt-text limit must be between 40 and "
                     "500 characters.".format(name))
-        try:
-            ceiling = int(p.get("max_tokens", DEFAULT_MAX_TOKENS))
-        except (TypeError, ValueError):
-            return ("Profile '{}': the reply limit must be a number of "
-                    "tokens.".format(name))
-        if not MIN_MAX_TOKENS <= ceiling <= MAX_MAX_TOKENS:
-            return ("Profile '{}': the reply limit must be between {} and "
-                    "{} tokens.".format(name, MIN_MAX_TOKENS,
-                                        MAX_MAX_TOKENS))
     default = str(cfg.get("default", "")).strip()
     if default and default not in [str(p.get("name", "")).strip()
                                    for p in cfg["profiles"]]:
@@ -695,7 +698,8 @@ def find_endpoint(cfg: dict, name: str):
 #          prompt-prefix caching
 #     1.3  early-stop detection (finishReason / stop_reason / finish_reason)
 #     1.4  reasoning-trace tokens captured as usage["think"]
-AI_CLIENT_VERSION = "1.4"
+#     1.5  billed usage carried on AIError; retries sum every attempt
+AI_CLIENT_VERSION = "1.5"
 
 def _int(value) -> int:
     try:
@@ -762,8 +766,8 @@ def normalize_usage(kind, usage) -> dict:
 # This is a different failure from the dropped connection v1.1 was written
 # for, and it defeated that guard completely. Gemini has no stream
 # terminator, so `done` is true from the first byte and a tidy EOF after an
-# early stop is indistinguishable from a finished reply. In the 78-image
-# Jesuits run of 2026-09-02 that cost seven pages: every one ended mid-word,
+# early stop is indistinguishable from a finished reply. In one 78-image
+# archival run that cost seven pages: every one ended mid-word,
 # every one was written to disk, and the report called all of them
 # "Described" with zero warnings.
 _NORMAL_STOP = {
@@ -838,6 +842,11 @@ class AIError(Exception):
         self.status = status
         self.transient = transient
         self.retry_after = None
+        # Client 1.5: what the provider reported billing for this request
+        # (or for every attempt, once ai_generate_with_retry gives up), so a
+        # failed row can record what it cost. None means "not reported".
+        self.usage = None
+        self.retries = 0
 
 
 class FileError(Exception):
@@ -1113,10 +1122,12 @@ def ai_generate(ep, prompt, image_bytes=None, image_mime="image/png",
         # and retrying it four times only spends the backoff. The row fails
         # with the provider's own reason in it, which is what tells a user
         # to escalate this page rather than re-run it.
-        raise AIError(
+        err = AIError(
             "The endpoint stopped generating early after {} characters "
             "(the provider gave the reason '{}'), so the reply is "
             "incomplete".format(len(text), finish))
+        err.usage = normalize_usage(kind, usage)     # billed all the same
+        raise err
     if not done:
         # Cut off mid-answer. Retry rather than save a truncated
         # transcription that looks complete but stops in the middle.
@@ -1124,10 +1135,21 @@ def ai_generate(ep, prompt, image_bytes=None, image_mime="image/png",
                       "(stream ended without a completion signal)"
                       .format(len(text)))
         err.transient = True
+        err.usage = normalize_usage(kind, usage)
         raise err
     if not text.strip():
-        raise AIError("The endpoint returned an empty reply")
+        err = AIError("The endpoint returned an empty reply")
+        err.usage = normalize_usage(kind, usage)
+        raise err
     return text, normalize_usage(kind, usage)
+
+
+def sum_usage(total, more):
+    """Sum two normalised usage dicts; None counts as nothing reported."""
+    out = dict(total or {"in": 0, "out": 0, "think": 0, "cache_read": 0})
+    for k, v in (more or {}).items():
+        out[k] = out.get(k, 0) + _int(v)
+    return out
 
 
 # HTTP statuses worth waiting out: rate limit, and the various "busy"
@@ -1152,16 +1174,24 @@ def ai_generate_with_retry(ep, prompt, image_bytes, image_mime,
     or immediately for an error retrying cannot fix (bad key, bad model).
     sleep_fn must honour Pause/Stop so a backoff never blocks the UI.
     """
+    # Client 1.5: usage is the SUM over every attempt the provider reported
+    # on, success or failure, because each one was billed. Before, a retried
+    # success reported only its last attempt and a failure reported nothing.
     wait = BACKOFF_START
     attempt = 0
+    billed = None
     while True:
         try:
             text, usage = ai_generate(ep, prompt, image_bytes, image_mime,
                                       timeout=timeout,
                                       max_tokens=max_tokens)
-            return text, usage, attempt
+            return text, sum_usage(billed, usage), attempt
         except AIError as e:
+            if e.usage is not None:
+                billed = sum_usage(billed, e.usage)
             if not is_retryable(e) or attempt >= max_retries:
+                e.usage = billed
+                e.retries = attempt
                 raise
             attempt += 1
             pause = getattr(e, "retry_after", None) or wait
@@ -1268,7 +1298,7 @@ _ARTIFACT_RE = re.compile(r"^DC_[A-Za-z]+_?.*\.(xlsx|txt|xml)$", re.I)
 
 # A DC context slug: lowercase, no spaces. Used to decide whether a folder
 # name is safe to record as a Context ID — digitization folders are commonly
-# named for the structure they came from (jesuit-gallery19/), but an ordinary
+# named for the structure they came from (photo-gallery19/), but an ordinary
 # folder of photos ("Scans May 2026") must not be mistaken for one.
 _CTX_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,60}$")
 # Article ID as written by the download tools: an explicit _article_NNNN, or
@@ -1563,6 +1593,19 @@ def build_sidecar(entry, sections, ep, profile_name, generated):
 _UNCERTAIN_RE = re.compile(r"^\s*Uncertain\s*:\s*(.*)$", re.I | re.M)
 
 
+# A reply sometimes echoes the label ("Uncertain: Uncertain: None."). The
+# echo is the label, not a reading: strip every leading repeat before the
+# value is judged, or "None" is counted as a listed doubt. Duplicated in
+# both AI modules (the image describer and the OCR toolkit) - change both.
+_UNCERTAIN_ECHO_RE = re.compile(r"^(?:uncertain[ \t]*:[ \t]*)+", re.I)
+
+
+def uncertain_said(raw: str) -> str:
+    """The text after "Uncertain:", whitespace-collapsed, echoed labels
+    removed. One function both modules call (see the comment above)."""
+    return _UNCERTAIN_ECHO_RE.sub("", " ".join((raw or "").split())).strip()
+
+
 def extract_alt(sections: dict) -> str:
     return " ".join((sections.get("ALT TEXT") or "").split())
 
@@ -1574,7 +1617,7 @@ def uncertain_state(sections: dict) -> str:
     m = _UNCERTAIN_RE.search(sections.get("NOTES") or "")
     if not m:
         return "absent"
-    text = " ".join(m.group(1).split())
+    text = uncertain_said(m.group(1))
     return "none" if text.rstrip(".").strip().lower() == "none" else "listed"
 
 
@@ -1582,7 +1625,7 @@ def extract_uncertain(sections: dict) -> str:
     m = _UNCERTAIN_RE.search(sections.get("NOTES") or "")
     if not m:
         return ""
-    text = " ".join(m.group(1).split())
+    text = uncertain_said(m.group(1))
     return "" if text.rstrip(".").strip().lower() == "none" else text
 
 
@@ -1697,8 +1740,8 @@ SHORT_TRANSCRIPTION_RATIO = 0.40
 # marginalia or mirrored show-through, is a claim worth checking rather than
 # a green light.
 #
-# INCOMPLETE REPLY is the structural one, and it is the flag the 78-image run
-# of 2026-09-02 proved was missing: seven replies stopped mid-sentence before
+# INCOMPLETE REPLY is the structural one, and it is the flag a 78-image run
+# proved was missing: seven replies stopped mid-sentence before
 # writing their NOTES, and neither of the other two flags could see them —
 # they were the LONGEST rows in the run, so nothing median-relative applied,
 # and they had no "Uncertain: None." to be suspicious of. The client now
@@ -1752,7 +1795,7 @@ REVIEW_NOTE = [
     "· Alt text over the character limit still works, but is usually a sign",
     "  the description belongs in the extended text instead.",
     "· Out Tok includes Think Tok, the model's reasoning. Both count",
-    "  against the profile's reply limit, so a page refused for max_tokens",
+    "  against the run's reply limit, so a page refused for max_tokens",
     "  may show far less visible text than the limit would suggest.",
     "· INCOMPLETE REPLY flags a row whose reply stopped before it wrote its",
     "  notes. The transcription there is cut off mid-sentence — re-run the",
@@ -1825,8 +1868,8 @@ CLEAR_RESETS = {"last_file": None, "out_dir": None, "warnings": 0,
 #
 # The page keeps the last 200 lines, so Copy log used to copy whatever the
 # box held: the tail of this run, or the end of the previous one and the
-# start of this. Jeff withheld a log on 2026-10-01 for exactly that reason
-# (downloader v1.34.2; the suite since 2026-10-02). RUN_LOG starts empty at
+# start of this, so a copied log could not be shared as the record of one
+# run (downloader v1.34.2; the suite since 1.0.0). RUN_LOG starts empty at
 # the module's run claim and holds every line since. Each module defines,
 # beside this block:
 #   RUN_LOG_NAME   the .txt saved into a run's folder ("..._{}.txt"), or
@@ -1925,6 +1968,180 @@ def send_run_log(handler):
     handler.end_headers()
     handler.wfile.write(data)
 # ---- /DC-LOG --------------------------------------------------------------
+
+
+# ---- DC-TONE 1 -------------------------------------------------------------
+# The color of a finished run (1.0.1, three tones). Green: the state
+# matches what the operator intended - a run that did what was asked, or a
+# Stop the operator pressed. Amber: the run finished, with problems the
+# operator should look at. Red: the run ended in error, or nothing it
+# attempted succeeded. The module decides and puts it in STATE["outcome"];
+# the page only shows it (logTone() in the DC-TONE script). Every
+# set_state(phase="done", ...) passes outcome=, which _verify_pages.py checks
+# with ast in every module. Duplicated verbatim; the copies must agree.
+_WARNING_LINE_RE = re.compile(r"^\[[0-9:]+\]\s+WARNING\b")
+
+
+def run_warnings():
+    """How many WARNING lines the current run has logged."""
+    with LOCK:
+        return sum(1 for line in RUN_LOG if _WARNING_LINE_RE.match(line))
+
+
+def outcome_tone(problems, succeeded=None):
+    """"green", "amber" or "red" for a run that finished.
+
+    `problems` counts what went wrong - failed items, warnings, refusals.
+    `succeeded` is how many items came through, where the module counts
+    them; None means it does not, and then a run is never called red on
+    that ground."""
+    if problems and succeeded == 0:
+        return "red"
+    return "amber" if problems else "green"
+# ---- /DC-TONE --------------------------------------------------------------
+
+
+# The page's settings, by element id, remembered across launches (DC-FORM, 1.0.1).
+FORM_FIELDS = ("srcfolder", "srcrun", "srcpaths", "srcdir", "recursive",
+    "pathbox", "profile", "endpoint", "dbeside", "dfolder", "skip", "outdir",
+    "delay", "retries", "maxdim", "conc", "maxtok",
+)
+# The page's other controls, which are NOT kept, and why: the queue filter, the log copy box, and the profile dialog, which saves itself.
+# Every control on the page is in one list or the other (_verify_pages.py).
+FORM_NOT_KEPT = (
+    "filter", "logfull", "p_name", "p_desc", "p_alt", "p_prompt",
+    "p_default",
+)
+
+
+# ---- DC-FORM 1 -------------------------------------------------------------
+# The page's settings, remembered across launches (1.0.1; the downloader kept
+# them for one launch since v1.34.2). After a restart, the image describer's
+# profile went back to the default and its report folder to the Desktop,
+# so a rerun meant for "Alt text only" ran Archival and wrote its report
+# somewhere unexpected. Every module that
+# runs a job keeps its page's settings in STATE["form"] and in a file beside
+# the suite's configuration (config/forms/<module id>.json). Clear for a new
+# run keeps them. Each module defines FORM_FIELDS, the ids of its page's
+# settings, injected into the page so the two lists cannot drift.
+# Duplicated verbatim; _verify_pages.py checks the copies agree and drives
+# each one through a restart.
+FORM_TEXT_MAX = 65536
+FORM_PARENTS_MAX = 5000
+FORM_PATH = None        # tests point this elsewhere; None means config/forms
+
+
+def form_file():
+    """Where this module's remembered form lives."""
+    if FORM_PATH is not None:
+        return Path(FORM_PATH)
+    return DEFAULT_SESSION.parent / "forms" / (MANIFEST["id"] + ".json")
+
+
+def validate_form_state(body, known_only=False):
+    """The form as the page sent it, checked; raises ValueError if not.
+
+    Only fields in FORM_FIELDS, each a bool (a box or a radio) or a string
+    (a text field or a choice), plus the checked parent structures as a
+    list of strings. From the page, anything else is refused whole rather
+    than half-stored. From a file an earlier version wrote (known_only), a
+    field this version no longer has is dropped instead."""
+    if not isinstance(body, dict):
+        raise ValueError("the form must be an object")
+    fields = body.get("fields", {})
+    parents = body.get("parents", [])
+    if not isinstance(fields, dict) or not isinstance(parents, list):
+        raise ValueError("fields must be an object and parents a list")
+    out = {}
+    for key, value in fields.items():
+        if key not in FORM_FIELDS:
+            if known_only:
+                continue
+            raise ValueError("unknown form field: {!r}".format(key))
+        if isinstance(value, bool):
+            out[key] = value
+        elif isinstance(value, str) and len(value) <= FORM_TEXT_MAX:
+            out[key] = value
+        else:
+            raise ValueError("form field {} has an unusable value"
+                             .format(key))
+    if len(parents) > FORM_PARENTS_MAX or not all(
+            isinstance(p, str) and len(p) <= 256 for p in parents):
+        raise ValueError("parents must be a list of structure ids")
+    return {"fields": out, "parents": list(parents)}
+
+
+def load_form():
+    """The form an earlier launch saved, or None. A file that cannot be
+    read or used is said in the log, and the page starts from its
+    defaults - never half-restored."""
+    path = form_file()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        log("NOTE: the page's saved settings ({}) could not be read - {}; "
+            "the page starts from its defaults.".format(
+                path.name, e.__class__.__name__))
+        return None
+    try:
+        return validate_form_state(raw, known_only=True)
+    except ValueError as e:
+        log("NOTE: the page's saved settings ({}) were not usable - {}; "
+            "the page starts from its defaults.".format(path.name, e))
+        return None
+
+
+def save_form(form):
+    """Write the form beside the configuration. "" or what went wrong."""
+    path = form_file()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(form, indent=1, ensure_ascii=False),
+                       encoding="utf-8")
+        os.replace(str(tmp), str(path))
+        return ""
+    except OSError as e:
+        return "{}: {}".format(e.__class__.__name__, e)
+
+
+def form_for_page():
+    """Put the remembered form in STATE the first time a page asks."""
+    with LOCK:
+        if STATE.get("form_loaded"):
+            return
+    form = load_form()
+    with LOCK:
+        if not STATE.get("form_loaded"):
+            STATE["form"] = form
+            STATE["form_loaded"] = True
+
+
+def remember_form_request(handler):
+    """POST /api/form. Accepted during a run too: it changes nothing about
+    the run, and a page reopened mid-run is the one that needs it.
+    Returns (payload, status code)."""
+    try:
+        length = int(handler.headers.get("Content-Length", 0) or 0)
+        form = validate_form_state(json.loads(
+            handler.rfile.read(length).decode("utf-8") or "{}"))
+    except ValueError as e:
+        return {"error": str(e)}, 400
+    with LOCK:
+        STATE["form"] = form
+        STATE["form_loaded"] = True
+        said = STATE.get("form_save_said")
+    why = save_form(form)
+    if why and not said:
+        # Kept for this launch; said once, not on every keystroke.
+        log("NOTE: the page's settings could not be saved for the next "
+            "launch - {}. They are kept until this module stops.".format(why))
+        with LOCK:
+            STATE["form_save_said"] = True
+    return {"ok": True, "saved": not why}, 200
+# ---- /DC-FORM --------------------------------------------------------------
 
 
 # ---- DC-RUN 1 -------------------------------------------------------------
@@ -2069,8 +2286,7 @@ def describe_one(entry, ep, profile, max_dim, max_retries, have_pymupdf,
     data, mime, note = prepare_image(entry["path"], max_dim, have_pymupdf)
     if note:
         log_fn("    {}".format(note))
-    ceiling = (max_tokens or profile.get("max_tokens")
-               or DEFAULT_MAX_TOKENS)
+    ceiling = max_tokens or DEFAULT_REPLY_LIMIT
     raw, usage, retries = ai_generate_with_retry(
         ep, profile["prompt"], data, mime, max_retries, sleep_fn, log_fn,
         timeout=timeout, max_tokens=ceiling)
@@ -2152,6 +2368,15 @@ def process_one(entry, idx, cfg, ep, profile):
         add_warning()
         log("  WARNING: {}: {}".format(entry["name"], e))
         row["status"] = "Failed: {}".format(e)
+        # A refused reply is still billed. 1.0.0 left In/Out/Think blank on
+        # every failed row, so the report understated what a run cost and
+        # hid exactly the rows where the reply limit was spent.
+        billed = getattr(e, "usage", None) or {}
+        row["in_tok"] = billed.get("in", 0)
+        row["out_tok"] = billed.get("out", 0)
+        row["think_tok"] = billed.get("think", 0)
+        row["cache_tok"] = billed.get("cache_read", 0)
+        row["retries"] = getattr(e, "retries", 0)
     except Exception as e:
         add_warning()
         log("  WARNING: {}: unexpected {}: {}".format(
@@ -2313,8 +2538,15 @@ def describe_worker(session, cfg, ep, profile):
                 "reply limit" if tok_think else
                 " (this endpoint reports no separate figure)")),
             ("Total cached input tokens", "{:,}".format(tok_cache)),
+            # Described rows only: the totals above now include what
+            # failed rows were billed (client 1.5), and dividing those by
+            # the described count would overstate the mean.
             ("Mean output tokens per described image",
-             "{:,}".format(int(tok_out / described_n))),
+             "{:,}".format(int(sum(r["out_tok"] for r in described)
+                               / described_n))),
+            ("Output tokens billed for failed images",
+             "{:,}".format(sum(r["out_tok"] for r in rows
+                               if r["status"].startswith("Failed")))),
             ("Median transcription characters",
              "{:,}".format(int(median_chars))),
             ("Rows with an incomplete reply",
@@ -2384,13 +2616,20 @@ def describe_worker(session, cfg, ep, profile):
         if path:
             summary += " · report: " + os.path.basename(path)
         set_progress(total, total, "Done")
-        set_state(phase="done", summary=summary, paused=False)
+        # Skipped = a sidecar already there, which is what was asked for.
+        set_state(phase="done", summary=summary, paused=False,
+                  outcome=outcome_tone(n_fail + n_warn,
+                                       succeeded=n_ok + n_skip))
     except StopRequested:
         log("Stop requested — {} of {} image(s) done.".format(
             len(rows), total))
         path = finish_report("stopped early")
         if path:
             set_state(phase="done", paused=False,
+                      outcome=outcome_tone(
+                          sum(1 for r in rows
+                              if r["status"].startswith("Failed"))
+                          + run_warnings()),
                       summary="Stopped early ({} of {} image(s)). Partial "
                               "report: {}".format(len(rows), total,
                                                   os.path.basename(path)))
@@ -2409,6 +2648,29 @@ def describe_worker(session, cfg, ep, profile):
 # cross-site form/fetch (foreign Origin). Called FIRST in do_GET and do_POST.
 # ---------------------------------------------------------------------------
 _LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1", "[::1]", "")
+
+
+# ---- DC-FOLDER 1 -----------------------------------------------------------
+# Folder fields carry no default (1.0.1). The pages used to fill every folder
+# field with ~/Desktop, a guess that goes wrong on a Windows computer whose
+# Desktop is redirected to OneDrive: a report lands in a folder the operator
+# does not see as the Desktop. Every folder a request names is judged here,
+# and the message names the field the way the page labels it. Duplicated
+# verbatim into every module with a folder field (modules are standalone);
+# _verify_pages.py checks that the copies agree and drives each one.
+def folder_error(label, path, optional=False):
+    """"" when `path` names an existing folder, or is blank and the field is
+    optional. Otherwise a message that names the field."""
+    if not path:
+        if optional:
+            return ""
+        return ("The \u201c{}\u201d field is empty — choose a folder "
+                "(it must exist already).".format(label))
+    if not os.path.isdir(path):
+        return ("The folder in \u201c{}\u201d does not exist: {} — "
+                "create it first, or choose another.".format(label, path))
+    return ""
+# ---- /DC-FOLDER ------------------------------------------------------------
 
 
 def request_allowed(handler) -> bool:
@@ -2451,9 +2713,9 @@ def validate_start(req, model, tools, ai_cfg, profile_cfg):
         return "Bad request.", None, None, None
     if cfg["dest"] not in ("beside", "folder"):
         return "Bad request.", None, None, None
-    if not cfg["out_dir"] or not os.path.isdir(cfg["out_dir"]):
-        return ("Output folder does not exist: " + cfg["out_dir"], None,
-                None, None)
+    err_ = folder_error("Report folder", cfg["out_dir"])
+    if err_:
+        return err_, None, None, None
     if not 0 <= cfg["delay"] <= 120:
         return ("Delay between requests must be between 0 and 120 seconds.",
                 None, None, None)
@@ -2476,19 +2738,11 @@ def validate_start(req, model, tools, ai_cfg, profile_cfg):
     if profile is None:
         return ("Description profile '{}' not found.".format(cfg["profile"]),
                 None, None, None)
-    # The reply ceiling comes from the profile; a request may override it,
-    # and either way it is range-checked here rather than trusted into a
-    # request body.
-    try:
-        ceiling = int(req.get("max_tokens")
-                      if req.get("max_tokens") not in (None, "")
-                      else profile.get("max_tokens", DEFAULT_MAX_TOKENS))
-    except (TypeError, ValueError):
-        return "Reply limit must be a number of tokens.", None, None, None
-    if not MIN_MAX_TOKENS <= ceiling <= MAX_MAX_TOKENS:
-        return ("Reply limit must be between {} and {} output tokens — "
-                "check the profile under Manage profiles."
-                .format(MIN_MAX_TOKENS, MAX_MAX_TOKENS), None, None, None)
+    # The reply limit is the run's, from the job form (1.0.1), range-checked
+    # here rather than trusted into a request body.
+    ceiling, err = parse_reply_limit(req.get("max_tokens"))
+    if err:
+        return err, None, None, None
     cfg["max_tokens"] = ceiling
     by_path = {e["path"]: e for e in model}
     entries = [by_path[p] for p in paths if p in by_path]
@@ -2617,21 +2871,27 @@ PAGE = r"""<!DOCTYPE html>
   padding:.5rem .7rem;border-radius:6px;border:1px solid #9aa5ad;background:#eef1f5}
 .logfull{width:100%;margin-top:.4rem;font:12px/1.4 ui-monospace,monospace}
 /* /DC-LOG styles */
-/* DC-PALETTE 2 — one notification palette for the shell and every module.
-   Gray: instructions and neutral state. Green: something succeeded.
-   Red: errors and warnings. The same block, byte for byte, in every page;
+/* DC-PALETTE 3 — one notification palette for the shell and every module.
+   Gray: instructions and neutral state. Green: the state matches what the
+   operator intended. Amber (version 3): a run that finished, with problems
+   to look at. Red: errors, and a run that ended in error or in which
+   nothing succeeded. The same block, byte for byte, in every page;
    modules/_verify_pages.py fails the build if any copy differs, and checks
    each ink against its background for WCAG 2.1 AA contrast. It sits last in
    each page's <style>, so it wins over the older per-page colors. */
 :root{--dc-info-bg:#eef1f5;--dc-info-line:#9aa5ad;--dc-info-ink:#2c3440;
  --dc-ok-bg:#eaf5ec;--dc-ok-line:#1d6b34;--dc-ok-ink:#14522a;
- --dc-bad-bg:#fbecec;--dc-bad-line:#a3252c;--dc-bad-ink:#7c1c22}
+ --dc-bad-bg:#fbecec;--dc-bad-line:#a3252c;--dc-bad-ink:#7c1c22;
+ --dc-amber-bg:#fff4d6;--dc-amber-line:#b07d12;--dc-amber-ink:#6b4300}
 #status,#status.waiting,#cerr.notice,.sum,.sum.warn,.status.info{
  background:var(--dc-info-bg);border-color:var(--dc-info-line);color:var(--dc-info-ink)}
 #status.done,#cerr.ok,.sum.loaded,.status.good,.notice{
  background:var(--dc-ok-bg);border-color:var(--dc-ok-line);color:var(--dc-ok-ink)}
 #status.error,#cerr,.sum.bad,.status.bad,.status.warn,.notice.err{
  background:var(--dc-bad-bg);border-color:var(--dc-bad-line);color:var(--dc-bad-ink)}
+#status.amber,#cerr.amber,.status.amber{
+ background:var(--dc-amber-bg);border-color:var(--dc-amber-line);color:var(--dc-amber-ink)}
+.dc-amber{color:var(--dc-amber-ink)}
 .dc-ok{color:var(--dc-ok-ink)}
 .dc-bad{color:var(--dc-bad-ink)}
 .dc-info{color:var(--dc-info-ink)}
@@ -2672,7 +2932,7 @@ PAGE = r"""<!DOCTYPE html>
  <div class="row" id="folderrow">
   <div>
    <label for="srcdir" id="srcdirlabel">Folder to scan</label>
-   <input type="text" id="srcdir" value="~/Desktop" autocomplete="off" spellcheck="false">
+   <input type="text" id="srcdir" value="" autocomplete="off" spellcheck="false">
   </div>
   <div style="flex:0;min-width:auto" id="recwrap">
    <div class="inline"><input type="checkbox" id="recursive" checked>
@@ -2762,7 +3022,7 @@ PAGE = r"""<!DOCTYPE html>
  <div class="row">
   <div>
    <label for="outdir" id="outdirlabel">Report folder</label>
-   <input type="text" id="outdir" value="~/Desktop" autocomplete="off" spellcheck="false">
+   <input type="text" id="outdir" value="" autocomplete="off" spellcheck="false">
   </div>
  </div>
  <div class="row">
@@ -2774,7 +3034,16 @@ PAGE = r"""<!DOCTYPE html>
    <input type="number" id="maxdim" min="512" max="8000" step="100" value="2000"></div>
   <div><label for="conc">Concurrent requests</label>
    <input type="number" id="conc" min="1" max="4" value="1"></div>
+  <div><label for="maxtok">Reply limit (output tokens)</label>
+   <input type="number" id="maxtok" min="64" max="32000" step="100"
+    value="8000" aria-describedby="maxtokhint"></div>
  </div>
+ <p class="hint" id="maxtokhint">The ceiling on one reply, for every image in
+  the run. On a thinking model it counts the model's reasoning as well as the
+  text it returns, and the reasoning varies from one run to the next even on
+  the same image &mdash; so 8000 is the default even for alt text alone. Lower
+  it to save on a first run, and raise it if rows fail with
+  <code>max_tokens</code>.</p>
  <p class="hint" id="dimhint"></p>
  <p class="hint">Larger images are downscaled before sending — every provider
   downsamples internally anyway, and 2000 px keeps small print legible. TIFF
@@ -2841,14 +3110,6 @@ PAGE = r"""<!DOCTYPE html>
  <input type="text" id="p_desc" autocomplete="off">
  <label for="p_alt" style="margin-top:.5rem">Alt-text character limit (reported, not enforced)</label>
  <input type="number" id="p_alt" min="40" max="500" value="125">
- <label for="p_tok" style="margin-top:.5rem">Reply limit (output tokens)</label>
- <input type="number" id="p_tok" min="64" max="32000" step="100" value="8000">
- <p class="hint">The ceiling on one reply. 8000 suits a dense archival page.
-  On a thinking model this counts the model's reasoning as well as the text
-  it returns, and the reasoning does not appear in the Out Tok column — so
-  set it well above what the answer alone needs. A profile that only writes
-  alt text needs a few hundred, and a low ceiling there is what stops a
-  misread instruction spending a full page's budget on a blank endpaper.</p>
  <label for="p_prompt" style="margin-top:.5rem">Prompt sent with every image</label>
  <textarea id="p_prompt" spellcheck="false"></textarea>
  <div class="inline" style="margin-top:.5rem"><input type="checkbox" id="p_default">
@@ -2874,7 +3135,7 @@ PAGE = r"""<!DOCTYPE html>
    and snapped the scroll back to the tail. So: render only on change,
    append rather than replace, follow the tail only from the tail, and do
    not touch the DOM at all while a selection is live inside the box.
-   Reported by Jeff on 2026-09-08 while trying to copy a log line.
+   Found by an operator trying to copy one line out of a running log.
 ------------------------------------------------------------------------ */
 var logShown = null;
 var LOG_TAIL_SLOP = 24;      /* px from the bottom that still counts as "at the tail" */
@@ -3036,6 +3297,95 @@ function logStateSeen(s){
   });
 })();
 /* /DC-LOG */
+/* DC-TONE 1: the color of a finished run (1.0.1). Green (done): the state
+   matches what the operator intended. Amber: it finished, with problems to
+   look at. Red (error): it ended in error, or nothing it attempted
+   succeeded. The module decides, in s.outcome; this only shows it. Shared
+   by every module with a log and duplicated verbatim. */
+function logTone(s){
+  if(!s) return '';
+  if(s.phase === 'error') return 'error';
+  if(s.phase !== 'done') return '';
+  if(s.outcome === 'amber') return 'amber';
+  if(s.outcome === 'red') return 'error';
+  return 'done';
+}
+/* /DC-TONE */
+const FORM_IDS=__FORM_FIELDS__;
+/* DC-FORM 1: the page's settings, remembered across launches (1.0.1).
+   Every field named in FORM_IDS (the module's FORM_FIELDS, defined by the
+   page before this block) is sent to the module as it changes, and put
+   back when the page loads from a file the module keeps beside the suite's
+   configuration. A choice whose option has not loaded yet is put back when
+   it appears. Shared by every module that runs a job and duplicated
+   verbatim. A page may define formParents() (its checked structures) and
+   formRestoredHook(form) (what its own controls need afterwards). Every
+   page's poll() calls formSeen(s) with the state it just read. */
+var formRestored = false, formTimer = null, formPending = {};
+function formState(){
+  var fields = {};
+  FORM_IDS.forEach(function(id){
+    var el = document.getElementById(id); if(!el) return;
+    fields[id] = (el.type === 'checkbox' || el.type === 'radio') ? el.checked : el.value;
+  });
+  return {fields: fields,
+          parents: (typeof formParents === 'function') ? formParents() : []};
+}
+function saveForm(){
+  if(!formRestored) return;      /* never overwrite what is about to load */
+  clearTimeout(formTimer);
+  formTimer = setTimeout(function(){
+    fetch('/api/form', {method:'POST', cache:'no-store',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(formState())});
+  }, 400);
+}
+function formHasOption(el, v){
+  if(!el.options) return true;
+  for(var i = 0; i < el.options.length; i++){
+    if(el.options[i].value === v) return true;
+  }
+  return false;
+}
+function formFire(el){
+  if(el.dispatchEvent && typeof Event === 'function') el.dispatchEvent(new Event('change'));
+}
+function restoreForm(form){
+  var changed = [];
+  if(form && form.fields){
+    Object.keys(form.fields).forEach(function(id){
+      if(FORM_IDS.indexOf(id) < 0) return;
+      var el = document.getElementById(id); if(!el) return;
+      var v = form.fields[id];
+      if(el.type === 'checkbox' || el.type === 'radio'){ el.checked = !!v; }
+      else if(formHasOption(el, String(v))){ el.value = String(v); }
+      else { formPending[id] = String(v); return; }
+      changed.push(el);
+    });
+  }
+  formRestored = true;
+  FORM_IDS.forEach(function(id){
+    var el = document.getElementById(id); if(!el) return;
+    el.addEventListener('change', saveForm);
+    el.addEventListener('input', saveForm);
+  });
+  changed.forEach(function(el){ if(el.type !== 'radio' || el.checked) formFire(el); });
+  if(typeof formRestoredHook === 'function') formRestoredHook(form);
+}
+function formRetryPending(){
+  Object.keys(formPending).forEach(function(id){
+    var el = document.getElementById(id);
+    if(!el || !formHasOption(el, formPending[id])) return;
+    el.value = formPending[id];
+    delete formPending[id];
+    formFire(el);
+  });
+}
+function formSeen(s){
+  if(!formRestored){ restoreForm(s && s.form); return; }
+  formRetryPending();
+}
+/* /DC-FORM */
 
 (function(){
   const box = logEl(), btn = document.getElementById('logcopy');
@@ -3220,7 +3570,7 @@ function renderProfiles(){
   b.textContent=p.name+(profCfg['default']===p.name?' (default)':'');
   b.addEventListener('click',()=>openProf(i));
   td.append(b);tr.append(td);
-  [String(p.max_alt_chars)+' / '+String(p.max_tokens||8000),
+  [String(p.max_alt_chars),
    p.description].forEach(v=>{
    const c=document.createElement('td');c.textContent=v;tr.append(c);});
   tr.addEventListener('click',ev=>{if(ev.target===b)return;openProf(i);});
@@ -3238,11 +3588,10 @@ $('editprofiles').addEventListener('click',()=>{
 function openProf(i){
  profIndex=i;lastFocus=document.activeElement;
  const p=i>=0?profCfg.profiles[i]
-   :{name:'',description:'',prompt:'',max_alt_chars:125,max_tokens:8000};
+   :{name:'',description:'',prompt:'',max_alt_chars:125};
  $('ptitle').textContent=i>=0?'Edit profile':'Add profile';
  $('p_name').value=p.name;$('p_desc').value=p.description;
  $('p_alt').value=p.max_alt_chars;$('p_prompt').value=p.prompt;
- $('p_tok').value=p.max_tokens||8000;
  $('p_default').checked=i>=0&&profCfg['default']===p.name;
  $('p_delete').style.display=i>=0?'':'none';
  $('p_dup').style.display=i>=0?'':'none';
@@ -3252,7 +3601,7 @@ function openProf(i){
  $('p_name').focus();
 }
 /* An error from the dialog's own Save or Delete is shown IN the dialog
-   (Jeff, 2026-10-02): the page callout sits behind an open dialog, so a
+   (1.0.0): the page callout sits behind an open dialog, so a
    refused Save looked like a Save that did nothing. It stays until the
    next Save, Delete or opened profile; the dialog stays open. */
 function profErr(msg){
@@ -3272,15 +3621,14 @@ $('p_save').addEventListener('click',async()=>{
  clearErr();profErr('');
  const p={name:$('p_name').value.trim(),description:$('p_desc').value.trim(),
   prompt:$('p_prompt').value,
-  max_alt_chars:parseInt($('p_alt').value||'125',10),
-  max_tokens:parseInt($('p_tok').value||'8000',10)};
+  max_alt_chars:parseInt($('p_alt').value||'125',10)};
  const cand={profiles:profCfg.profiles.slice(),'default':profCfg['default']};
  if(profIndex>=0)cand.profiles[profIndex]=p;else cand.profiles.push(p);
  if($('p_default').checked)cand['default']=p.name;
  else if(cand['default']===p.name)cand['default']='';
  if(await saveProfiles(cand))closeModal('pback');
 });
-/* Delete asks first, inline (Jeff, 2026-10-02): a profile can hold an
+/* Delete asks first, inline (1.0.0): a profile can hold an
    afternoon's work on a prompt, and Restore brings back only the factory
    ones. */
 $('p_delete').addEventListener('click',()=>{
@@ -3460,6 +3808,7 @@ function runBody(){
   retries:parseInt($('retries').value||'4',10),
   max_dim:parseInt($('maxdim').value||'2000',10),
   concurrency:parseInt($('conc').value||'1',10),
+  max_tokens:$('maxtok').value.trim(),
   endpoint:$('endpoint').value,profile:$('profile').value};
 }
 $('go').addEventListener('click',async()=>{
@@ -3521,7 +3870,7 @@ async function poll(){
   if(s.tools&&Object.keys(s.tools).length&&!Object.keys(tools).length)
    renderTools(s.tools);
   const st=$('status');
-  st.className=s.phase==='done'?'done':(s.phase==='error'?'error':'');
+  st.className=logTone(s);
   let msg='';
   if(s.phase==='idle')msg='Idle — scan a folder to queue images.';
   else if(running){
@@ -3538,7 +3887,7 @@ async function poll(){
   if(s.progress.total&&running){
    prog.hidden=false;prog.max=s.progress.total;prog.value=s.progress.current;
   }else prog.hidden=true;
-  renderLog(s.log); logStateSeen(s);
+  renderLog(s.log); formSeen(s); logStateSeen(s);
  }catch(e){/* transient poll errors are fine */}
  setTimeout(poll,1500);
 }
@@ -3565,6 +3914,7 @@ def build_page(session: dict) -> bytes:
     colors = brand.get("colors", {})
     primary = colors.get("primary", FALLBACK_BRAND["primary"])
     html = (PAGE
+            .replace("__FORM_FIELDS__", json.dumps(list(FORM_FIELDS)))
             .replace("__NAME__", MANIFEST["name"])
             .replace("__SUITE__", brand.get("suite_name", "DC Admin Suite"))
             .replace("__INSTITUTION__", brand.get("institution", ""))
@@ -3618,6 +3968,7 @@ def make_handler(session: dict, page: bytes):
             if self.path == "/api/log":
                 return send_run_log(self)
             if self.path == "/api/state":
+                form_for_page()
                 with LOCK:
                     return self._json(dict(STATE))
             if self.path == "/api/files":
@@ -3657,10 +4008,11 @@ def make_handler(session: dict, page: bytes):
                 else:
                     folder = os.path.expanduser(
                         str(req.get("folder", "")).strip())
-                    if not folder or not os.path.isdir(folder):
-                        return self._json(
-                            {"error": "Folder does not exist: " + folder},
-                            400)
+                    err_ = folder_error(
+                        "Downloader run folder" if mode == "run"
+                        else "Folder to scan", folder)
+                    if err_:
+                        return self._json({"error": err_}, 400)
                     if mode == "run":
                         entries, run, skipped = scan_run_folder(folder)
                         source = os.path.basename(run)
@@ -3744,6 +4096,9 @@ def make_handler(session: dict, page: bytes):
             if not request_allowed(self):
                 return self._json(
                     {"error": "Forbidden (non-local request)."}, 403)
+            if self.path == "/api/form":
+                payload, code = remember_form_request(self)
+                return self._json(payload, code)
             if self.path == "/api/clear":
                 with LOCK:
                     busy = STATE["phase"] in RUNNING_PHASES

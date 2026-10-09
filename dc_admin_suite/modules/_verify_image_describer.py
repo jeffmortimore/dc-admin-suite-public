@@ -14,8 +14,8 @@ What is covered, and why each one is here rather than left to a real run:
   · the endpoint round-trip, shell normalize() -> save -> module read,
     because THREE separate whitelists rebuild an endpoint dict and a field
     missing from any one of them is dropped in silence;
-  · early-stop detection per provider, which is the defect the 78-image
-    Jesuits run of 2026-09-02 exposed: seven replies ended mid-sentence and
+  · early-stop detection per provider, which is the defect a 78-image
+    archival run exposed: seven replies ended mid-sentence and
     every one was saved and reported as a success;
   · reasoning-trace accounting, which is why that defect took two days to
     diagnose — Gemini bills thinking as output and counts it against the
@@ -42,7 +42,10 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(ROOT))
 
 import dc_image_describer as M          # noqa: E402
+# DC-FORM (1.0.1): a test must never write the operator's remembered form.
+M.FORM_PATH = os.path.join(tempfile.mkdtemp(prefix="dcid-form-"), "f.json")
 import dc_ocr_toolkit as OCR            # noqa: E402
+OCR.FORM_PATH = os.path.join(tempfile.mkdtemp(prefix="dcocr-form-"), "f.json")
 from app import ai_endpoints as SHELL   # noqa: E402
 
 
@@ -232,12 +235,14 @@ class RequestBuilders(unittest.TestCase):
         self.assertEqual([b["type"] for b in blocks], ["text", "image"])
         self.assertEqual(blocks[0]["cache_control"], {"type": "ephemeral"})
 
-    def test_profile_ceiling_reaches_the_wire(self):
+    def test_the_runs_reply_limit_reaches_the_wire(self):
         lines = ['data: {"candidates":[{"content":{"parts":'
                  '[{"text":"x"}]}}]}']
         entry = {"path": __file__, "name": "x.py", "rel": "x.py",
                  "ctx": "", "article": "", "title": "", "size": 1,
                  "admin_url": "", "sidecar": ""}
+        # A stale max_tokens left in a profile by an older version must NOT
+        # reach the wire: the run's limit (the job form) is the only one.
         profile = {"name": "Alt text only", "prompt": "p",
                    "max_alt_chars": 125, "max_tokens": 300}
         real_prepare = M.prepare_image
@@ -245,9 +250,16 @@ class RequestBuilders(unittest.TestCase):
         try:
             with StreamPatch(lines) as sp:
                 M.describe_one(entry, ep("gemini"), profile, 2000, 0, False,
+                               lambda s: None, lambda m: None,
+                               max_tokens=2500)
+            self.assertEqual(
+                sp.sent["generationConfig"]["maxOutputTokens"], 2500)
+            with StreamPatch(lines) as sp:
+                M.describe_one(entry, ep("gemini"), profile, 2000, 0, False,
                                lambda s: None, lambda m: None)
             self.assertEqual(
-                sp.sent["generationConfig"]["maxOutputTokens"], 300)
+                sp.sent["generationConfig"]["maxOutputTokens"],
+                M.DEFAULT_REPLY_LIMIT)
         finally:
             M.prepare_image = real_prepare
 
@@ -284,7 +296,7 @@ class RegistryRoundTrip(unittest.TestCase):
             self.assertEqual(got["model"], "test-model", mod.__name__)
 
     def test_cost_estimation_is_gone(self):
-        """Removed at Jeff's request once the model choice was settled: the
+        """Removed once the model choice was settled: the
         run reports tokens, and nothing anywhere prices them."""
         for mod in (M, OCR, SHELL):
             self.assertFalse(hasattr(mod, "endpoint_cost"), mod.__name__)
@@ -376,39 +388,45 @@ class PromptMigration(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 5. Profiles: the reply ceiling
+# 5. The reply limit is the run's, not the profile's (1.0.1)
 # ---------------------------------------------------------------------------
-class ProfileCeiling(unittest.TestCase):
+class ReplyLimit(unittest.TestCase):
 
-    def test_factory_profiles_carry_their_own_ceiling(self):
-        by_name = {p["name"]: p for p in M.FACTORY_PROFILES}
-        self.assertEqual(by_name["Archival"]["max_tokens"], 8000)
-        self.assertEqual(by_name["Alt text only"]["max_tokens"], 300)
+    def test_factory_profiles_carry_no_reply_limit(self):
+        for p in M.FACTORY_PROFILES:
+            self.assertNotIn("max_tokens", p, p["name"])
 
-    def test_an_older_profile_is_backfilled(self):
-        cfg = M.backfill_profiles({"profiles": [
-            {"name": "Old", "prompt": "x" * 50 + "--- ALT TEXT ---",
-             "max_alt_chars": 125}], "default": "Old"})
-        self.assertEqual(cfg["profiles"][0]["max_tokens"],
-                         M.DEFAULT_MAX_TOKENS)
-
-    def test_a_factory_profile_is_backfilled_to_its_own_ceiling(self):
-        """An untouched "Alt text only" saved before v1.3 must come back
-        with 300, not the generic 4000 — that ceiling is the point of C4."""
+    def test_a_saved_limit_is_dropped_from_a_profile(self):
+        """A profile saved by 1.0.0 carries max_tokens; it is ignored and
+        does not survive the next save."""
         cfg = M.backfill_profiles({"profiles": [
             {"name": "Alt text only", "prompt": "--- ALT TEXT ---" + "z" * 40,
-             "max_alt_chars": 125},
-            {"name": "Mine", "prompt": "--- ALT TEXT ---" + "z" * 40,
-             "max_alt_chars": 125}], "default": "Mine"})
-        by_name = {p["name"]: p for p in cfg["profiles"]}
-        self.assertEqual(by_name["Alt text only"]["max_tokens"], 300)
-        self.assertEqual(by_name["Mine"]["max_tokens"], M.DEFAULT_MAX_TOKENS)
+             "max_alt_chars": 125, "max_tokens": 300}],
+            "default": "Alt text only"})
+        self.assertNotIn("max_tokens", cfg["profiles"][0])
 
-    def test_out_of_range_ceiling_is_refused(self):
+    def test_a_profile_is_not_refused_for_a_stale_limit(self):
         cfg = {"profiles": [{"name": "X", "prompt": "--- ALT TEXT ---" + "y" * 40,
                              "max_alt_chars": 125, "max_tokens": 9}],
                "default": "X"}
-        self.assertIn("between 64 and 32000", M.validate_profiles(cfg))
+        self.assertEqual(M.validate_profiles(cfg), "")
+
+    def test_the_default_is_generous(self):
+        self.assertEqual(M.DEFAULT_REPLY_LIMIT, 8000)
+        self.assertEqual(M.parse_reply_limit(None), (8000, ""))
+
+    def test_a_blank_or_bad_limit_names_the_field(self):
+        for raw in ("", "  ", "lots", "1.5"):
+            limit, err = M.parse_reply_limit(raw)
+            self.assertIsNone(limit, raw)
+            self.assertIn("Reply limit (output tokens)", err, raw)
+
+    def test_the_limit_is_range_checked(self):
+        self.assertIn("between 64 and 32,000", M.parse_reply_limit(63)[1])
+        self.assertIn("between 64 and 32,000",
+                      M.parse_reply_limit("32001")[1])
+        self.assertEqual(M.parse_reply_limit("64"), (64, ""))
+        self.assertEqual(M.parse_reply_limit(32000), (32000, ""))
 
 
 # ---------------------------------------------------------------------------
@@ -463,7 +481,7 @@ class QualityFlags(unittest.TestCase):
         self.assertEqual(rows[2]["flags"], "")
 
     def test_a_reply_that_never_wrote_its_notes_is_flagged(self):
-        """The seven-page failure from the 2026-09-02 corpus run. These are
+        """The seven-page failure from a 78-image corpus run. These are
         the LONGEST rows, so nothing median-relative sees them, and they
         have no "Uncertain: None." to be suspicious of."""
         rows = [row(i, 1800) for i in range(1, 8)]
@@ -493,6 +511,17 @@ class QualityFlags(unittest.TestCase):
         self.assertEqual(M.uncertain_state({"NOTES": "Uncertain: the date."}),
                          "listed")
         self.assertEqual(M.uncertain_state({"NOTES": "Title: X"}), "absent")
+
+    def test_an_echoed_label_is_the_label_not_a_reading(self):
+        """A reply that writes "Uncertain: Uncertain: None." asserts a clean
+        read. Counting it as a listed doubt made one run report 11 rows
+        with uncertain readings when 8 had them."""
+        notes = {"NOTES": "Uncertain: Uncertain: None."}
+        self.assertEqual(M.uncertain_state(notes), "none")
+        self.assertEqual(M.extract_uncertain(notes), "")
+        listed = {"NOTES": "Uncertain: uncertain:  the second date "}
+        self.assertEqual(M.uncertain_state(listed), "listed")
+        self.assertEqual(M.extract_uncertain(listed), "the second date")
 
 
 # ---------------------------------------------------------------------------
@@ -543,14 +572,32 @@ class ValidateStart(unittest.TestCase):
         self.assertEqual(cfg["max_tokens"], 512)
 
     def test_the_reply_ceiling_is_range_checked(self):
-        self.assertIn("between 64 and 32000", self.run_it(max_tokens=1)[0])
-        self.assertIn("between 64 and 32000",
+        self.assertIn("between 64 and 32,000", self.run_it(max_tokens=1)[0])
+        self.assertIn("between 64 and 32,000",
                       self.run_it(max_tokens=99999)[0])
         self.assertEqual(self.run_it(max_tokens=12000)[0], "")
 
-    def test_a_broken_profile_ceiling_is_caught_before_the_run(self):
-        self.profiles["profiles"][0]["max_tokens"] = 999999
-        self.assertIn("Manage profiles", self.run_it()[0])
+    def test_a_blank_report_folder_is_refused_by_name(self):
+        """1.0.1: no default folder. A blank one is named, not guessed."""
+        msg = self.run_it(out_dir="")[0]
+        self.assertIn("\u201cReport folder\u201d field is empty", msg)
+        msg = self.run_it(out_dir=str(self.tmp) + "/nope")[0]
+        self.assertIn("\u201cReport folder\u201d does not exist", msg)
+
+    def test_the_page_offers_no_default_folder(self):
+        html = M.build_page({"branding": {}}).decode("utf-8")
+        self.assertNotIn("~/Desktop", html)
+
+    def test_a_blank_reply_limit_is_refused_by_name(self):
+        self.assertIn("Reply limit (output tokens) is empty",
+                      self.run_it(max_tokens="")[0])
+
+    def test_a_stale_profile_limit_is_ignored(self):
+        """1.0.0 kept the limit in the profile. A saved 300 must not decide
+        the run any more - the form's value does."""
+        self.profiles["profiles"][0]["max_tokens"] = 300
+        msg, cfg, _e, _p = self.run_it()
+        self.assertEqual((msg, cfg["max_tokens"]), ("", 8000))
 
 
 # ---------------------------------------------------------------------------
@@ -657,12 +704,12 @@ class ThinkingTokens(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 8b. Early-stop detection — the 2026-09-02 defect
+# 8b. Early-stop detection — the seven-page defect
 # ---------------------------------------------------------------------------
 class EarlyStop(unittest.TestCase):
     """A provider can close the stream tidily AFTER giving up part-way. The
-    v1.1 guard only caught connections that drop, so seven pages of the
-    Jesuits corpus were saved mid-sentence and reported as successes."""
+    v1.1 guard only caught connections that drop, so seven pages of an
+    archival corpus were saved mid-sentence and reported as successes."""
 
     def test_gemini_recitation_stop_is_refused(self):
         lines = ['data: {"candidates":[{"content":{"parts":'
@@ -682,6 +729,80 @@ class EarlyStop(unittest.TestCase):
         with StreamPatch(lines):
             self.assertRaises(M.AIError, M.ai_generate,
                               ep("gemini"), "p", b"img")
+
+    def test_a_refused_reply_carries_what_it_was_billed(self):
+        """Client 1.5. The provider bills a reply it cut off; the error now
+        carries that usage so the failed row can record it."""
+        lines = ['data: {"candidates":[{"content":{"parts":[{"text":"x"}]},'
+                 '"finishReason":"MAX_TOKENS"}],"usageMetadata":'
+                 '{"promptTokenCount":1189,"candidatesTokenCount":21,'
+                 '"thoughtsTokenCount":279}}']
+        with StreamPatch(lines):
+            with self.assertRaises(M.AIError) as cm:
+                M.ai_generate(ep("gemini"), "p", b"img")
+        self.assertEqual(cm.exception.usage,
+                         {"in": 1189, "out": 300, "think": 279,
+                          "cache_read": 0})
+
+    def test_retries_sum_every_billed_attempt(self):
+        """Two cut-off attempts, then a success: all three were billed, so
+        all three are reported - on success and on giving up alike."""
+        def billed(n):
+            return {"in": 10 * n, "out": n, "think": 0, "cache_read": 0}
+        calls = []
+
+        def fake(*_a, **_k):
+            calls.append(1)
+            if len(calls) < 3:
+                e = M.AIError("cut off")
+                e.transient = True
+                e.usage = billed(len(calls))
+                raise e
+            return "ok", billed(3)
+        real = M.ai_generate
+        M.ai_generate = fake
+        try:
+            text, usage, tries = M.ai_generate_with_retry(
+                ep("gemini"), "p", b"i", "image/png", 4,
+                lambda s: None, lambda m: None)
+            self.assertEqual((text, tries), ("ok", 2))
+            self.assertEqual(usage, {"in": 60, "out": 6, "think": 0,
+                                     "cache_read": 0})
+            del calls[:]
+            with self.assertRaises(M.AIError) as cm:
+                M.ai_generate_with_retry(ep("gemini"), "p", b"i",
+                                         "image/png", 1, lambda s: None,
+                                         lambda m: None)
+            self.assertEqual(cm.exception.usage["out"], 3)
+            self.assertEqual(cm.exception.retries, 1)
+        finally:
+            M.ai_generate = real
+
+    def test_a_failed_row_records_its_billed_tokens(self):
+        entry = {"path": __file__, "name": "x.py", "rel": "x.py", "ctx": "",
+                 "article": "", "title": "", "size": 1, "admin_url": "",
+                 "sidecar": ""}
+        cfg = {"dest": "beside", "skip": False, "have_pymupdf": False,
+               "max_dim": 2000, "retries": 2, "max_tokens": 300}
+
+        def refuse(*_a, **_k):
+            e = M.AIError("The endpoint stopped generating early after 21 "
+                          "characters (the provider gave the reason "
+                          "'MAX_TOKENS'), so the reply is incomplete")
+            e.usage = {"in": 1189, "out": 300, "think": 279,
+                       "cache_read": 0}
+            e.retries = 0
+            raise e
+        real = M.describe_one
+        M.describe_one = refuse
+        try:
+            row = M.process_one(entry, 1, cfg, ep("gemini"),
+                                {"name": "P", "max_alt_chars": 125})
+        finally:
+            M.describe_one = real
+        self.assertTrue(row["status"].startswith("Failed:"), row["status"])
+        self.assertEqual((row["in_tok"], row["out_tok"], row["think_tok"]),
+                         (1189, 300, 279))
 
     def test_gemini_normal_stop_is_kept(self):
         lines = ['data: {"candidates":[{"content":{"parts":'
@@ -768,12 +889,74 @@ class EarlyStop(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# 8b. The color of a finished run (DC-TONE, 1.0.1)
+# ---------------------------------------------------------------------------
+class RunTone(unittest.TestCase):
+    """The run that started this: "2 described, 6 failed" was
+    shown green. Driven through describe_worker with process_one stubbed."""
+
+    def run_with(self, statuses):
+        tmp = tempfile.mkdtemp()
+        entries = [{"name": "i%d.jpg" % n, "rel": "i%d.jpg" % n,
+                    "path": "i%d.jpg" % n} for n in range(len(statuses))]
+
+        def fake(entry, idx, cfg, ep_, profile):
+            st = statuses[idx - 1]
+            if st.startswith("Failed"):
+                M.add_warning()
+            return {"order": idx, "status": st, "over": "", "uncertain": "",
+                    "in_tok": 0, "out_tok": 0, "think_tok": 0,
+                    "cache_tok": 0, "tchars": 0, "uncertain_state": "absent",
+                    "has_notes": False, "flags": ""}
+        real = (M.process_one, M.write_report, M.log)
+        M.process_one = fake
+        M.write_report = lambda *a, **k: None
+        M.log = lambda *a, **k: None
+        try:
+            cfg = {"entries": entries, "dest": "beside", "concurrency": 1,
+                   "delay": 0, "out_dir": tmp, "run_stamp": "t",
+                   "source": "test", "max_dim": 2000, "retries": 0,
+                   "max_tokens": 8000, "skip": True, "endpoint": "G",
+                   "profile": "P", "have_pymupdf": False}
+            M.describe_worker({"branding": {}}, cfg, ep("gemini"),
+                              {"name": "P", "max_alt_chars": 125})
+            with M.LOCK:
+                return M.STATE["phase"], M.STATE.get("outcome")
+        finally:
+            M.process_one, M.write_report, M.log = real
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_all_described_is_green(self):
+        self.assertEqual(self.run_with(["Described"] * 3), ("done", "green"))
+
+    def test_some_failed_is_amber(self):
+        self.assertEqual(
+            self.run_with(["Described", "Described"] + ["Failed: x"] * 6),
+            ("done", "amber"))
+
+    def test_none_described_is_red(self):
+        self.assertEqual(self.run_with(["Failed: x"] * 3), ("done", "red"))
+
+    def test_skipped_because_already_done_is_green(self):
+        self.assertEqual(self.run_with(["Skipped (sidecar exists)"] * 2),
+                         ("done", "green"))
+
+
+# ---------------------------------------------------------------------------
 # 9. Client drift between the two AI modules
 # ---------------------------------------------------------------------------
 class ClientDrift(unittest.TestCase):
 
+    def test_both_modules_read_an_uncertain_line_the_same_way(self):
+        for raw in ("Uncertain: None.", "None", "  the date ",
+                    "Uncertain:Uncertain: None", "Uncertain: Uncertain: None.",
+                    "UNCERTAIN :  uncertain:the 3 or 8", "uncertain: the 3 or 8",
+                    ""):
+            self.assertEqual(M.uncertain_said(raw), OCR.uncertain_said(raw),
+                             raw)
+
     def test_both_modules_declare_the_same_client(self):
-        self.assertEqual(M.AI_CLIENT_VERSION, "1.4")
+        self.assertEqual(M.AI_CLIENT_VERSION, "1.5")
         self.assertEqual(M.AI_CLIENT_VERSION, OCR.AI_CLIENT_VERSION)
 
     def test_the_usage_normaliser_is_the_same_in_both(self):
@@ -867,8 +1050,8 @@ function confirm(){ return true; }
 let profIndex=-1, lastFocus=null;
 const LONG = 'Describe the image. --- ALT TEXT --- then the alt text, briefly.';
 let profCfg = {profiles:[
-  {name:'Archival', description:'full', prompt:LONG, max_alt_chars:125, max_tokens:8000},
-  {name:'archival (COPY)', description:'taken', prompt:LONG, max_alt_chars:125, max_tokens:300}],
+  {name:'Archival', description:'full', prompt:LONG, max_alt_chars:125},
+  {name:'archival (COPY)', description:'taken', prompt:LONG, max_alt_chars:125}],
   'default':'Archival'};
 __SECTION__
 (async function(){
@@ -969,6 +1152,39 @@ class ProfileDuplicate(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr[-800:])
         return json.loads(done.stdout.strip().splitlines()[-1])
 
+    def test_the_run_sends_the_forms_reply_limit(self):
+        """1.0.1, behavioral: runBody() reads #maxtok and sends it as typed,
+        so a blank field reaches the server, which names the field."""
+        import re
+        import subprocess
+        html = M.build_page({"branding": {}}).decode("utf-8")
+        self.assertIn('id="maxtok"', html)
+        self.assertNotIn('id="p_tok"', html)
+        script = "\n".join(re.findall(r"<script>(.*?)</script>", html,
+                                       re.S))
+        a = script.index("function runBody(){")
+        b = script.index("\n}\n", a) + 3
+        js = ("const vals={outdir:'~/r',delay:'2',retries:'4',maxdim:'2000',"
+              "conc:'1',maxtok:' 2500 ',endpoint:'G',profile:'Archival'};"
+              "function $(id){return {value:vals[id]||'',checked:false};}"
+              "const checked=new Set(['a.jpg']);" + script[a:b] +
+              "console.log(JSON.stringify(runBody()));")
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False,
+                                         encoding="utf-8") as fh:
+            fh.write(js)
+            tmp = fh.name
+        try:
+            done = subprocess.run([self.node, tmp], capture_output=True,
+                                  text=True, encoding="utf-8",
+                                  errors="replace", timeout=30)
+        finally:
+            os.unlink(tmp)
+        self.assertEqual(done.returncode, 0, done.stderr[-800:])
+        body = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertEqual(body["max_tokens"], "2500")
+        msg, cfg = M.parse_reply_limit(body["max_tokens"])
+        self.assertEqual((msg, cfg), (2500, ""))
+
     def test_a_copy_is_a_new_profile_with_a_free_name(self):
         out = self.run_page()
         self.assertEqual(out["dupShownForAnExisting"], "")
@@ -985,7 +1201,7 @@ class ProfileDuplicate(unittest.TestCase):
         self.assertTrue(out["original"], "the original's prompt changed")
         self.assertEqual(out["copy"]["name"], "Archival (copy 2)")
         self.assertTrue(out["copy"]["prompt"].endswith(" EDITED"))
-        self.assertEqual(out["copy"]["max_tokens"], 8000)
+        self.assertNotIn("max_tokens", out["copy"])
         self.assertEqual(out["def"], "Archival")
 
     def test_delete_asks_first_and_keep_keeps(self):

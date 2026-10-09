@@ -56,6 +56,8 @@ WHAT IS STRIPPED, AND WHY
                       endpoints.
   config/session.json Rewritten at every launch and full of absolute paths
                       from THIS machine. A stale one is worse than none.
+  config/forms/       Each page's remembered settings (1.0.1): this
+                      machine's folders and choices, not a recipient's.
   __pycache__, .git   Byte-code for one Python version on one platform, and
                       this machine's history and remotes.
   _backup_*, _removed Working folders, not part of the product.
@@ -197,6 +199,8 @@ GENERIC_KEEP_IN_PROFILES = ("README.md",)
 def _skip(path: Path) -> bool:
     name = path.name
     if path.is_dir():
+        if name == "forms" and path.parent.name == "config":
+            return True
         return (name in SKIP_DIRS
                 or name.startswith(SKIP_DIR_PREFIXES))
     if name.endswith(SKIP_FILE_SUFFIXES):
@@ -616,6 +620,15 @@ def private_terms(repo=None):
                                  "\"pattern\" (and a \"why\"): {!r}"
                                  .format(item.name, entry))
             pat = str(entry["pattern"]).strip().lower()
+            if "-" in pat:
+                # The scan reads normalized text, in which every hyphen is
+                # a space (_normalized). A pattern with a hyphen can never
+                # match, so it would be a term declared and never enforced
+                # (1.0.1: a hyphenated collection name in a planted comment
+                # passed the build). Refused.
+                raise SystemExit("{}: private_terms pattern {!r} contains a "
+                                 "hyphen, which the scan never sees - write "
+                                 "it as a space".format(item.name, pat))
             try:
                 re.compile(pat)
             except re.error as e:
@@ -693,6 +706,11 @@ def _verify(folder: Path, generic: bool = False) -> list:
         if found:
             problems.append("{} secret(s) still present in {}".format(
                 found, path.relative_to(folder)))
+    forms = folder / SUITE_DIR / "config" / "forms"
+    if forms.exists():
+        problems.append("{} was not removed — it holds this machine's "
+                        "remembered page settings".format(
+                            forms.relative_to(folder)))
     session = folder / SUITE_DIR / "config" / "session.json"
     if session.exists():
         problems.append("{} was not removed".format(

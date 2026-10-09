@@ -1,5 +1,83 @@
 # Release notes
 
+## 1.0.1 — 2026-10-08
+
+Fixes from the first weeks of use, and the run history taken out of the
+code's comments.
+
+### What is in it
+
+| Module | Version |
+|---|---|
+| Structure URL Generator | 1.4.0 |
+| Hierarchy Mapping Tool | 1.4.0 |
+| Structure Regenerator | 1.4.0 |
+| Configuration Manager | 1.4.0 |
+| DOI & XML Generator | 1.9.0 |
+| Structure HTML Drafting Tool | 1.6.3 |
+| Batch Revise Manager | 1.4.0 |
+| Batch File Downloader | 1.35.0 |
+| OCR & Accessibility Toolkit | 1.10.0 |
+| Image Description Generator | 1.8.0 |
+| Shell (start page, settings, Main Menu) | 1.12.2 |
+
+### Shared by every module that runs a job
+
+- **A finished run says how it went.** Green when it did what you asked
+  (including a Stop you pressed), **amber** when it finished with problems
+  to look at, and red when it ended in error or nothing it tried
+  succeeded. Amber is new, and meets WCAG 2.1 AA contrast like the rest.
+- **Your settings are remembered across a restart.** Each page keeps its
+  settings in a file beside the suite's configuration, so a restart no
+  longer puts a profile, an endpoint or a folder back to its default.
+  Clear for a new run keeps them, as before.
+- **No folder field has a default.** The pages used to fill folder fields
+  with `~/Desktop`, which on a computer whose Desktop is stored in OneDrive
+  is not the Desktop you see. A run now waits until you choose a folder,
+  and a blank or missing one is refused with a message that names the
+  field.
+
+### Image Description Generator and OCR & Accessibility Toolkit
+
+- **The reply limit is on the form, default 8,000.** It was part of each
+  description profile, and the factory "Alt text only" profile used 300.
+  On a thinking model the limit counts the model's reasoning, and the
+  reasoning varied by a factor of four on the same image between two
+  runs, so 300 refused most images. The OCR toolkit's alt-text drafts were
+  capped at 300 too; one setting now covers pages and drafts.
+- **A failed image or page reports what it was billed.** A reply the
+  provider cut off is still charged; its tokens now appear in the report,
+  and a retried request reports every attempt.
+- **"Uncertain: Uncertain: None." is read as no uncertain readings.** A
+  reply that repeated the label was counted as listing a doubt.
+
+### Batch File Downloader
+
+- **The Chrome bridge line leads with its verdict**, and no longer says
+  FAILED in front of a connection that got the timeout it asked for.
+- **Comments and the page's explanations describe what was measured, not
+  where.** The explanation of the session limits no longer says they
+  default to anything but 0.
+
+### Checks
+
+- A check that cannot run without Node.js is listed under `SKIPPED`
+  rather than counted as passed or left out silently.
+- The page checks drive each module through a restart, a blank folder
+  and a finished run of each color.
+
+### Known limits
+
+- **OCR & Accessibility Toolkit:** "Tagged" checks only that tags are
+  present and can be wrong on real files. "Alt Missing" is read from text,
+  not structure. "AI Pages" counts pages sent, not pages transcribed.
+- **Batch File Downloader:** not yet measured on a collection of several
+  thousand records. A run needs a person present for its whole length, to
+  answer any prompt asking whether one is.
+- **Structure HTML Drafting Tool:** ships nine example templates.
+- **Windows:** tested on two computers and in CI (see 1.0.0, below). Not
+  yet tested with a long run on a managed workstation.
+
 ## 1.0.0 — 2026-10-03
 
 The first public release.

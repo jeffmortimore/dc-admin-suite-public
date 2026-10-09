@@ -24,6 +24,7 @@ import ast
 import contextlib
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -202,7 +203,7 @@ def check_shell_returns_to_a_running_module(problems):
 
 
 # ---------------------------------------------------------------------------
-# One notification palette (v1.34.2 / shell v1.12). Jeff, 2026-10-01:
+# One notification palette (v1.34.2 / shell v1.12):
 # instructions gray, success green, errors and warnings red, across the
 # shell and every module. The block is duplicated verbatim — modules are
 # standalone — so the check is that every copy is the same copy.
@@ -210,7 +211,8 @@ def check_shell_returns_to_a_running_module(problems):
 PALETTE_RE = re.compile(r"/\* DC-PALETTE (\d+) .*?/\* /DC-PALETTE \*/", re.S)
 PALETTE_PAIRS = (("--dc-info-ink", "--dc-info-bg"),
                  ("--dc-ok-ink", "--dc-ok-bg"),
-                 ("--dc-bad-ink", "--dc-bad-bg"))
+                 ("--dc-bad-ink", "--dc-bad-bg"),
+                 ("--dc-amber-ink", "--dc-amber-bg"))
 
 
 def _luminance(hexcolor):
@@ -344,8 +346,8 @@ console.log(painted);
 
 
 # ---------------------------------------------------------------------------
-# DC-LOG 1 and DC-RUN 1 (2026-10-02, for the public release). Jeff's two
-# requests of 2026-10-01 — Clear for a new run, and a Copy log that is
+# DC-LOG 1 and DC-RUN 1 (for the public release). Two operator
+# requests — Clear for a new run, and a Copy log that is
 # exactly the current run — went into the downloader in v1.34.2 and into
 # every module with a log here. Count the group, not the pair: every page
 # with a log is in it, found by its markup rather than by a list someone
@@ -792,7 +794,7 @@ def check_callout_above_the_form(label, html, problems):
     """The message callout comes first inside <main>, before any form.
 
     It scrolls itself into view, so wherever it sits is where the page
-    jumps. 2026-10-02, Jeff: in the image describer every Save, Duplicate
+    jumps. In the image describer every Save, Duplicate
     and Delete threw the page to the bottom, "as we've seen before in
     other modules". Only the downloader had the callout above its form;
     eight modules had it beside the status line under the last fieldset.
@@ -814,7 +816,7 @@ def check_callout_above_the_form(label, html, problems):
 def check_dialogs_speak_for_themselves(label, html, problems):
     """Every dialog holds its own message region (role alert or status).
 
-    2026-10-02, Jeff: a profile Save the module refused put its error in
+    A profile Save the module refused once put its error in
     the page callout, behind the open dialog, so it looked like a Save
     that did nothing. A dialog's own actions must be able to answer inside
     it. STRUCTURAL, said so: that each dialog's script writes there is
@@ -900,6 +902,478 @@ def check_named_buttons_exist(problems):
                                 phrase.strip()))
 
 
+TONE_PY_RE = re.compile(r"# ---- DC-TONE (\d+) -+\n.*?# ---- /DC-TONE -+\n", re.S)
+TONE_JS_RE = re.compile(r"/\* DC-TONE (\d+):.*?/\* /DC-TONE \*/", re.S)
+
+
+def check_tones(node_bin, group, problems):
+    """DC-TONE 1 (1.0.1): green, amber, red for a finished run.
+
+    - every log module carries one DC-TONE Python block and its page one
+      DC-TONE script, and the copies agree;
+    - EVERY set_state(phase="done", ...) in every module passes outcome=
+      (ast, across all modules, not a list of call sites);
+    - each page colors its status line with logTone(s) and no longer with
+      a literal 'done' (a SOURCE check, said so - poll() needs a server);
+    - logTone() and each module's outcome_tone()/run_warnings() behave.
+    """
+    import ast
+    py, js = {}, {}
+    for label, html in group:
+        src = (SUITE / label).read_text(encoding="utf-8")
+        b = _one_block(label, src, TONE_PY_RE, "DC-TONE Python", problems)
+        if b is not None:
+            py[label] = b
+        b = _one_block(label, html, TONE_JS_RE, "DC-TONE script", problems)
+        if b is not None:
+            js[label] = b
+            if "\\" in b:
+                problems.append("{}: its DC-TONE script contains a "
+                                "backslash".format(label))
+        script = _strip_js_comments("\n".join(SCRIPT_RE.findall(html)))
+        if "className=logTone(s)" not in script:
+            problems.append("{}: its status line is not colored by "
+                            "logTone(s)".format(label))
+        if re.search(r"className\s*=\s*'done'|\?\s*'done'\s*:", script):
+            problems.append("{}: still colors a finished run 'done' "
+                            "whatever happened".format(label))
+    _agree(py, "DC-TONE Python", problems)
+    _agree(js, "DC-TONE script", problems)
+    for path in sorted((SUITE / "modules").glob("dc_*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for c in ast.walk(tree):
+            if not (isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+                    and c.func.id == "set_state"):
+                continue
+            kws = {k.arg: k.value for k in c.keywords}
+            ph = kws.get("phase")
+            if isinstance(ph, ast.Constant) and ph.value == "done" \
+                    and "outcome" not in kws:
+                problems.append("modules/{}:{}: set_state(phase=\"done\") "
+                                "without outcome=".format(path.name, c.lineno))
+    for label, _html in group:
+        M = _import_module(label)
+        quiet = M.log
+        try:
+            M.log = quiet
+            with contextlib.redirect_stdout(io.StringIO()):
+                M.begin_run_log()
+                M.log("an ordinary line")
+                M.log("a line that mentions a WARNING in passing")
+                n0 = M.run_warnings()
+                M.log("WARNING: something went wrong")
+                M.log("  WARNING: indented, as a per-item line is")
+                n2 = M.run_warnings()
+                M.begin_run_log()
+            got = (n0, n2, M.outcome_tone(0), M.outcome_tone(3, 1),
+                   M.outcome_tone(3, 0), M.outcome_tone(0, 0),
+                   M.outcome_tone(3))
+            want = (0, 2, "green", "amber", "red", "green", "amber")
+            if got != want:
+                problems.append("{}: outcome_tone/run_warnings gave {} (want "
+                                "{})".format(label, got, want))
+        finally:
+            M.log = quiet
+    if not group or not node_bin:
+        return
+    block = TONE_JS_RE.search(group[0][1]).group(0)
+    script = block + """
+const cases = [null, {phase:'scraping'}, {phase:'idle'}, {phase:'error'},
+  {phase:'done'}, {phase:'done', outcome:'green'},
+  {phase:'done', outcome:'amber'}, {phase:'done', outcome:'red'},
+  {phase:'error', outcome:'green'}];
+console.log(cases.map(logTone).join(','));
+"""
+    with tempfile.NamedTemporaryFile("w", suffix=".js", encoding="utf-8",
+                                     delete=False) as fh:
+        fh.write(script)
+        tmp = fh.name
+    try:
+        done = subprocess.run([node_bin, tmp], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=30)
+    finally:
+        Path(tmp).unlink()
+    want = ",,,error,done,done,amber,error,error"
+    if done.returncode != 0 or done.stdout.strip() != want:
+        problems.append("DC-TONE script: logTone gave {!r}, expected {!r}"
+                        .format(done.stdout.strip(), want))
+
+
+FORM_PY_RE = re.compile(r"# ---- DC-FORM (\d+) -+\n.*?# ---- /DC-FORM -+\n", re.S)
+FORM_JS_RE = re.compile(r"/\* DC-FORM (\d+):.*?/\* /DC-FORM \*/", re.S)
+CONTROL_RE = re.compile(r"<(input|select|textarea)\b([^>]*)>", re.S | re.I)
+
+
+def _form_value_for(html, fid):
+    """A value of the right kind for one kept control: text for a text
+    field or a choice (the first option), True for a box or a radio."""
+    m = re.search(r'<(input|select|textarea)\b[^>]*\bid="{}"[^>]*>'
+                  .format(re.escape(fid)), html)
+    tag = m.group(0) if m else ""
+    if re.search(r'type="(checkbox|radio)"', tag):
+        return True
+    if tag.startswith("<select"):
+        return ""
+    return "/kept/after/a/restart/" + fid
+
+
+def check_forms(node_bin, group, problems):
+    """DC-FORM 1 (1.0.1): the page's settings survive a restart.
+
+    - every module that runs a job (the log group) carries one DC-FORM
+      Python block and its page one DC-FORM script, and the copies agree;
+    - every control on the page is either kept (FORM_FIELDS) or declared
+      not kept (FORM_NOT_KEPT), found by markup, and every kept id exists;
+    - the page is served its own FORM_FIELDS, and poll() calls formSeen(s);
+    - driven: a form posted to one copy of the module is what a FRESH copy
+      (a restart) hands the page; Clear keeps it; a field an older version
+      wrote is dropped; an unreadable file is said and ignored;
+    - the script restores fields, waits for a choice whose option has not
+      loaded yet, and never saves before it has restored.
+    """
+    import threading
+    from http.server import ThreadingHTTPServer
+    py, js = {}, {}
+    tmp = tempfile.mkdtemp(prefix="dcform-")
+    try:
+        for label, html in group:
+            src = (SUITE / label).read_text(encoding="utf-8")
+            b = _one_block(label, src, FORM_PY_RE, "DC-FORM Python", problems)
+            if b is not None:
+                py[label] = b
+            b = _one_block(label, html, FORM_JS_RE, "DC-FORM script", problems)
+            if b is not None:
+                js[label] = b
+                if "\\" in b:
+                    problems.append("{}: its DC-FORM script contains a "
+                                    "backslash".format(label))
+            M = _import_module(label)
+            kept = list(getattr(M, "FORM_FIELDS", ()))
+            not_kept = list(getattr(M, "FORM_NOT_KEPT", ()))
+            ids = []
+            for t in CONTROL_RE.finditer(html):
+                i = re.search(r'\bid="([^"]+)"', t.group(2))
+                if i and not re.search(r'type="(file|hidden|button|submit)"',
+                                       t.group(2)):
+                    ids.append(i.group(1))
+            stray = [i for i in ids if i not in kept and i not in not_kept]
+            if stray:
+                problems.append("{}: control(s) neither kept nor declared not "
+                                "kept: {}".format(label, ", ".join(stray)))
+            gone = [i for i in kept + not_kept if i not in ids]
+            if gone:
+                problems.append("{}: FORM_FIELDS/FORM_NOT_KEPT name(s) with no "
+                                "control on the page: {}".format(
+                                    label, ", ".join(gone)))
+            served_page = M.build_page(M.load_session(
+                Path("/nonexistent/session.json")))
+            if isinstance(served_page, bytes):
+                served_page = served_page.decode("utf-8")
+            if "const FORM_IDS={};".format(json.dumps(kept)) \
+                    not in served_page or "__FORM_FIELDS__" in served_page:
+                problems.append("{}: the page is not served its own "
+                                "FORM_FIELDS (verify the served bytes)"
+                                .format(label))
+            script = _strip_js_comments("\n".join(SCRIPT_RE.findall(html)))
+            at = script.find("async function poll(")
+            if at < 0 or "formSeen(s)" not in script[at:at + 4000]:
+                problems.append("{}: poll() does not call formSeen(s)"
+                                .format(label))
+            if not kept:
+                problems.append("{}: keeps no settings".format(label))
+                continue
+            # Driven through a restart.
+            path = os.path.join(tmp, Path(label).stem + ".json")
+            form = {"fields": {k: _form_value_for(html, k) for k in kept},
+                    "parents": []}
+            quiet = M.log
+            said = []
+            try:
+                M.FORM_PATH = path
+                M.log = lambda m, *a: said.append(str(m))
+                session = M.load_session(Path("/nonexistent/session.json"))
+                srv = ThreadingHTTPServer(
+                    ("127.0.0.1", 0),
+                    M.make_handler(session, M.build_page(session)))
+                port = srv.server_address[1]
+                threading.Thread(target=srv.serve_forever,
+                                 daemon=True).start()
+                try:
+                    code, txt = _http(port, "/api/form", form)
+                    if code != 200:
+                        problems.append("{}: /api/form gave {} {}".format(
+                            label, code, txt[:160]))
+                    code, _ = _http(port, "/api/form",
+                                    {"fields": {"no-such-field": "x"}})
+                    if code != 400:
+                        problems.append("{}: /api/form took an unknown field "
+                                        "({})".format(label, code))
+                finally:
+                    srv.shutdown()
+                    srv.server_close()
+                M2 = _import_module(label)          # a restart
+                M2.FORM_PATH = path
+                M2.log = lambda m, *a: said.append(str(m))
+                srv = ThreadingHTTPServer(
+                    ("127.0.0.1", 0),
+                    M2.make_handler(session, M2.build_page(session)))
+                port = srv.server_address[1]
+                threading.Thread(target=srv.serve_forever,
+                                 daemon=True).start()
+                try:
+                    st = json.loads(_http(port, "/api/state")[1])
+                    if st.get("form") != form:
+                        problems.append("{}: after a restart the page was "
+                                        "handed {!r}, not the form it saved"
+                                        .format(label, st.get("form"))[:300])
+                    _http(port, "/api/clear", {})
+                    st = json.loads(_http(port, "/api/state")[1])
+                    if st.get("form") != form:
+                        problems.append("{}: Clear dropped the remembered "
+                                        "form".format(label))
+                finally:
+                    srv.shutdown()
+                    srv.server_close()
+                older = dict(form, fields=dict(form["fields"],
+                                               **{"retired-field": "x"}))
+                Path(path).write_text(json.dumps(older), encoding="utf-8")
+                if M2.load_form() != form:
+                    problems.append("{}: a field an older version saved was "
+                                    "not dropped".format(label))
+                Path(path).write_text("{not json", encoding="utf-8")
+                del said[:]
+                if M2.load_form() is not None or not any(
+                        "could not be read" in x for x in said):
+                    problems.append("{}: an unreadable saved form was not "
+                                    "ignored and said".format(label))
+            finally:
+                M.log = quiet
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    _agree(py, "DC-FORM Python", problems)
+    _agree(js, "DC-FORM script", problems)
+    if not group or not node_bin:
+        return
+    block = FORM_JS_RE.search(group[0][1]).group(0)
+    script = """
+const FORM_IDS = ['dir', 'box', 'pick', 'r1', 'r2'];
+const sent = [];
+function fetch(u, o){ sent.push(JSON.parse(o.body)); return {then(){}}; }
+function setTimeout(f){ f(); } function clearTimeout(){}
+const els = {};
+function mk(id, type, opts){ els[id] = {id:id, type:type, value:'', checked:false,
+  options: opts, fired:0, listeners:{},
+  addEventListener(t, f){ this.listeners[t] = f; },
+  dispatchEvent(){ this.fired += 1; }}; }
+mk('dir', 'text'); mk('box', 'checkbox'); mk('pick', 'select-one', []);
+mk('r1', 'radio'); mk('r2', 'radio'); els.r1.checked = true;
+const document = {getElementById: id => els[id] || null};
+""" + block + """
+saveForm(); const before = sent.length;
+formSeen({form: {fields: {dir: '/x', box: true, pick: 'Alt', r1: false, r2: true}}});
+const pendingAtFirst = els.pick.value;
+els.pick.options.push({value: 'Archival'}, {value: 'Alt'});
+formSeen({});
+els.dir.listeners.input();
+console.log(JSON.stringify([before, els.dir.value, els.box.checked,
+  pendingAtFirst, els.pick.value, els.r1.checked, els.r2.checked,
+  els.r2.fired, els.r1.fired, sent.length, sent[sent.length - 1].fields.pick]));
+"""
+    with tempfile.NamedTemporaryFile("w", suffix=".js", encoding="utf-8",
+                                     delete=False) as fh:
+        fh.write(script)
+        tmpjs = fh.name
+    try:
+        done = subprocess.run([node_bin, tmpjs], capture_output=True,
+                              text=True, encoding="utf-8", errors="replace",
+                              timeout=30)
+    finally:
+        Path(tmpjs).unlink()
+    want = '[0,"/x",true,"","Alt",false,true,1,0,1,"Alt"]'
+    if done.returncode != 0 or done.stdout.strip() != want:
+        problems.append("DC-FORM script: behaved as {!r}, expected {!r}{}"
+                        .format(done.stdout.strip(), want,
+                                " - " + _node_error(done)
+                                if done.returncode else ""))
+
+
+FOLDER_PY_RE = re.compile(r"# ---- DC-FOLDER (\d+) -+\n.*?# ---- /DC-FOLDER -+\n",
+                          re.S)
+FOLDER_INPUT_RE = re.compile(r'<input\b[^>]*\bid="([A-Za-z0-9_-]*dir)"[^>]*>',
+                             re.S)
+# (module, endpoint, body, the label the page gives that field). Every body
+# is INVALID on purpose - a blank or missing folder - so no worker starts.
+FOLDER_DRIVES = (
+    ("modules/dc_batch_revise.py", "/api/reports/scan",
+     {"folder": "", "kind": "hier"}, "Reports folder"),
+    ("modules/dc_batch_revise.py", "/api/reports/scan",
+     {"folder": "", "kind": "queue"}, "Queues folder"),
+    ("modules/dc_batch_revise.py", "/api/uploads/scan", {"folder": ""},
+     "Folder of revised .xls files"),
+    ("modules/dc_batch_revise.py", "/api/map", {"out_dir": ""},
+     "Queue workbook folder"),
+    ("modules/dc_batch_revise.py", "/api/start",
+     {"workflow": "download", "out_dir": ""}, "Save reports to"),
+    ("modules/dc_config_manager.py", "/api/scan",
+     {"kind": "inventory", "folder": ""}, "Workbooks folder"),
+    ("modules/dc_doi_xml.py", "/api/start", {"out_dir": "", "sets": []},
+     "Output folder"),
+    ("modules/dc_file_downloader.py", "/api/reports/scan", {"folder": ""},
+     "Reports folder"),
+    ("modules/dc_file_downloader.py", "/api/map", {"out_dir": ""},
+     "Save downloads to"),
+    ("modules/dc_file_downloader.py", "/api/map",
+     {"out_dir": "__TMP__", "report_dir": "__TMP__/no-such-folder"},
+     "Save reports to"),
+    ("modules/dc_hierarchy_mapper.py", "/api/start", {"out_dir": ""},
+     "Output folder"),
+    ("modules/dc_image_describer.py", "/api/scan",
+     {"mode": "folder", "folder": ""}, "Folder to scan"),
+    ("modules/dc_ocr_toolkit.py", "/api/scan",
+     {"mode": "run", "folder": ""}, "Downloader run folder"),
+    ("modules/dc_regenerator.py", "/api/reports/scan", {"folder": ""},
+     "Reports folder"),
+    ("modules/dc_regenerator.py", "/api/map", {"out_dir": ""},
+     "Output folder"),
+    ("modules/dc_url_scraper.py", "/api/start",
+     {"types": "__FIRST_TYPE__", "reports": "__FIRST_REPORT__",
+      "out_dir": ""}, "Output folder"),
+)
+
+
+def check_folder_fields(served, problems):
+    """DC-FOLDER 1 (1.0.1). No folder field carries a default, found by
+    markup on every page rather than by a list; every module with one
+    carries the one folder_error() block, the copies agree, and no other
+    "folder does not exist" message survives in its source (ast, string
+    literals only). Returns the modules that carry the block."""
+    import ast
+    group = []
+    for label, html in served:
+        defaulted = []
+        for m in FOLDER_INPUT_RE.finditer(html):
+            tag = m.group(0)
+            if 'type="text"' not in tag:
+                continue
+            v = re.search(r'\bvalue="([^"]*)"', tag)
+            if v and v.group(1).strip():
+                defaulted.append("{}={!r}".format(m.group(1), v.group(1)))
+        if defaulted:
+            problems.append("{}: folder field(s) with a default: {}".format(
+                label, ", ".join(defaulted)))
+        if not label.startswith("modules/"):
+            continue
+        has_fields = bool(FOLDER_INPUT_RE.search(html))
+        src = (SUITE / label).read_text(encoding="utf-8")
+        blocks = FOLDER_PY_RE.findall(src)
+        if has_fields and len(blocks) != 1:
+            problems.append("{}: has folder fields and {} DC-FOLDER "
+                            "block(s), not 1".format(label, len(blocks)))
+            continue
+        if not has_fields:
+            continue
+        group.append(label)
+        tree = ast.parse(src)
+        outside = []
+        for fn in [n for n in ast.walk(tree)
+                   if isinstance(n, ast.FunctionDef)
+                   and n.name != "folder_error"]:
+            for c in ast.walk(fn):
+                if isinstance(c, ast.Constant) and isinstance(c.value, str) \
+                        and re.search(r"folder does not exist",
+                                      c.value, re.I):
+                    outside.append("{}:{}".format(fn.name, c.lineno))
+        if outside:
+            problems.append("{}: a folder message outside folder_error(): {}"
+                            .format(label, ", ".join(sorted(set(outside)))))
+    texts = {lb: FOLDER_PY_RE.search(
+        (SUITE / lb).read_text(encoding="utf-8")).group(0) for lb in group}
+    if len(set(texts.values())) > 1:
+        first = group[0]
+        for lb in group[1:]:
+            if texts[lb] != texts[first]:
+                problems.append("{}: its DC-FOLDER block differs from {}'s"
+                                .format(lb, first))
+    return group
+
+
+def _fill_tmp(value, folder):
+    """Put a real folder where a drive says __TMP__, in the STRUCTURE.
+
+    The first version substituted into the JSON text, so the folder was
+    spliced into a string literal unescaped. A Windows temp path
+    (D:\\a\\...) then made an invalid escape and the whole check died
+    on CI; on Linux a backslash would have turned "\\f" into a form
+    feed and quietly tested a different folder. Strings are replaced
+    as strings, so a path is never parsed as anything else.
+    """
+    if isinstance(value, str):
+        return value.replace("__TMP__", folder)
+    if isinstance(value, dict):
+        return {k: _fill_tmp(v, folder) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_fill_tmp(v, folder) for v in value]
+    return value
+
+
+def check_folder_fields_driven(group, problems):
+    """Drive each module's server with a blank (or missing) folder and read
+    the answer: a 400 that names the field the way its page labels it."""
+    import threading
+    from http.server import ThreadingHTTPServer
+    # A BACKSLASH in the folder name wherever the platform allows one, so
+    # a Linux run handles the character every Windows path is full of.
+    # (On Windows it is the separator, and the temp path has plenty.)
+    tmp = tempfile.mkdtemp(prefix="dc\\folder-" if os.sep == "/"
+                           else "dcfolder-")
+    covered = set()
+    try:
+        for label in group:
+            M = _import_module(label)
+            quiet = M.log
+            M.log = lambda *_a, **_k: None
+            ok_dir = os.path.join(tmp, "exists")
+            os.makedirs(ok_dir, exist_ok=True)
+            for lb, path, body, want in FOLDER_DRIVES:
+                if lb != label:
+                    continue
+                covered.add(lb)
+                b = _fill_tmp(body, ok_dir)
+                if b.get("types") == "__FIRST_TYPE__":
+                    b["types"] = [sorted(M.CODE_TO_LABEL)[0]]
+                    b["reports"] = [sorted(M.REPORT_LABELS)[0]]
+                session = M.load_session(Path("/nonexistent/session.json"))
+                session["hub_url"] = "http://127.0.0.1:8750"
+                srv = ThreadingHTTPServer(
+                    ("127.0.0.1", 0),
+                    M.make_handler(session, M.build_page(session)))
+                port = srv.server_address[1]
+                threading.Thread(target=srv.serve_forever,
+                                 daemon=True).start()
+                try:
+                    code, txt = _http(port, path, b)
+                finally:
+                    srv.shutdown()
+                    srv.server_close()
+                quoted = "\u201c{}\u201d".format(want)
+                try:
+                    said = json.loads(txt).get("error", "")
+                except ValueError:
+                    said = txt
+                if code != 400 or quoted not in said:
+                    problems.append("{} {} with {}: gave {} {!r} (want 400 "
+                                    "naming {})".format(label, path, body,
+                                                        code, said[:160],
+                                                        quoted))
+            M.log = quiet
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    for label in group:
+        if label not in covered:
+            problems.append("{}: has folder fields and no driven check in "
+                            "FOLDER_DRIVES".format(label))
+
+
 def main():
     node_bin = shutil.which("node")
     if not node_bin:
@@ -926,12 +1400,18 @@ def main():
     group = check_log_blocks(served, problems)
     check_poll_reports_state(group, problems)
     check_log_block_in_node(node_bin, group, problems)
+    check_tones(node_bin, group, problems)
+    with contextlib.redirect_stdout(io.StringIO()):
+        check_forms(node_bin, group, problems)
     with contextlib.redirect_stdout(io.StringIO()):
         check_log_modules_driven(group, problems)
     check_run_folder_logs(problems)
     check_shell_steps_are_toned(node_bin, problems)
     check_shell_returns_to_a_running_module(problems)
     check_named_buttons_exist(problems)
+    folders = check_folder_fields(served, problems)
+    with contextlib.redirect_stdout(io.StringIO()):
+        check_folder_fields_driven(folders, problems)
 
     print("Served pages — verification")
     print("  pages checked: {}".format(len(PAGE_SOURCES)))
@@ -942,11 +1422,21 @@ def main():
         print("  every page parses, every id it uses exists in its markup,")
         print("  and every log renders through renderLog().")
         print("  Every page carries the one notification palette, and its")
-        print("  inks meet AA contrast.")
+        print("  inks meet AA contrast, amber included.")
+        print("  Every module that runs a job keeps its page's settings")
+        print("  across a restart (DC-FORM, driven), and every control on")
+        print("  its page is either kept or declared not kept.")
+        print("  Every finished run is colored by what happened: every")
+        print("  set_state(phase=\"done\") passes outcome=, and every page")
+        print("  shows it through logTone().")
         print("  The shell returns to a module that is already running.")
         print("  Every message callout sits above its page's form, and")
         print("  every dialog has a message region of its own.")
         print("  Every button a message tells the operator to click exists.")
+        print("  No folder field has a default; {} module(s) carry the one"
+              .format(len(folders)))
+        print("  DC-FOLDER block, and each was driven with a blank folder")
+        print("  and named the field the way its page labels it.")
         print("  {} module(s) with a log carry the one DC-LOG block; each was".format(len(group)))
         print("  driven: Copy log is the whole run, Clear is refused during")
         print("  a run and keeps what is loaded, and one start of many wins.")

@@ -97,7 +97,7 @@ MANIFEST = {
     "id": "file-downloader",
     "name": "Batch File Downloader",
     "description": "Download primary, native, supplemental, hidden, and versioned files for selected structures, with per-structure reports.",
-    "version": "1.34.3",
+    "version": "1.35.0",
     "requires": ["selenium", "beautifulsoup4", "openpyxl"],
 }
 
@@ -149,7 +149,7 @@ REQUEST_DELAY = 5.0                # default; the run may set its own
 # counts downloads and does not appear to count admin pages.
 #
 # The evidence is the Hierarchy Mapping Tool, which sleeps 1.0s between
-# admin page loads: on 2026-09-08 it made ~1,152 of them in 28 minutes with
+# admin page loads: in one measured run it made ~1,152 of them in 28 minutes with
 # no lockout, and a download run started two minutes later fetched 37 of 38
 # files unpenalised. Had admin traffic shared the download budget, that map
 # would have exhausted it many times over.
@@ -181,7 +181,7 @@ DRIVER_COMMAND_TIMEOUT = 300
 MAX_LISTING_PAGES = 400            # hard cap per state crawl (safety)
 LISTING_PAGE_SIZE = 25             # rows Digital Commons serves per page
 
-# Rate limiting. Digital Commons throttles a sustained run: on 2026-09-08
+# Rate limiting. Digital Commons throttles a sustained run: in one run
 # a 38-record gallery ran clean for 25 records and then answered HTTP 429
 # for the whole tail, and because a 429 fell through the native-fallback
 # path those twelve records were reported as having no downloadable file.
@@ -199,19 +199,19 @@ REDIRECT_CODES = (301, 302, 303, 307, 308)
 # The server ANSWERING that there is no such file. A 404 is not a failure
 # and not pushback: it is a fact about the record, and the only reason it
 # has not been usable until now is that the browser path cannot hear it.
-# Measured 2026-09-22 on two records reported `Failed:` by two off-campus
-# runs: both natives answered HTTP 404, both derivatives answered 200 with
+# Measured on two records reported `Failed:` by two runs from outside the
+# institution's network: both natives answered HTTP 404, both derivatives answered 200 with
 # the PDF, over the same cookie and the same four minutes.
 ABSENT_CODES = (404, 410)
 # What the server ASKS for, via Retry-After, is honored up to this. Beyond
-# it there is no point retrying: on 2026-09-08 DC asked for longer than the
+# it there is no point retrying: in one run DC asked for longer than the
 # 20s backoff cap, the cap silently overrode it, and three retries were
 # burned against a wall whose height the server had already stated. A wait
 # longer than this fails the row immediately, naming the number, so the
 # operator learns the real figure instead of a guess.
 RATE_HONOR_CAP = 120.0
 # A cooldown is a lockout with an ABSOLUTE expiry, which is what the
-# 2026-09-08 evidence showed: ten consecutive refusals reported 600, 598,
+# measured evidence showed: ten consecutive refusals reported 600, 598,
 # 595 ... 563 seconds, and `time + Retry-After` was the same instant to
 # within a second in every one. The wall does not move, so retrying inside
 # the window is provably futile - but every pending request shares the one
@@ -264,7 +264,7 @@ CHALLENGE_MARKERS = ("just a moment", "challenges.cloudflare.com",
 # A definite absence: the server answered, and the answer was that there is
 # no file. Usually a record whose upload was never a PDF.
 ABSENT_MARKERS = ("no pdf has been provided",
-                  # v1.34 — captured from the live page on 2026-09-29 by
+                  # v1.34 — captured from the live page by
                   # the native-absence probe, not paraphrased: a native
                   # URL with no file lands on the CGI form of itself,
                   # whose TITLE and BODY word it differently. Both
@@ -273,7 +273,7 @@ ABSENT_MARKERS = ("no pdf has been provided",
                   "sorry, that file doesn't exist")
 
 # A THIRD way the server was believed to say the same thing — and the
-# belief was wrong. From 2026-09-15 to 2026-09-22 this module recorded
+# belief was wrong. From v1.33.3 to v1.33.8 this module recorded
 # that "a content URL with no file behind it redirects to the repository's
 # own home page". It does not. That was never measured; it was a log line
 # misread, twice, a week apart.
@@ -281,8 +281,8 @@ ABSENT_MARKERS = ("no pdf has been provided",
 # What the module actually printed was `landed on: <the home page>`, which
 # reports WHERE THE TAB IS, not where the request went. A navigation that
 # never commits leaves the tab wherever it already was, and after the
-# first such request that is always the home page. Probed directly on
-# 2026-09-22 against a record that had failed this way in two runs: the
+# first such request that is always the home page. Probed directly
+# against a record that had failed this way in two runs: the
 # navigation timed out after 15s, no page rendered, the document identity
 # was byte-for-byte unchanged, and nothing arrived. The server had in fact
 # answered HTTP 404 — which the browser cannot hear at all.
@@ -330,7 +330,7 @@ VERIFY_MAX_HOLDS = 3
 # Directory watching, which is how a download is known to have finished.
 # Chrome writes <final>.crdownload while transferring and renames it on
 # completion, so the TRANSITION is the signal. "A new file appeared" is not:
-# a probe on 2026-09-14 counted a .DS_Store that Finder wrote as a 0.01 MB
+# a probe once counted a .DS_Store that Finder wrote as a 0.01 MB
 # download taking 39.9 seconds. Dotfiles are excluded everywhere.
 #
 # Chrome's own download events may be reachable and would make completion
@@ -342,7 +342,7 @@ VERIFY_MAX_HOLDS = 3
 # files without a miscount.
 BROWSER_START_WITHIN = 8.0         # nothing began arriving → it is not coming
 # How often the tab is glanced at WHILE waiting for a file. The first live
-# run (2026-09-14) met a verification prompt, the operator cleared it in
+# run (v1.33) met a verification prompt, the operator cleared it in
 # about two seconds, the file arrived normally, and the run reported that
 # no verification had been requested — because the tab was only ever read
 # AFTER the wait gave up. A prompt answered quickly is still a prompt, and
@@ -351,7 +351,7 @@ BROWSER_START_WITHIN = 8.0         # nothing began arriving → it is not coming
 BROWSER_OBSERVE = 0.5
 # v1.34: there is NO total ceiling on a transfer. A fixed 300 s gave up on
 # files that were still arriving — a 3.05 GB video took about three minutes
-# on 2026-09-29, and this module now has to expect 10 GB — and the partial
+# in one run, and this module now has to expect 10 GB — and the partial
 # was then thrown away, so the same row failed on every re-run. Patience is
 # measured by PROGRESS instead: a transfer that keeps growing is waited
 # for, and one that stops growing for BROWSER_STALL_LIMIT is given up.
@@ -365,21 +365,22 @@ PROGRESS_TICK = 60.0               # one "still waiting" line a minute —
                                    # for holds and transfers alike
 BROWSER_POLL = 0.3                 # seconds between folder reads
 # How long a .crdownload must sit at the same size before it counts as
-# stranded rather than in flight. Measured need, 2026-09-15: a video was
+# stranded rather than in flight. Measured need (v1.33.4): a video was
 # deleted mid-transfer because "is there a partial?" was the only question
 # asked.
 PARTIAL_STILL_FOR = 1.5
 BROWSER_PAGE_TIMEOUT = 15          # a download completes no navigation
 # v1.34.2. A NATIVE gets longer, because a missing native is the server's
-# slowest answer and the module's commonest. MEASURED twice: a HAR Jeff
-# captured on 2026-10-01 (native URL -> 302 in 93 ms -> the CGI form ->
-# 404 after 15,210 ms, load event at 15.58 s) and a curl on 2026-09-30
+# slowest answer and the module's commonest. MEASURED twice: a browser
+# network capture (native URL -> 302 in 93 ms -> the CGI form ->
+# 404 after 15,210 ms, load event at 15.58 s) and a curl
 # (15.48 s). At 15.0 s chromedriver stopped the load just before the
 # "Sorry" page arrived, so the tab never said anything about the request
-# and every missing native ended "not confirmed" off campus, ~28 s each.
+# and every missing native ended "not confirmed" from outside the
+# institution's network, ~28 s each.
 # 30 s is about twice the measured answer. It costs a successful download
 # nothing: a download completes no navigation and get() returns as the
-# file starts (09-28 campus run: downloads median 5-7 s a row against a
+# file starts (one measured run: downloads median 5-7 s a row against a
 # 5.0 s gap). Only a page that RENDERS slowly waits for it.
 BROWSER_NATIVE_PAGE_TIMEOUT = 30
 BROWSER_PAGE_TIMEOUT_DEFAULT = 300 # Selenium's own default, restored on close
@@ -521,7 +522,7 @@ def native_file_url(base_url: str, ctx: str, article: str) -> str:
         /cgi/viewcontent.cgi?article=N&context=CTX&type=native&preview_mode=1
     on the stated assumption that DC's path rewrite was "the same handler and
     the same response". It is not. Checked against a live record
-    (jesuit-gallery25 article 1000, a native-only image):
+    (photo-gallery25 article 1000, a native-only image):
 
         /context/CTX/article/N/type/native/viewcontent   -> the image bytes
         /cgi/viewcontent.cgi?...&type=native&preview_mode=1
@@ -641,7 +642,7 @@ def attach_chrome(session: dict):
     # default is 120s and nothing here was raising it.
     #
     # v1.28 attempted this and wrapped it in a bare `except: pass`, so when
-    # it did not take effect nothing said so — and two campus runs then
+    # it did not take effect nothing said so — and two runs then
     # failed at exactly 120.0s, which is precisely the tell that the raise
     # had not happened. A guard that quietly does nothing turns a bug into
     # a mystery. It reports now, and the caller logs it.
@@ -667,7 +668,7 @@ def attach_chrome(session: dict):
     # Selenium moves this lever between versions, so try every one that
     # exists on the live connection and then REPORT what it ends up at.
     #
-    # v1.29 got this half right and the report proved it: on Jeff's
+    # v1.29 got this half right and the report proved it: on the operator's
     # Selenium the class-level setter raises
     #   AttributeError: 'NoneType' object has no attribute 'timeout'
     # because RemoteConnection._client_config is None until an instance
@@ -684,7 +685,8 @@ def attach_chrome(session: dict):
             conn._timeout = DRIVER_COMMAND_TIMEOUT
             levers.append("_timeout")
         except Exception as e:            # noqa: BLE001
-            levers.append("_timeout FAILED ({})".format(e.__class__.__name__))
+            levers.append("_timeout unavailable ({})".format(
+                e.__class__.__name__))
         # Newer builds route it through a ClientConfig instead.
         cfg = getattr(conn, "_client_config", None)
         if cfg is not None:
@@ -692,14 +694,14 @@ def attach_chrome(session: dict):
                 cfg.timeout = DRIVER_COMMAND_TIMEOUT
                 levers.append("_client_config.timeout")
             except Exception as e:        # noqa: BLE001
-                levers.append("_client_config FAILED ({})"
+                levers.append("_client_config unavailable ({})"
                               .format(e.__class__.__name__))
         if hasattr(conn, "set_timeout"):
             try:
                 conn.set_timeout(DRIVER_COMMAND_TIMEOUT)
                 levers.append("conn.set_timeout")
             except Exception as e:        # noqa: BLE001
-                levers.append("conn.set_timeout FAILED ({})"
+                levers.append("conn.set_timeout unavailable ({})"
                               .format(e.__class__.__name__))
         # Read back whatever the connection now believes, preferring the
         # value a request would actually use.
@@ -717,15 +719,38 @@ def attach_chrome(session: dict):
         driver.set_page_load_timeout(DRIVER_COMMAND_TIMEOUT - 30)
         page_set = True
     except Exception as e:                # noqa: BLE001 - reported
-        page_set = "FAILED ({})".format(e.__class__.__name__)
+        page_set = "NOT set ({})".format(e.__class__.__name__)
 
-    driver._dc_timeout_report = (
-        "command timeout: connection reports {} (asked {}s; {}); "
-        "page-load timeout {}".format(
-            "{}s".format(actual) if actual else "unknown",
-            DRIVER_COMMAND_TIMEOUT, set_via,
-            "set" if page_set is True else page_set))
+    driver._dc_timeout_report = timeout_report(
+        actual, DRIVER_COMMAND_TIMEOUT, set_via, page_set)
     return driver
+
+
+def timeout_report(actual, asked, levers: str, page_set) -> str:
+    """The Chrome bridge line, verdict first.
+
+    Several levers are tried because Selenium moves them between versions,
+    and on any one Selenium some are unavailable. That is normal and is not
+    the verdict: the verdict is what the connection ends up reporting. So
+    the line opens with whether the command timeout is what was asked, and
+    lists the levers after it. 1.0.0 printed "asked 300s via FAILED (...)"
+    in front of a connection that had its 300 s - the word in front of a
+    success was the kind of message that gets acted on wrongly."""
+    try:
+        got = float(actual) if actual else None
+    except (TypeError, ValueError):
+        got = None
+    if got is None:
+        verdict = ("command timeout: could not be read back (asked {}s)"
+                   .format(asked))
+    elif got >= asked:
+        verdict = "command timeout {:g}s, as asked".format(got)
+    else:
+        verdict = ("command timeout is {:g}s, NOT the {}s asked - a long "
+                   "page may end the run at {:g}s".format(got, asked, got))
+    page = ("page-load timeout set" if page_set is True
+            else "page-load timeout " + str(page_set))
+    return "{}; {} (levers: {})".format(verdict, page, levers or "none")
 
 
 # ---------------------------------------------------------------------------
@@ -1127,7 +1152,7 @@ def _own_selection(a):
     The module used to ask only "is ANY radio in this row checked?", so a
     revision whose native was selected was labelled current in full — and
     its PDF, an earlier PDF, was saved and reported as the current one.
-    That is what `sspeach` article 1004 showed on 2026-10-01: two
+    That is what a journal's article 1004 showed in a live run: two
     revisions both labelled `current`, with different PDFs.
 
     Returns (group, selected): the radio's name and whether it is checked,
@@ -1522,7 +1547,7 @@ def build_filename(ctx, article, kind, visibility, version, orig_name,
     lead = "_".join(t for t in (safe_token(ctx), str(article), kind,
                                 visibility, version) if t)
     tail = safe_token(base) or "file"
-    # v1.34: a CAP. Measured on 2026-09-21's complete structure: saved
+    # v1.34: a CAP. Measured on one complete structure: saved
     # names reached 168 characters (214 with natives on), and at a
     # plausible managed-workstation destination 2 of 1,133 paths passed
     # Windows' 260-character limit — each of which ended the whole run.
@@ -2018,9 +2043,10 @@ class NotConfirmedHere(BrowserFetchFailed):
 
     The browser observed nothing it could read, and the network layer —
     the only path that hears a 404 — was asked to verify that a person is
-    present, which no program can answer honestly. Measured 2026-09-29
-    off campus: 337 native rows, every one of which had been an absence
-    or a 404 when the same collection was run on campus.
+    present, which no program can answer honestly. Measured from outside
+    the institution's network: 337 native rows, every one of which had
+    been an absence or a 404 when the same collection was run from inside
+    it.
 
     A failure, never an absence: nothing establishes that the file is not
     there. But not an ordinary failure either, because retrying it from
@@ -2411,22 +2437,22 @@ CHECKS_WIDTHS = [22, 10, 96, 21]
 # ---------------------------------------------------------------------------
 # SESSION LIMITS
 #
-# What the server is actually rationing is NOT KNOWN. Three days of measured
-# campus runs:
+# What the server was believed to be rationing was NOT KNOWN. Three days of
+# measured runs from inside one institution's network:
 #
-#     2026-09-09   379 files    322 MB   across four runs, never blocked
-#     2026-09-11   167 files    442 MB   blocked
-#     2026-09-10   158 files    766 MB   blocked
+#     day 1   379 files    322 MB   across four runs, never blocked
+#     day 2   158 files    766 MB   blocked
+#     day 3   167 files    442 MB   blocked
 #
-# A file count does not predict it: 176 files went through in one run on
-# 09-09 and 158 blocked on 09-10. Megabytes fit these three better — 322
+# A file count did not predict it: 176 files went through in one run on
+# day 1 and 158 blocked on day 2. Megabytes fit these three better — 322
 # through, 442 and 766 blocked — but three points and one address is not a
-# model, and the off-campus run blocked at 99 files / 200 MB, lower in both
-# units. Something about the address matters too.
+# model, and a run from outside that network blocked at 99 files / 200 MB,
+# lower in both units. Something about the address mattered too.
 #
 # So the module does not pick a theory. It carries BOTH limits, stops a
 # session on whichever binds first, and lets the operator change either one
-# in the plan. That is Jeff's design (2026-09-11) and it has three
+# in the plan. That is the operator's design (v1.32) and it has three
 # properties worth naming:
 #
 #   - it ships without the question being settled;
@@ -2445,8 +2471,8 @@ CHECKS_WIDTHS = [22, 10, 96, 21]
 # that turned out not to exist (2026-09-14: it was a verification prompt,
 # which now paces the work by itself). They are kept as history, and as
 # the values to type in if a limit is ever wanted again.
-SESSION_LIMIT_FILES = 0            # was 134: 85% of 158 (2026-09-10)
-SESSION_LIMIT_MB = 0               # was 375: 85% of 442 MB (2026-09-11)
+SESSION_LIMIT_FILES = 0            # was 134: 85% of 158 (day 2 above)
+SESSION_LIMIT_MB = 0               # was 375: 85% of 442 MB (day 3 above)
 
 SESSION_LIMITS = (
     # key         label                     unit    default
@@ -2457,10 +2483,10 @@ SESSION_LIMITS = (
 _LIMIT_BASIS = {
     # History, not advice: see SESSION_LIMIT_FILES. 0 means no limit.
     "max_files": "0 = no limit (the default since v1.34). Formerly 134: 85% of 158 — the fewest files served before a block "
-                 "(2026-09-10, on campus). Not known to be the unit the "
-                 "server counts: 176 files went through unblocked on 09-09.",
+                 "in one measured run. Not known to be the unit the "
+                 "server counts: 176 files went through unblocked in another.",
     "max_mb": "0 = no limit (the default since v1.34). Formerly 375: 85% of 442 MB — the least volume served before a block "
-              "(2026-09-11, on campus). Fits the campus runs better than a "
+              "in one measured run. Fits those runs better than a "
               "file count does, but is not proven to be the unit either.",
 }
 
@@ -2767,7 +2793,7 @@ RUNNING_PHASES = ("starting", "mapping", "downloading", "writing")
 # ---------------------------------------------------------------------------
 # One run per Chrome, across processes (v1.34.1).
 #
-# 2026-09-30: the module's tab was closed during a campus run, and opening
+# v1.34.1: the module's tab was closed during a run, and opening
 # the module again from the shell started a SECOND copy on the next port
 # instead of returning to the first. The one-run claim above lives in each
 # process's memory, so the idle copy would have accepted Start — and both
@@ -2947,8 +2973,9 @@ class ServerRefusing(StopRequested):
     _PARTIAL report lands, and the run is resumable. Only the summary needs
     to know the difference.
 
-    Measured 2026-09-10. Digital Commons imposes a ceiling on file
-    downloads per account or address — 99 off campus, 156 on campus — that
+    Measured (v1.29). Digital Commons imposes a ceiling on file
+    downloads per account or address — 99 from outside one institution's
+    network, 156 from inside it — that
     a fresh login does not reset, that ~35 minutes of quiet does not
     reset, and that pacing cannot avoid. After it, every file request is
     refused with HTTP 403. That run then spent 24 more minutes and 285
@@ -2976,8 +3003,8 @@ CLEAR_RESETS = {"last_file": None, "report_file": None, "run_dir": None,
 #
 # The page keeps the last 200 lines, so Copy log used to copy whatever the
 # box held: the tail of this run, or the end of the previous one and the
-# start of this. Jeff withheld a log on 2026-10-01 for exactly that reason
-# (downloader v1.34.2; the suite since 2026-10-02). RUN_LOG starts empty at
+# start of this, so a copied log could not be shared as the record of one
+# run (downloader v1.34.2; the suite since 1.0.0). RUN_LOG starts empty at
 # the module's run claim and holds every line since. Each module defines,
 # beside this block:
 #   RUN_LOG_NAME   the .txt saved into a run's folder ("..._{}.txt"), or
@@ -3078,6 +3105,167 @@ def send_run_log(handler):
 # ---- /DC-LOG --------------------------------------------------------------
 
 
+# ---- DC-TONE 1 -------------------------------------------------------------
+# The color of a finished run (1.0.1, three tones). Green: the state
+# matches what the operator intended - a run that did what was asked, or a
+# Stop the operator pressed. Amber: the run finished, with problems the
+# operator should look at. Red: the run ended in error, or nothing it
+# attempted succeeded. The module decides and puts it in STATE["outcome"];
+# the page only shows it (logTone() in the DC-TONE script). Every
+# set_state(phase="done", ...) passes outcome=, which _verify_pages.py checks
+# with ast in every module. Duplicated verbatim; the copies must agree.
+_WARNING_LINE_RE = re.compile(r"^\[[0-9:]+\]\s+WARNING\b")
+
+
+def run_warnings():
+    """How many WARNING lines the current run has logged."""
+    with LOCK:
+        return sum(1 for line in RUN_LOG if _WARNING_LINE_RE.match(line))
+
+
+def outcome_tone(problems, succeeded=None):
+    """"green", "amber" or "red" for a run that finished.
+
+    `problems` counts what went wrong - failed items, warnings, refusals.
+    `succeeded` is how many items came through, where the module counts
+    them; None means it does not, and then a run is never called red on
+    that ground."""
+    if problems and succeeded == 0:
+        return "red"
+    return "amber" if problems else "green"
+# ---- /DC-TONE --------------------------------------------------------------
+
+
+# ---- DC-FORM 1 -------------------------------------------------------------
+# The page's settings, remembered across launches (1.0.1; the downloader kept
+# them for one launch since v1.34.2). After a restart, the image describer's
+# profile went back to the default and its report folder to the Desktop,
+# so a rerun meant for "Alt text only" ran Archival and wrote its report
+# somewhere unexpected. Every module that
+# runs a job keeps its page's settings in STATE["form"] and in a file beside
+# the suite's configuration (config/forms/<module id>.json). Clear for a new
+# run keeps them. Each module defines FORM_FIELDS, the ids of its page's
+# settings, injected into the page so the two lists cannot drift.
+# Duplicated verbatim; _verify_pages.py checks the copies agree and drives
+# each one through a restart.
+FORM_TEXT_MAX = 65536
+FORM_PARENTS_MAX = 5000
+FORM_PATH = None        # tests point this elsewhere; None means config/forms
+
+
+def form_file():
+    """Where this module's remembered form lives."""
+    if FORM_PATH is not None:
+        return Path(FORM_PATH)
+    return DEFAULT_SESSION.parent / "forms" / (MANIFEST["id"] + ".json")
+
+
+def validate_form_state(body, known_only=False):
+    """The form as the page sent it, checked; raises ValueError if not.
+
+    Only fields in FORM_FIELDS, each a bool (a box or a radio) or a string
+    (a text field or a choice), plus the checked parent structures as a
+    list of strings. From the page, anything else is refused whole rather
+    than half-stored. From a file an earlier version wrote (known_only), a
+    field this version no longer has is dropped instead."""
+    if not isinstance(body, dict):
+        raise ValueError("the form must be an object")
+    fields = body.get("fields", {})
+    parents = body.get("parents", [])
+    if not isinstance(fields, dict) or not isinstance(parents, list):
+        raise ValueError("fields must be an object and parents a list")
+    out = {}
+    for key, value in fields.items():
+        if key not in FORM_FIELDS:
+            if known_only:
+                continue
+            raise ValueError("unknown form field: {!r}".format(key))
+        if isinstance(value, bool):
+            out[key] = value
+        elif isinstance(value, str) and len(value) <= FORM_TEXT_MAX:
+            out[key] = value
+        else:
+            raise ValueError("form field {} has an unusable value"
+                             .format(key))
+    if len(parents) > FORM_PARENTS_MAX or not all(
+            isinstance(p, str) and len(p) <= 256 for p in parents):
+        raise ValueError("parents must be a list of structure ids")
+    return {"fields": out, "parents": list(parents)}
+
+
+def load_form():
+    """The form an earlier launch saved, or None. A file that cannot be
+    read or used is said in the log, and the page starts from its
+    defaults - never half-restored."""
+    path = form_file()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        log("NOTE: the page's saved settings ({}) could not be read - {}; "
+            "the page starts from its defaults.".format(
+                path.name, e.__class__.__name__))
+        return None
+    try:
+        return validate_form_state(raw, known_only=True)
+    except ValueError as e:
+        log("NOTE: the page's saved settings ({}) were not usable - {}; "
+            "the page starts from its defaults.".format(path.name, e))
+        return None
+
+
+def save_form(form):
+    """Write the form beside the configuration. "" or what went wrong."""
+    path = form_file()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(form, indent=1, ensure_ascii=False),
+                       encoding="utf-8")
+        os.replace(str(tmp), str(path))
+        return ""
+    except OSError as e:
+        return "{}: {}".format(e.__class__.__name__, e)
+
+
+def form_for_page():
+    """Put the remembered form in STATE the first time a page asks."""
+    with LOCK:
+        if STATE.get("form_loaded"):
+            return
+    form = load_form()
+    with LOCK:
+        if not STATE.get("form_loaded"):
+            STATE["form"] = form
+            STATE["form_loaded"] = True
+
+
+def remember_form_request(handler):
+    """POST /api/form. Accepted during a run too: it changes nothing about
+    the run, and a page reopened mid-run is the one that needs it.
+    Returns (payload, status code)."""
+    try:
+        length = int(handler.headers.get("Content-Length", 0) or 0)
+        form = validate_form_state(json.loads(
+            handler.rfile.read(length).decode("utf-8") or "{}"))
+    except ValueError as e:
+        return {"error": str(e)}, 400
+    with LOCK:
+        STATE["form"] = form
+        STATE["form_loaded"] = True
+        said = STATE.get("form_save_said")
+    why = save_form(form)
+    if why and not said:
+        # Kept for this launch; said once, not on every keystroke.
+        log("NOTE: the page's settings could not be saved for the next "
+            "launch - {}. They are kept until this module stops.".format(why))
+        with LOCK:
+            STATE["form_save_said"] = True
+    return {"ok": True, "saved": not why}, 200
+# ---- /DC-FORM --------------------------------------------------------------
+
+
 def log(msg: str):
     line = time.strftime("[%H:%M:%S] ") + msg
     _LAST_LOG[0] = time.time()
@@ -3109,39 +3297,11 @@ FORM_FIELDS = (
     "pagedelay", "cooldowns", "rptdir", "retryunconfirmed", "reconcile",
     "retryrpt",
 )
-FORM_TEXT_MAX = 4096
-FORM_PARENTS_MAX = 5000
-
-
-def validate_form_state(body):
-    """The form as the page sent it, checked; raises ValueError if not.
-
-    Only known fields, each a bool (a box or a radio) or a short string (a
-    text field), plus the checked parent structures as a list of strings.
-    Anything else is refused whole rather than half-stored.
-    """
-    if not isinstance(body, dict):
-        raise ValueError("the form must be an object")
-    fields = body.get("fields", {})
-    parents = body.get("parents", [])
-    if not isinstance(fields, dict) or not isinstance(parents, list):
-        raise ValueError("fields must be an object and parents a list")
-    out = {}
-    for key, value in fields.items():
-        if key not in FORM_FIELDS:
-            raise ValueError("unknown form field: {!r}".format(key))
-        if isinstance(value, bool):
-            out[key] = value
-        elif isinstance(value, str) and len(value) <= FORM_TEXT_MAX:
-            out[key] = value
-        else:
-            raise ValueError("form field {} has an unusable value".format(key))
-    if len(parents) > FORM_PARENTS_MAX or not all(
-            isinstance(p, str) and len(p) <= 256 for p in parents):
-        raise ValueError("parents must be a list of structure ids")
-    return {"fields": out, "parents": list(parents)}
-
-
+# The page's other controls, which are NOT kept, and why: the reports found by a scan, the hierarchy filter, the log copy box.
+# Every control on the page is in one list or the other (_verify_pages.py).
+FORM_NOT_KEPT = (
+    "reports", "filter", "logfull",
+)
 def set_state(**kw):
     with LOCK:
         STATE.update(kw)
@@ -3165,7 +3325,7 @@ def set_progress_msg(msg):
     """Change the progress TEXT, keeping the counts already showing.
 
     A ten-minute cooldown happens deep inside the fetch, so the status line
-    kept whatever the item loop last set - which on 2026-09-08 left Jeff
+    kept whatever the item loop last set - which once left the operator
     watching a stale "item 36/38 · ETA --:--" for ten minutes with the
     countdown only in the log. The counts are still true; the sentence is
     what needs to change.
@@ -3276,8 +3436,8 @@ def _attach_or_fail(session):
         driver = get_driver(session)
     except Exception as e:
         # The underlying exception names both versions and the remedy when
-        # chromedriver is stale. Reporting only the class name sent Jeff to
-        # restart a Chrome that was already correct (2026-09-08).
+        # chromedriver is stale. Reporting only the class name sent the
+        # operator to restart a Chrome that was already correct.
         fail("Could not attach to Chrome. {}\n\nIf that names a ChromeDriver "
              "version mismatch, the driver on PATH is stale — Chrome updates "
              "itself and a hand-installed driver does not. Otherwise: start "
@@ -3866,7 +4026,7 @@ def ask_the_network(url, cookie, observed="", timeout=FILE_TIMEOUT,
     codes: over urllib a 404 and a 403 are different facts, while
     through Chrome there is no status at all. For most outcomes the tab
     substitutes — a challenge marker, an absence marker, a file landing.
-    For a 404 it does not substitute at all: measured 2026-09-22, the
+    For a 404 it does not substitute at all: measured (v1.33.9), the
     navigation simply never commits, so there is no page to read, no
     new document, and nothing to distinguish "no such file" from "the
     request went nowhere". Seven days of `Failed:` rows were that.
@@ -3940,7 +4100,8 @@ def ask_the_network(url, cookie, observed="", timeout=FILE_TIMEOUT,
             # poll, so every such prompt "cleared in 2s" without anyone
             # doing anything, the retry met the same 403, and three of
             # them in a row spent the per-file bound and ended the run as
-            # NotVerified. Measured off campus, 2026-09-22: three prompts
+            # NotVerified. Measured from outside the institution's
+            # network (v1.33.10): three prompts
             # in three file requests, no files, 23s to raise each and 2s
             # to "clear" it.
             #
@@ -3987,7 +4148,8 @@ def native_status(url, cookie, timeout=FILE_TIMEOUT):
 
     **Why this exists (v1.34).** A native with no file behind it is the
     commonest answer on a collection pass, and the browser cannot hear
-    it: measured 2026-09-29 on campus, the navigation never commits, so
+    it: measured from inside the institution's network, the navigation
+    never commits, so
     the page budget, the wait for a file and then the second opinion
     were all spent before the 404 was read — about 44 seconds a row.
     Asking first costs one request and is answered in about one.
@@ -3998,7 +4160,8 @@ def native_status(url, cookie, timeout=FILE_TIMEOUT):
     page where a file was expected is a question for the browser to
     read, not a file.
 
-    Off campus the network layer is challenged, and then the answer is
+    From outside that network the network layer is challenged, and then
+    the answer is
     "" and the browser path runs as it always has. Nothing is disguised
     and nothing is held for: see ask_the_network().
     """
@@ -4248,7 +4411,7 @@ class BrowserFetcher:
         showing X" says nothing about the request just made. Only "the
         tab CHANGED to X" does.
 
-        Measured 2026-09-15, and expensively: after a real challenge the
+        Measured in v1.33.4, and expensively: after a real challenge the
         tab was left on Cloudflare's own page, and every one of the next
         145 downloads read that frozen page as a fresh prompt. The audit
         trail — the artifact this whole feature exists to produce —
@@ -4273,9 +4436,9 @@ class BrowserFetcher:
         it looks identical to the last one, which appearance cannot see.
 
         It is worth being exact about what this did NOT fix, because
-        v1.33.7 shipped claiming it did. The 51 off-campus rows of
-        2026-09-21 were not redirects that `moved()` failed to notice.
-        Probed on 2026-09-22: the navigation never committed, so there
+        v1.33.7 shipped claiming it did. The 51 rows of a run from outside
+        the institution's network were not redirects that `moved()` failed
+        to notice. Probed directly: the navigation never committed, so there
         was no new document for this to compare and the tab stayed on
         the page it was already showing. This returns the same string
         before and after, correctly, and `served()` correctly says no.
@@ -4422,7 +4585,7 @@ class BrowserFetcher:
         # v1.33.5 taught _attempt() to ignore a frozen challenge page
         # and did not teach resume(), which is the thirteenth time in
         # this module that a rule reached one of a pair and not the
-        # other. Live proof, 2026-09-18: an off-campus run recorded
+        # other. Live proof: a run from outside the network recorded
         # three prompts where two had happened — the extra one filed
         # against the same file request as the first, with 0 files
         # between them, seventeen seconds later.
@@ -4531,7 +4694,7 @@ class BrowserFetcher:
                     # A redirect is the server answering, but WHAT it
                     # answered is on the page, not in the fact of the
                     # redirect. A page stating an absence was read just
-                    # above; anything else — measured 2026-09-29, a
+                    # above; anything else — measured, a
                     # "500 Internal Server Error" — establishes nothing,
                     # and until v1.34 it was written down as an absence.
                     # Asked at once rather than after the wait for a
@@ -5592,6 +5755,7 @@ def map_worker(session, out_dir, report_dir=""):
         set_model(build_model(rows, "mapped just now → " + fname))
         set_progress(total, total, "Done")
         set_state(phase="done", report_file=path,
+                  outcome=outcome_tone(run_warnings()),
                   summary="{} structures mapped → {}. Choose the scope and "
                           "options below, then Start.".format(len(rows),
                                                               fname))
@@ -5637,11 +5801,11 @@ def _fetch_listing(url: str, cookie: str):
         # ANY transport failure on the one-page request, not just an
         # explicit refusal.
         #
-        # 2026-09-10, on campus: the ETD `published` state answered
+        # Measured: the ETD `published` state answered
         # `RemoteDisconnected: Remote end closed connection without
         # response` after about sixty seconds. That state is 3,106 records
-        # in roughly 4.8 MB, and the same request had succeeded off campus
-        # the evening before — so this is a marginal, intermittent cost of
+        # in roughly 4.8 MB, and the same request had succeeded from
+        # another network the evening before — so this is a marginal, intermittent cost of
         # asking for the whole thing at once, not a property of the state.
         #
         # x_showall is an OPTIMIZATION. When it fails for any reason the
@@ -5887,10 +6051,10 @@ def plan_item_jobs(base_url, ctx, item, record_state, gallery, opts, cookie,
                         # The revisions table's copy of the current PDF
                         # is the UNSTAMPED one; the primary job above
                         # fetches the stamped derivative the public sees.
-                        # Different bytes (sspeach 1000: 254,280 against
+                        # Different bytes (one journal record: 254,280 against
                         # 235,659), so both are kept — and named apart,
                         # because "current" and "current_2" read as a
-                        # duplicate. Decided with Jeff, 2026-10-01.
+                        # duplicate. Decided with the operator (v1.34.2).
                         version = VERSION_CURRENT_UNSTAMPED
                     jobs.append({
                         "kind": f["kind"],
@@ -5971,8 +6135,8 @@ def file_identity(job):
     no derivative and falls back to the native; the natives job, at the
     short path-form URL; and the current revision's native, at its dated
     CGI URL. Three keys, one file, saved as X, X_2 and X_3: 93 of 142
-    files of `honors_symposium` on 2026-10-01. `sspeach` did the same to
-    its current natives.
+    files of one symposium collection in one run. A journal did the same
+    to its current natives.
 
     A file is (kind, form, version, revision): the stamped default stream
     and the revisions table's unstamped copy are different bytes and stay
@@ -6322,7 +6486,7 @@ def download_worker(session, out_dir, scope_mode, parents_sel, opts,
             # It used to load the first listing page with x_showall=1 —
             # 3,383 rows and ~4.8 MB on the ETD collection — which
             # exceeded Selenium's 120s command default. v1.28 changed that
-            # to the PAGED listing and two campus runs still died at
+            # to the PAGED listing and two runs still died at
             # exactly 120.0s, so an `editor.cgi` navigation is not
             # dependable through the DevTools channel whatever its size.
             #
@@ -6595,7 +6759,7 @@ def download_worker(session, out_dir, scope_mode, parents_sel, opts,
                     except Exception as e:
                         # An ABSENCE is not a FAILURE, and until 2026-09-09
                         # this reported both as "Failed:" and raised a
-                        # warning for each. The first campus run made the
+                        # warning for each. The first full run made the
                         # cost of that obvious: `native` was requested for
                         # 86 records in a series of 2017 PDF uploads, every
                         # one answered 404 — which is the server saying,
@@ -6786,7 +6950,7 @@ def download_worker(session, out_dir, scope_mode, parents_sel, opts,
                     "already saved are kept.".format(ctx))
 
             # Say what happened, not what usually happens. On the first
-            # complete v1.10 run this NOTE told Jeff that "files reported
+            # complete v1.10 run this NOTE told the operator that "files reported
             # as rate limited exist — re-run this structure" on a run that
             # had recovered every one of its 40 rows. A message that
             # asserts a failure which did not occur is the same defect as
@@ -6938,7 +7102,15 @@ def download_worker(session, out_dir, scope_mode, parents_sel, opts,
         summary += " · " + verify.summary()
         if path:
             summary += " · master log: " + os.path.basename(path)
-        set_state(phase="done", summary=summary, paused=False)
+        # Absences are the server answering, and access-restricted files
+        # came down as asked: neither is a problem. A refusal, a file not
+        # confirmed, a row left unfetched, an unrecognized release option
+        # and any warning are.
+        set_state(phase="done", summary=summary, paused=False,
+                  outcome=outcome_tone(
+                      n_warn + tot_unconfirmed + tot_403 + tot_failed
+                      + tot_unknown,
+                      succeeded=None if opts.get("inventory") else tot_files))
     except StopRequested as _stop:
         # ServerRefusing subclasses StopRequested, so everything below
         # already does the right thing; only the wording differs.
@@ -7018,7 +7190,15 @@ def download_worker(session, out_dir, scope_mode, parents_sel, opts,
             # operator actually looks.
             summary += " " + verify.summary()
             summary += " Partial master log: " + os.path.basename(path)
-            set_state(phase="done", paused=False, summary=summary)
+            # A Stop the operator pressed, or a session that spent its
+            # planned allowance, is what was intended. A server refusing
+            # every file, or a prompt nobody cleared, is not; a refusal
+            # before any file came down is red.
+            set_state(phase="done", paused=False, summary=summary,
+                      outcome=outcome_tone(
+                          sum(row[6] for row in master)
+                          + (1 if blocked or unverified else 0),
+                          succeeded=budget.files if blocked else None))
         else:
             set_state(phase="idle", paused=False)
             set_progress(0, 0, "")
@@ -7090,7 +7270,8 @@ RECORD_KIND = "record"
 # How many consecutive HTTP 403s before the run says, once, that this is a
 # block rather than a per-record permission problem.
 #
-# Measured 2026-09-09, off campus: the ETD collection downloaded 99 files
+# Measured from outside the institution's network: the ETD collection
+# downloaded 99 files
 # and then answered 403 to 80 consecutive requests. Every one of those 80
 # was on a record whose release option reads "open access", and four
 # ACCESS-RESTRICTED files had already downloaded successfully — so the
@@ -7490,7 +7671,7 @@ def session_slice(rows, cap, max_mb=0, avg_mb=0.0):
 # about a second and nothing from the download allowance.
 #
 # Records ADDED since the plan are counted and reported, and that is all.
-# Jeff was explicit that a snapshot missing new records is the correct
+# The operator was explicit that a snapshot missing new records is the correct
 # behaviour, not a defect to fix.
 DRIFT_GONE = "Skipped: no longer in this structure's listing"
 
@@ -7515,7 +7696,7 @@ def reconcile_rows(rows, live, planned=None):
     if rows and not live:
         # NOTHING CAME BACK, AND THAT IS NOT EVIDENCE OF ANYTHING.
         #
-        # Measured 2026-09-22. An expired session bounced the listing to
+        # Measured (v1.33.8). An expired session bounced the listing to
         # the login page, which was read as "no records in this state",
         # which arrived here as an empty `live` — and every outstanding
         # row was marked departed and skipped, with the report saying the
@@ -8665,7 +8846,16 @@ def retry_worker(session, out_dir, report_path, opts, report_dir=""):
                             rl["hits_page"], rl["page_base"]))
         summary += " · " + verify.summary()
         summary += " · master log: " + os.path.basename(mpath)
-        set_state(phase="done", summary=summary, paused=False)
+        # `still` and the structure warnings overlap: every failure the
+        # fixtures can produce is ALSO a warning, so planting `still` out
+        # changed no tone (1.0.1). It stays for a row that fails without a
+        # warning, a case no check exercises - said here rather than
+        # counted as covered.
+        set_state(phase="done", summary=summary, paused=False,
+                  outcome=outcome_tone(
+                      max(still, 0) + tot_unconfirmed
+                      + sum(row[6] for row in master),
+                      succeeded=tot_files + tot_absent))
     except StopRequested as _stop:
         # Until 2026-09-09 this wrote no report at all. download_worker was
         # given flush_pending in v1.20 for exactly this — a stop at row 33
@@ -8708,7 +8898,11 @@ def retry_worker(session, out_dir, report_path, opts, report_dir=""):
         summary += " " + verify.summary()
         summary += (" Partial report: " + pname) if pname else \
                    " No rows had been attempted, so no report was written."
-        set_state(phase="done", paused=False, summary=summary)
+        set_state(phase="done", paused=False, summary=summary,
+                  outcome=outcome_tone(
+                      sum(row[6] for row in master)
+                      + (1 if blocked or unverified else 0),
+                      succeeded=budget.files if blocked else None))
     except Exception as e:
         # A full disk on a long re-run is the obvious case, and it must not
         # cost the record of everything already fetched.
@@ -8816,21 +9010,27 @@ PAGE = r"""<!DOCTYPE html>
   padding:.5rem .7rem;border-radius:6px;border:1px solid #9aa5ad;background:#eef1f5}
 .logfull{width:100%;margin-top:.4rem;font:12px/1.4 ui-monospace,monospace}
 /* /DC-LOG styles */
-/* DC-PALETTE 2 — one notification palette for the shell and every module.
-   Gray: instructions and neutral state. Green: something succeeded.
-   Red: errors and warnings. The same block, byte for byte, in every page;
+/* DC-PALETTE 3 — one notification palette for the shell and every module.
+   Gray: instructions and neutral state. Green: the state matches what the
+   operator intended. Amber (version 3): a run that finished, with problems
+   to look at. Red: errors, and a run that ended in error or in which
+   nothing succeeded. The same block, byte for byte, in every page;
    modules/_verify_pages.py fails the build if any copy differs, and checks
    each ink against its background for WCAG 2.1 AA contrast. It sits last in
    each page's <style>, so it wins over the older per-page colors. */
 :root{--dc-info-bg:#eef1f5;--dc-info-line:#9aa5ad;--dc-info-ink:#2c3440;
  --dc-ok-bg:#eaf5ec;--dc-ok-line:#1d6b34;--dc-ok-ink:#14522a;
- --dc-bad-bg:#fbecec;--dc-bad-line:#a3252c;--dc-bad-ink:#7c1c22}
+ --dc-bad-bg:#fbecec;--dc-bad-line:#a3252c;--dc-bad-ink:#7c1c22;
+ --dc-amber-bg:#fff4d6;--dc-amber-line:#b07d12;--dc-amber-ink:#6b4300}
 #status,#status.waiting,#cerr.notice,.sum,.sum.warn,.status.info{
  background:var(--dc-info-bg);border-color:var(--dc-info-line);color:var(--dc-info-ink)}
 #status.done,#cerr.ok,.sum.loaded,.status.good,.notice{
  background:var(--dc-ok-bg);border-color:var(--dc-ok-line);color:var(--dc-ok-ink)}
 #status.error,#cerr,.sum.bad,.status.bad,.status.warn,.notice.err{
  background:var(--dc-bad-bg);border-color:var(--dc-bad-line);color:var(--dc-bad-ink)}
+#status.amber,#cerr.amber,.status.amber{
+ background:var(--dc-amber-bg);border-color:var(--dc-amber-line);color:var(--dc-amber-ink)}
+.dc-amber{color:var(--dc-amber-ink)}
 .dc-ok{color:var(--dc-ok-ink)}
 .dc-bad{color:var(--dc-bad-ink)}
 .dc-info{color:var(--dc-info-ink)}
@@ -8876,7 +9076,7 @@ PAGE = r"""<!DOCTYPE html>
  <div class="row">
   <div>
    <label for="repdir">Reports folder</label>
-   <input type="text" id="repdir" value="~/Desktop" autocomplete="off" spellcheck="false">
+   <input type="text" id="repdir" value="" autocomplete="off" spellcheck="false">
   </div>
   <button type="button" id="scan" class="small secondary">Scan</button>
  </div>
@@ -9102,33 +9302,28 @@ PAGE = r"""<!DOCTYPE html>
  takes everything outstanding, which is what a structure smaller than a
  day's allowance wants.</p>
  <details>
-  <summary>Where these defaults come from, and why there are two</summary>
-  <p class="hint"><strong>Which of the two the server actually counts is not
-  known.</strong> Measured on campus, this account:</p>
-  <p class="hint">
-   2026-09-09 &mdash; 379 files, 322 MB, across four runs: never blocked<br>
-   2026-09-11 &mdash; 167 files, 442 MB: blocked<br>
-   2026-09-10 &mdash; 158 files, 766 MB: blocked
-  </p>
-  <p class="hint">A file count does not predict it: 176 files went through
-  in a single run on 09-09 and 158 blocked the next day. Megabytes fit these
-  three better &mdash; 322 through, 442 and 766 blocked &mdash; but three
-  points from one address is not a rule, and an off-campus run blocked at 99
-  files and 200 MB, lower in both units. So the module carries both limits
-  rather than choosing, and the defaults are 85% of the lowest figure
-  measured in each unit: <strong>__LIMFILES__ files</strong> and
-  <strong>__LIMMB__ MB</strong>. 85% because a session sized at the ceiling
-  ends on a wall of refusals every time; the lowest because being early
-  costs a session and being late costs a day's allowance.</p>
-  <p class="hint">Raising or lowering either of these is a genuine
-  experiment, and the plan workbook records what was set, so the run is its
-  own evidence.</p>
+  <summary>Why both are 0 by default, and why there are two</summary>
+  <p class="hint">Both default to <strong>__LIMFILES__ files</strong> and
+  <strong>__LIMMB__ MB</strong> &mdash; that is, no limit. They were added
+  when the refusals a long run met were believed to be a download allowance,
+  and there were two because it was not known which unit the server counted.
+  The refusals turned out to be the repository asking whether a person is
+  present (see <em>What the refusals mean</em>, below), which the Chrome path
+  answers through you. So there is no allowance to size a session for.</p>
+  <p class="hint">The measurements they were built from, from one address:
+  379 files and 322 MB across four runs, never refused; 158 files and
+  766 MB, refused; 167 files and 442 MB, refused; and from another network,
+  99 files and 200 MB, refused. A file count did not predict the refusals
+  and megabytes only partly did &mdash; which is what an unanswered question
+  looks like, rather than an allowance.</p>
+  <p class="hint">Set either one to size a session deliberately. The plan
+  workbook records what was set, so the run is its own evidence.</p>
  </details>
 </fieldset>
 
 <fieldset id="sec4"><legend id="leg4">6 · Destination</legend>
  <label for="dldir">Save downloads to</label>
- <input type="text" id="dldir" value="~/Desktop" autocomplete="off" spellcheck="false">
+ <input type="text" id="dldir" value="" autocomplete="off" spellcheck="false">
  <p class="hint">Each run creates DC_FileDownloads_&lt;timestamp&gt;/ here,
  with one subfolder per structure. Files are renamed
  &lt;context&gt;_&lt;article&gt;_&lt;kind&gt;_&lt;visibility&gt;_&lt;version&gt;_&lt;original
@@ -9154,14 +9349,13 @@ PAGE = r"""<!DOCTYPE html>
    &mdash; after __BLOCKSTOP__ file requests refused in a row</label>
  </div>
  <p class="hint">Leave this on. Once the server starts refusing, the rest of
- a run is spent being told no &mdash; on 2026-09-10 that was 24 minutes and
- 285 requests. Stopping writes the same complete report a Stop does, with
+ a run is spent being told no &mdash; in one measured run that was 24
+ minutes and 285 requests. Stopping writes the same complete report a Stop does, with
  every un-reached record and its plan, so re-running it later picks up
  exactly where this left off.</p>
  <details><summary>What the refusals mean</summary>
   <p class="hint"><strong>This describes the network-layer path.</strong>
-  What was taken for a download quota during the week of 2026-09-08 is not
-  one. Digital Commons periodically asks a client to confirm a person is
+  What looked like a download quota is not one. Digital Commons periodically asks a client to confirm a person is
   present, and a request made outside a browser cannot answer that question,
   so it sees the refusal repeated indefinitely and nothing about waiting or
   logging in again changes it. Six days were spent measuring a ceiling that
@@ -9171,7 +9365,7 @@ PAGE = r"""<!DOCTYPE html>
   <p class="hint">On the Chrome path the same moment appears as a
   verification prompt, which you clear, and the run continues.</p>
   <p class="hint"><strong>A refusal here is not a permissions problem.</strong>
-  Of 80 refusals measured off campus, every one was on a record marked open
+  Of 80 refusals measured in one run, every one was on a record marked open
   access, while four access-restricted files downloaded successfully in the
   same run. It says nothing about what the records permit &mdash; and it
   never means the file is absent.</p>
@@ -9313,7 +9507,7 @@ PAGE = r"""<!DOCTYPE html>
    and snapped the scroll back to the tail. So: render only on change,
    append rather than replace, follow the tail only from the tail, and do
    not touch the DOM at all while a selection is live inside the box.
-   Reported by Jeff on 2026-09-08 while trying to copy a log line.
+   Found by an operator trying to copy one line out of a running log.
 ------------------------------------------------------------------------ */
 var logShown = null;
 var LOG_TAIL_SLOP = 24;      /* px from the bottom that still counts as "at the tail" */
@@ -9475,6 +9669,95 @@ function logStateSeen(s){
   });
 })();
 /* /DC-LOG */
+/* DC-TONE 1: the color of a finished run (1.0.1). Green (done): the state
+   matches what the operator intended. Amber: it finished, with problems to
+   look at. Red (error): it ended in error, or nothing it attempted
+   succeeded. The module decides, in s.outcome; this only shows it. Shared
+   by every module with a log and duplicated verbatim. */
+function logTone(s){
+  if(!s) return '';
+  if(s.phase === 'error') return 'error';
+  if(s.phase !== 'done') return '';
+  if(s.outcome === 'amber') return 'amber';
+  if(s.outcome === 'red') return 'error';
+  return 'done';
+}
+/* /DC-TONE */
+const FORM_IDS=__FORM_FIELDS__;
+/* DC-FORM 1: the page's settings, remembered across launches (1.0.1).
+   Every field named in FORM_IDS (the module's FORM_FIELDS, defined by the
+   page before this block) is sent to the module as it changes, and put
+   back when the page loads from a file the module keeps beside the suite's
+   configuration. A choice whose option has not loaded yet is put back when
+   it appears. Shared by every module that runs a job and duplicated
+   verbatim. A page may define formParents() (its checked structures) and
+   formRestoredHook(form) (what its own controls need afterwards). Every
+   page's poll() calls formSeen(s) with the state it just read. */
+var formRestored = false, formTimer = null, formPending = {};
+function formState(){
+  var fields = {};
+  FORM_IDS.forEach(function(id){
+    var el = document.getElementById(id); if(!el) return;
+    fields[id] = (el.type === 'checkbox' || el.type === 'radio') ? el.checked : el.value;
+  });
+  return {fields: fields,
+          parents: (typeof formParents === 'function') ? formParents() : []};
+}
+function saveForm(){
+  if(!formRestored) return;      /* never overwrite what is about to load */
+  clearTimeout(formTimer);
+  formTimer = setTimeout(function(){
+    fetch('/api/form', {method:'POST', cache:'no-store',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(formState())});
+  }, 400);
+}
+function formHasOption(el, v){
+  if(!el.options) return true;
+  for(var i = 0; i < el.options.length; i++){
+    if(el.options[i].value === v) return true;
+  }
+  return false;
+}
+function formFire(el){
+  if(el.dispatchEvent && typeof Event === 'function') el.dispatchEvent(new Event('change'));
+}
+function restoreForm(form){
+  var changed = [];
+  if(form && form.fields){
+    Object.keys(form.fields).forEach(function(id){
+      if(FORM_IDS.indexOf(id) < 0) return;
+      var el = document.getElementById(id); if(!el) return;
+      var v = form.fields[id];
+      if(el.type === 'checkbox' || el.type === 'radio'){ el.checked = !!v; }
+      else if(formHasOption(el, String(v))){ el.value = String(v); }
+      else { formPending[id] = String(v); return; }
+      changed.push(el);
+    });
+  }
+  formRestored = true;
+  FORM_IDS.forEach(function(id){
+    var el = document.getElementById(id); if(!el) return;
+    el.addEventListener('change', saveForm);
+    el.addEventListener('input', saveForm);
+  });
+  changed.forEach(function(el){ if(el.type !== 'radio' || el.checked) formFire(el); });
+  if(typeof formRestoredHook === 'function') formRestoredHook(form);
+}
+function formRetryPending(){
+  Object.keys(formPending).forEach(function(id){
+    var el = document.getElementById(id);
+    if(!el || !formHasOption(el, formPending[id])) return;
+    el.value = formPending[id];
+    delete formPending[id];
+    formFire(el);
+  });
+}
+function formSeen(s){
+  if(!formRestored){ restoreForm(s && s.form); return; }
+  formRetryPending();
+}
+/* /DC-FORM */
 
 (function(){
   const box = logEl(), btn = document.getElementById('logcopy');
@@ -9538,11 +9821,11 @@ loadBtn.addEventListener('click', async ()=>{
 });
 
 /* ---- Job mode -----------------------------------------------------------
-   Until 2026-09-11 the re-run controls sat at the FOOT of the page, after
+   Until v1.30 the re-run controls sat at the FOOT of the page, after
    four numbered sections none of which a re-run uses. Continuing a job
    meant walking past a required hierarchy source, a scope and a set of
    download options, with nothing saying whether they applied — a question
-   Jeff asked twice, which makes it the page's fault and not a gap in the
+   the operator asked twice, which makes it the page's fault and not a gap in the
    documentation. So the mode is the first thing asked, and the steps that
    do not apply are hidden rather than left to be guessed at.
 
@@ -9793,49 +10076,24 @@ async function refreshHierarchy(){
   renderList();
 }
 
-/* ---- The form survives a reopen (v1.34.2) -------------------------------
-   Every field is sent to the module as it changes and read back when the
-   page loads. 2026-10-01: a reopened tab came back with "Save reports to"
-   blank and the mode on Start — a silent change of destination for the
-   next run. FORM_IDS is the module's FORM_FIELDS, injected at serve time,
-   so the two lists cannot drift. */
-const FORM_IDS=__FORM_FIELDS__;
-let pendingParents=null, formRestored=false, formTimer=null;
-function formState(){
-  const fields={};
-  FORM_IDS.forEach(id=>{
-    const el=document.getElementById(id); if(!el) return;
-    fields[id]=(el.type==='checkbox'||el.type==='radio')?el.checked:el.value;
-  });
-  return {fields:fields, parents:[...checked]};
-}
-function saveForm(){
-  if(!formRestored) return;      /* never overwrite what is about to load */
-  clearTimeout(formTimer);
-  formTimer=setTimeout(()=>{ api('/api/form',formState()); },400);
-}
-function restoreForm(form){
-  formRestored=true;
+/* ---- The form survives a reopen (v1.34.2), and a restart (1.0.1) ------
+   2026-10-01: a reopened tab came back with "Save reports to" blank and
+   the mode on Start - a silent change of destination for the next run.
+   Since 1.0.1 the shared DC-FORM block (above) keeps the fields, in a file
+   beside the configuration, for every module that runs a job. The checked
+   structures and the job mode are this page's own; DC-FORM calls these. */
+let pendingParents=null;
+function formParents(){ return [...checked]; }
+function formRestoredHook(form){
   if(!form||!form.fields) return;
-  Object.keys(form.fields).forEach(id=>{
-    const el=document.getElementById(id); if(!el) return;
-    const v=form.fields[id];
-    if(el.type==='checkbox'||el.type==='radio') el.checked=!!v;
-    else el.value=String(v);
-  });
   pendingParents=form.parents||[];
   applyJobMode(); syncScope();
   if(hierLoaded&&nodes.length) refreshHierarchy();
 }
-FORM_IDS.forEach(id=>{
-  const el=document.getElementById(id); if(!el) return;
-  el.addEventListener('change',saveForm);
-  el.addEventListener('input',saveForm);
-});
 
 async function poll(){
   const s=await (await fetch('/api/state')).json();
-  if(!formRestored) restoreForm(s.form);
+  formSeen(s);
   renderLog(s.log); logStateSeen(s);
   paused=!!s.paused;
   pauseBtn.textContent=paused?'Resume':'Pause';
@@ -9875,7 +10133,7 @@ async function poll(){
   if(s.last_file) links+='<br><a href="/download">Download master log</a>';
   if(s.report_file) links+='<br><a href="/download-report">Download hierarchy report</a>';
   if(s.phase==='done'){
-    status.className='done'; status.innerHTML='Done: '+esc(s.summary)+links;
+    status.className=logTone(s); status.innerHTML='Done: '+esc(s.summary)+links;
   }else if(s.phase==='error'){
     status.className='error'; status.innerHTML='Error: '+esc(s.summary)+links;
   }else if(s.phase==='idle'){
@@ -10029,6 +10287,29 @@ def _fetch_option_error(opts):
     return ""
 
 
+# ---- DC-FOLDER 1 -----------------------------------------------------------
+# Folder fields carry no default (1.0.1). The pages used to fill every folder
+# field with ~/Desktop, a guess that goes wrong on a Windows computer whose
+# Desktop is redirected to OneDrive: a report lands in a folder the operator
+# does not see as the Desktop. Every folder a request names is judged here,
+# and the message names the field the way the page labels it. Duplicated
+# verbatim into every module with a folder field (modules are standalone);
+# _verify_pages.py checks that the copies agree and drives each one.
+def folder_error(label, path, optional=False):
+    """"" when `path` names an existing folder, or is blank and the field is
+    optional. Otherwise a message that names the field."""
+    if not path:
+        if optional:
+            return ""
+        return ("The \u201c{}\u201d field is empty — choose a folder "
+                "(it must exist already).".format(label))
+    if not os.path.isdir(path):
+        return ("The folder in \u201c{}\u201d does not exist: {} — "
+                "create it first, or choose another.".format(label, path))
+    return ""
+# ---- /DC-FOLDER ------------------------------------------------------------
+
+
 def request_allowed(handler) -> bool:
     """Reject requests that did not originate locally (DNS rebinding /
     cross-site form/fetch guard — see the module template)."""
@@ -10139,6 +10420,7 @@ def make_handler(session: dict, page: bytes):
             if not request_allowed(self):
                 return self._json({"error": "Forbidden (non-local request)."}, 403)
             if self.path == "/api/state":
+                form_for_page()
                 with LOCK:
                     return self._json(dict(STATE))
             if self.path == "/api/hierarchy":
@@ -10180,9 +10462,9 @@ def make_handler(session: dict, page: bytes):
                         str(self._body()["folder"]).strip())
                 except (KeyError, ValueError, json.JSONDecodeError):
                     return self._json({"error": "Bad request."}, 400)
-                if not folder or not os.path.isdir(folder):
-                    return self._json(
-                        {"error": "Folder does not exist: " + folder}, 400)
+                err_ = folder_error("Reports folder", folder)
+                if err_:
+                    return self._json({"error": err_}, 400)
                 return self._json(
                     {"reports": scan_reports(folder, HIER_GLOB)})
 
@@ -10219,14 +10501,12 @@ def make_handler(session: dict, page: bytes):
                         str(body.get("report_dir", "")).strip())
                 except (KeyError, ValueError, json.JSONDecodeError):
                     return self._json({"error": "Bad request."}, 400)
-                if not out_dir or not os.path.isdir(out_dir):
-                    return self._json(
-                        {"error": "Output folder does not exist: " + out_dir},
-                        400)
-                if report_dir and not os.path.isdir(report_dir):
-                    return self._json(
-                        {"error": "Report folder does not exist: "
-                                  + report_dir}, 400)
+                err_ = folder_error("Save downloads to", out_dir)
+                if err_:
+                    return self._json({"error": err_}, 400)
+                err_ = folder_error("Save reports to", report_dir, optional=True)
+                if err_:
+                    return self._json({"error": err_}, 400)
                 STOP_EVENT.clear()
                 PAUSE_EVENT.clear()
                 if not self._claim_and_start(
@@ -10276,14 +10556,12 @@ def make_handler(session: dict, page: bytes):
                      "stall_limit": stall_limit_v})
                 if bad:
                     return self._json({"error": bad}, 400)
-                if not out_dir or not os.path.isdir(out_dir):
-                    return self._json(
-                        {"error": "Output folder does not exist: "
-                                  + out_dir}, 400)
-                if report_dir and not os.path.isdir(report_dir):
-                    return self._json(
-                        {"error": "Report folder does not exist: "
-                                  + report_dir}, 400)
+                err_ = folder_error("Save downloads to", out_dir)
+                if err_:
+                    return self._json({"error": err_}, 400)
+                err_ = folder_error("Save reports to", report_dir, optional=True)
+                if err_:
+                    return self._json({"error": err_}, 400)
                 if not report_path or not os.path.exists(report_path):
                     return self._json(
                         {"error": "No such report or folder: "
@@ -10385,14 +10663,12 @@ def make_handler(session: dict, page: bytes):
                         {"error": "The gap before an admin page must be "
                                   "between 0 and {:.0f} seconds.".format(
                                       REQUEST_DELAY_MAX)}, 400)
-                if not out_dir or not os.path.isdir(out_dir):
-                    return self._json(
-                        {"error": "Output folder does not exist: " + out_dir},
-                        400)
-                if report_dir and not os.path.isdir(report_dir):
-                    return self._json(
-                        {"error": "Report folder does not exist: "
-                                  + report_dir}, 400)
+                err_ = folder_error("Save downloads to", out_dir)
+                if err_:
+                    return self._json({"error": err_}, 400)
+                err_ = folder_error("Save reports to", report_dir, optional=True)
+                if err_:
+                    return self._json({"error": err_}, 400)
                 if not (opts["primary"] or opts["supp"] or opts["native"]):
                     return self._json(
                         {"error": "Check at least one file kind."}, 400)
@@ -10421,15 +10697,8 @@ def make_handler(session: dict, page: bytes):
                 return self._json({"ok": True})
 
             if self.path == "/api/form":
-                # Accepted while a run is active too: it changes nothing
-                # about the run, and a page reopened MID-run is precisely
-                # the one that needs it.
-                try:
-                    form = validate_form_state(self._body())
-                except (ValueError, json.JSONDecodeError) as e:
-                    return self._json({"error": str(e)}, 400)
-                set_state(form=form)
-                return self._json({"ok": True})
+                payload, code = remember_form_request(self)
+                return self._json(payload, code)
 
             if self.path == "/api/clear":
                 # Refused while a run holds the slot, paused or not: the

@@ -49,6 +49,8 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(ROOT))
 
 import dc_ocr_toolkit as M              # noqa: E402
+# DC-FORM (1.0.1): a test must never write the operator's remembered form.
+M.FORM_PATH = os.path.join(tempfile.mkdtemp(prefix="dcocr-form-"), "f.json")
 import dc_image_describer as IMG        # noqa: E402
 
 
@@ -109,39 +111,69 @@ class RequestCeilings(unittest.TestCase):
 
     def test_gemini_builder_carries_the_ceiling(self):
         _u, _h, body = M.build_gemini_request(ep("gemini"), "p", b"i",
-                                              max_tokens=M.AI_OCR_MAX_TOKENS)
+                                              max_tokens=M.DEFAULT_REPLY_LIMIT)
         self.assertEqual(body["generationConfig"]["maxOutputTokens"],
-                         M.AI_OCR_MAX_TOKENS)
+                         M.DEFAULT_REPLY_LIMIT)
 
     def test_openai_builder_carries_the_ceiling_and_asks_for_usage(self):
         _u, _h, body = M.build_openai_request(ep("openai"), "p", b"i",
                                               stream=True,
-                                              max_tokens=M.AI_OCR_MAX_TOKENS)
-        self.assertEqual(body["max_tokens"], M.AI_OCR_MAX_TOKENS)
+                                              max_tokens=M.DEFAULT_REPLY_LIMIT)
+        self.assertEqual(body["max_tokens"], M.DEFAULT_REPLY_LIMIT)
         self.assertEqual(body["stream_options"], {"include_usage": True})
 
     def test_anthropic_builder_carries_the_ceiling(self):
         _u, _h, body = M.build_anthropic_request(
-            ep("anthropic"), "p", b"i", max_tokens=M.AI_OCR_MAX_TOKENS)
-        self.assertEqual(body["max_tokens"], M.AI_OCR_MAX_TOKENS)
+            ep("anthropic"), "p", b"i", max_tokens=M.DEFAULT_REPLY_LIMIT)
+        self.assertEqual(body["max_tokens"], M.DEFAULT_REPLY_LIMIT)
 
     def test_ocr_ceiling_reaches_the_wire(self):
         """The defect itself: no caller used to pass one."""
         with StreamPatch(GEMINI_LINES) as sp:
             M.ai_ocr_page(ep("gemini"), b"img", retries=0)
         self.assertEqual(sp.sent["generationConfig"]["maxOutputTokens"],
-                         M.AI_OCR_MAX_TOKENS)
+                         M.DEFAULT_REPLY_LIMIT)
+        with StreamPatch(GEMINI_LINES) as sp:
+            M.ai_ocr_page(ep("gemini"), b"img", retries=0, max_tokens=2500)
+        self.assertEqual(sp.sent["generationConfig"]["maxOutputTokens"],
+                         2500)
 
-    def test_alt_ceiling_reaches_the_wire_and_differs(self):
+    def test_the_forms_limit_reaches_an_alt_draft_too(self):
+        """1.0.1: one limit, from the form, for pages and alt drafts. 1.0.0
+        drafted alt text at 300, which a thinking model can spend on its
+        reasoning alone."""
+        with StreamPatch(GEMINI_LINES) as sp:
+            M.ai_alt_text(ep("gemini"), b"img", "image/png", retries=0,
+                          sink={"max_tokens": 1234})
+        self.assertEqual(sp.sent["generationConfig"]["maxOutputTokens"],
+                         1234)
         with StreamPatch(GEMINI_LINES) as sp:
             M.ai_alt_text(ep("gemini"), b"img", "image/png", retries=0)
         self.assertEqual(sp.sent["generationConfig"]["maxOutputTokens"],
-                         M.AI_ALT_MAX_TOKENS)
-        self.assertNotEqual(M.AI_ALT_MAX_TOKENS, M.AI_OCR_MAX_TOKENS)
+                         M.DEFAULT_REPLY_LIMIT)
+
+    def test_the_forms_limit_reaches_a_page_through_the_context(self):
+        ctx = M.new_ai_ctx({"max_tokens": 4321}, ep("gemini"))
+        self.assertEqual(ctx["max_tokens"], 4321)
+        ctx = M.new_ai_ctx({}, ep("gemini"))
+        self.assertEqual(ctx["max_tokens"], M.DEFAULT_REPLY_LIMIT)
 
     def test_the_ceiling_is_not_the_old_silent_default(self):
-        self.assertEqual(M.AI_OCR_MAX_TOKENS, 8000)
-        self.assertNotEqual(M.AI_OCR_MAX_TOKENS, M.DEFAULT_MAX_TOKENS)
+        self.assertEqual(M.DEFAULT_REPLY_LIMIT, 8000)
+        self.assertNotEqual(M.DEFAULT_REPLY_LIMIT, M.DEFAULT_MAX_TOKENS)
+
+    def test_a_refused_alt_draft_still_reports_what_it_cost(self):
+        lines = ['data: {"candidates":[{"content":{"parts":[{"text":"x"}]},'
+                 '"finishReason":"MAX_TOKENS"}],"usageMetadata":'
+                 '{"promptTokenCount":975,"candidatesTokenCount":20,'
+                 '"thoughtsTokenCount":280}}']
+        sink = M.new_ai_ctx({}, ep("gemini"))
+        with StreamPatch(lines):
+            with self.assertRaises(M.AIError):
+                M.ai_alt_text(ep("gemini"), b"img", "image/png", retries=0,
+                              sink=sink)
+        self.assertEqual((sink["usage"]["in"], sink["usage"]["out"]),
+                         (975, 300))
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +249,13 @@ class UncertainParsing(unittest.TestCase):
     def test_case_and_spacing_are_tolerated(self):
         self.assertEqual(M.parse_ocr_reply("t\nuncertain :  NONE")["state"],
                          "none")
+
+    def test_an_echoed_label_is_the_label_not_a_reading(self):
+        got = M.parse_ocr_reply("t\nUncertain: Uncertain: None.")
+        self.assertEqual((got["state"], got["uncertain"]), ("none", ""))
+        got = M.parse_ocr_reply("t\nUncertain: uncertain: line 4 faint")
+        self.assertEqual((got["state"], got["uncertain"]),
+                         ("listed", "line 4 faint"))
 
     def test_a_malformed_empty_line_is_not_a_clean_read(self):
         self.assertEqual(M.parse_ocr_reply("t\nUncertain:")["state"],
@@ -369,7 +408,9 @@ class PageIsolation(unittest.TestCase):
     def _run(self, replies, sink=None, check=lambda: None, concurrency=1):
         calls = {"n": 0}
 
-        def fake_page(endpoint, data, mime="image/png", retries=0):
+        def fake_page(endpoint, data, mime="image/png", retries=0,
+                      max_tokens=None):
+            self.__dict__.setdefault("page_limits", []).append(max_tokens)
             idx = calls["n"]
             calls["n"] += 1
             outcome = replies[idx] if idx < len(replies) else "ok"
@@ -510,6 +551,28 @@ class PageIsolation(unittest.TestCase):
                       Path(sidecar).read_text(encoding="utf-8"))
         self.assertEqual(sink["pages"][0]["refused"], "max_tokens")
 
+    def test_a_refused_page_still_reports_what_it_cost(self):
+        """Client 1.5: a refused page was billed, so its usage reaches the
+        file's totals. 1.0.0 recorded None for every refused page."""
+        refused = self._refusal()
+        refused.usage = {"in": 900, "out": 8000, "think": 7900,
+                         "cache_read": 0}
+        sink = M.new_ai_ctx({"ai_retries": 0}, ep("gemini"))
+        self._run(["p1", refused], sink=sink)
+        ok_pages = self.pages - 1             # every other page answers "ok"
+        self.assertEqual(sink["usage"]["out"], 20 * ok_pages + 8000)
+        self.assertEqual(sink["usage"]["think"], 5 * ok_pages + 7900)
+
+    def test_every_page_is_sent_the_forms_reply_limit(self):
+        """1.0.1: the limit travels from the form, through the per-file AI
+        context, to every page request - not a module constant."""
+        self.page_limits = []
+        sink = M.new_ai_ctx({"ai_retries": 0, "max_tokens": 2222},
+                            ep("gemini"))
+        self._run(["p1", "p2", "p3"], sink=sink)
+        self.assertTrue(self.page_limits)
+        self.assertEqual(set(self.page_limits), {2222})
+
 
 # ---------------------------------------------------------------------------
 # 6. Concurrency (C4)
@@ -522,7 +585,9 @@ class Concurrency(PageIsolation):
         order = []
         lock = threading.Lock()
 
-        def fake_page(endpoint, data, mime="image/png", retries=0):
+        def fake_page(endpoint, data, mime="image/png", retries=0,
+                      max_tokens=None):
+            self.__dict__.setdefault("page_limits", []).append(max_tokens)
             with lock:
                 order.append(len(order))
                 n = len(order)
@@ -712,6 +777,36 @@ class ValidateStart(unittest.TestCase):
         self.assertEqual(msg, "")
         self.assertEqual(cfg["ai_concurrency"], M.MAX_AI_CONCURRENCY)
 
+    def test_the_reply_limit_comes_from_the_form(self):
+        msg, cfg, _ep = M.validate_start(self.req(max_tokens="2000"),
+                                         self.model, self.tools, self.ai)
+        self.assertEqual((msg, cfg["max_tokens"]), ("", 2000))
+        msg, cfg, _ep = M.validate_start(self.req(), self.model,
+                                         self.tools, self.ai)
+        self.assertEqual(cfg["max_tokens"], 8000)
+        for bad in ("", "12", "x"):
+            msg, cfg, _ep = M.validate_start(self.req(max_tokens=bad),
+                                             self.model, self.tools, self.ai)
+            self.assertIn("Reply limit (output tokens)", msg, bad)
+            self.assertIsNone(cfg)
+
+    def test_a_blank_output_folder_is_refused_by_name(self):
+        msg, cfg, _ep = M.validate_start(self.req(out_dir=""), self.model,
+                                         self.tools, self.ai)
+        self.assertIn("\u201cOutput folder\u201d field is empty", msg)
+        self.assertIsNone(cfg)
+
+    def test_the_page_sends_the_reply_limit(self):
+        """SOURCE check, said so: the start body is assembled inside a click
+        handler that needs the whole page to run. The field must exist, be
+        enabled with the endpoint like the other AI settings, and be sent
+        as typed so a blank one is named by the server."""
+        page = M.build_page({"branding": {}})
+        page = page.decode("utf-8") if isinstance(page, bytes) else page
+        self.assertIn('id="aimaxtok"', page)
+        self.assertIn("aimaxtok.disabled=!has;", page)
+        self.assertIn("max_tokens:aimaxtok.value.trim(),", page)
+
     def test_it_is_still_a_pure_function(self):
         before = json.dumps(self.ai, sort_keys=True)
         M.validate_start(self.req(), self.model, self.tools, self.ai)
@@ -785,7 +880,13 @@ class ReportShape(unittest.TestCase):
 class ClientDrift(unittest.TestCase):
 
     def test_this_release_did_not_touch_the_client(self):
-        self.assertEqual(M.AI_CLIENT_VERSION, "1.4")
+        self.assertEqual(M.AI_CLIENT_VERSION, "1.5")
+
+    def test_both_modules_judge_a_reply_limit_the_same_way(self):
+        for raw in (None, "", " ", "x", "63", 64, "8000", 32000, "32001",
+                    "1.5", -1):
+            self.assertEqual(M.parse_reply_limit(raw),
+                             IMG.parse_reply_limit(raw), repr(raw))
         self.assertEqual(M.AI_CLIENT_VERSION, IMG.AI_CLIENT_VERSION)
 
     def test_the_usage_normaliser_is_still_shared(self):

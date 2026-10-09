@@ -49,8 +49,10 @@ colors, appear anywhere in it.
 ## `private_terms`
 
 A profile may also list words that must never appear in a copy you
-publish: for example a vendor's name, the vocabulary of a licence, or the
-names of your own folders and disks. Each entry is a pattern
+publish: for example a vendor's name, the vocabulary of a licence, the
+names of your own folders and disks, or the names of the collections and
+people your own testing used, so that run history written into comments
+cannot reach a public copy. Each entry is a pattern
 (case-insensitive, matched as whole words) and the reason it is private:
 
 ```
@@ -59,6 +61,10 @@ names of your own folders and disks. Each entry is a pattern
   {"pattern": "our-shared-drive", "why": "a folder on one computer"}
 ]
 ```
+
+The scan reads text with every hyphen turned into a space, so write a
+hyphenated name with spaces (`our shared drive`); a pattern that contains
+a hyphen is refused, because it could never match.
 
 `docs/make_distribution.py --generic` refuses to build if any file in the
 copy contains one, and also refuses when no profile declares any, because

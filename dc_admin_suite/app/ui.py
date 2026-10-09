@@ -163,21 +163,27 @@ APP_HTML = r"""<!DOCTYPE html>
     header{padding:.75rem .9rem} main{padding:.9rem}
     header nav a{margin-left:0; margin-right:1rem}
   }
-/* DC-PALETTE 2 — one notification palette for the shell and every module.
-   Gray: instructions and neutral state. Green: something succeeded.
-   Red: errors and warnings. The same block, byte for byte, in every page;
+/* DC-PALETTE 3 — one notification palette for the shell and every module.
+   Gray: instructions and neutral state. Green: the state matches what the
+   operator intended. Amber (version 3): a run that finished, with problems
+   to look at. Red: errors, and a run that ended in error or in which
+   nothing succeeded. The same block, byte for byte, in every page;
    modules/_verify_pages.py fails the build if any copy differs, and checks
    each ink against its background for WCAG 2.1 AA contrast. It sits last in
    each page's <style>, so it wins over the older per-page colors. */
 :root{--dc-info-bg:#eef1f5;--dc-info-line:#9aa5ad;--dc-info-ink:#2c3440;
  --dc-ok-bg:#eaf5ec;--dc-ok-line:#1d6b34;--dc-ok-ink:#14522a;
- --dc-bad-bg:#fbecec;--dc-bad-line:#a3252c;--dc-bad-ink:#7c1c22}
+ --dc-bad-bg:#fbecec;--dc-bad-line:#a3252c;--dc-bad-ink:#7c1c22;
+ --dc-amber-bg:#fff4d6;--dc-amber-line:#b07d12;--dc-amber-ink:#6b4300}
 #status,#status.waiting,#cerr.notice,.sum,.sum.warn,.status.info{
  background:var(--dc-info-bg);border-color:var(--dc-info-line);color:var(--dc-info-ink)}
 #status.done,#cerr.ok,.sum.loaded,.status.good,.notice{
  background:var(--dc-ok-bg);border-color:var(--dc-ok-line);color:var(--dc-ok-ink)}
 #status.error,#cerr,.sum.bad,.status.bad,.status.warn,.notice.err{
  background:var(--dc-bad-bg);border-color:var(--dc-bad-line);color:var(--dc-bad-ink)}
+#status.amber,#cerr.amber,.status.amber{
+ background:var(--dc-amber-bg);border-color:var(--dc-amber-line);color:var(--dc-amber-ink)}
+.dc-amber{color:var(--dc-amber-ink)}
 .dc-ok{color:var(--dc-ok-ink)}
 .dc-bad{color:var(--dc-bad-ink)}
 .dc-info{color:var(--dc-info-ink)}
@@ -515,7 +521,7 @@ APP_HTML = r"""<!DOCTYPE html>
 
 </main>
 <footer>
-  <p>DC Admin Suite · shell v1.12.1 · runs locally on your computer; nothing is
+  <p>DC Admin Suite · shell v1.12.2 · runs locally on your computer; nothing is
      sent anywhere except to your Digital Commons instance through your own
      Chrome session.</p>
 </footer>

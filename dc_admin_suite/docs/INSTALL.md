@@ -78,8 +78,10 @@ Then go to the Main Menu and open a module.
 
 ## 6. Choose where files go
 
-Modules that download files or write reports ask for a folder. Choose one
-yourself rather than accepting the default:
+Modules that download files or write reports ask for a folder. Since
+1.0.1 no folder field has a default: a run will not start until you choose
+one, and the message names the field. Each page remembers what you chose,
+even after the suite restarts.
 
 - **Create the folders first**, then enter their full paths, for example
   `C:\DC\downloads` and `C:\DC\reports` on Windows, or
@@ -88,9 +90,9 @@ yourself rather than accepting the default:
   to 260 characters, and downloaded files carry long names. The downloader
   checks this before it starts.
 - **On a managed Windows computer, your Desktop may be stored in
-  OneDrive.** The default `~/Desktop` then points to a different, local
-  Desktop folder from the one you see, and your reports seem to vanish.
-  An explicit folder avoids this.
+  OneDrive.** Then `~/Desktop` points to a different, local Desktop folder
+  from the one you see, and reports written there seem to vanish. Use the
+  full path of a folder you can see.
 
 ## 7. Make it yours (optional)
 
@@ -141,9 +143,9 @@ python3 docs/check_docs.py
   Those are the tests at work. **Only the last two lines count:**
   `passed: N` and `failed: 0`.
 - **Node.js is optional.** Without it, `_verify_pages.py` stops at once
-  with "node is not on PATH", five image describer tests are reported as
-  skipped, and the downloader runs fewer checks, so its passed total is
-  lower. None of these means the install is broken. Install Node.js from
+  with "node is not on PATH", some image describer tests are reported as
+  skipped, and the downloader lists the checks it could not run under
+  `SKIPPED`. None of these means the install is broken. Install Node.js from
   [nodejs.org](https://nodejs.org/) to run every check.
 
 ## Troubleshooting

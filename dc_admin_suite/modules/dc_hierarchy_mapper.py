@@ -51,7 +51,7 @@ MANIFEST = {
     "id": "hierarchy-mapper",
     "name": "Hierarchy Mapping Tool",
     "description": "Export all structure groupings and a sortable platform hierarchy to a spreadsheet.",
-    "version": "1.3.2",
+    "version": "1.4.0",
     "requires": ["selenium", "beautifulsoup4", "openpyxl"],
 }
 
@@ -330,8 +330,8 @@ CLEAR_RESETS = {"last_file": None, "paused": False}
 #
 # The page keeps the last 200 lines, so Copy log used to copy whatever the
 # box held: the tail of this run, or the end of the previous one and the
-# start of this. Jeff withheld a log on 2026-10-01 for exactly that reason
-# (downloader v1.34.2; the suite since 2026-10-02). RUN_LOG starts empty at
+# start of this, so a copied log could not be shared as the record of one
+# run (downloader v1.34.2; the suite since 1.0.0). RUN_LOG starts empty at
 # the module's run claim and holds every line since. Each module defines,
 # beside this block:
 #   RUN_LOG_NAME   the .txt saved into a run's folder ("..._{}.txt"), or
@@ -430,6 +430,177 @@ def send_run_log(handler):
     handler.end_headers()
     handler.wfile.write(data)
 # ---- /DC-LOG --------------------------------------------------------------
+
+
+# ---- DC-TONE 1 -------------------------------------------------------------
+# The color of a finished run (1.0.1, three tones). Green: the state
+# matches what the operator intended - a run that did what was asked, or a
+# Stop the operator pressed. Amber: the run finished, with problems the
+# operator should look at. Red: the run ended in error, or nothing it
+# attempted succeeded. The module decides and puts it in STATE["outcome"];
+# the page only shows it (logTone() in the DC-TONE script). Every
+# set_state(phase="done", ...) passes outcome=, which _verify_pages.py checks
+# with ast in every module. Duplicated verbatim; the copies must agree.
+_WARNING_LINE_RE = re.compile(r"^\[[0-9:]+\]\s+WARNING\b")
+
+
+def run_warnings():
+    """How many WARNING lines the current run has logged."""
+    with LOCK:
+        return sum(1 for line in RUN_LOG if _WARNING_LINE_RE.match(line))
+
+
+def outcome_tone(problems, succeeded=None):
+    """"green", "amber" or "red" for a run that finished.
+
+    `problems` counts what went wrong - failed items, warnings, refusals.
+    `succeeded` is how many items came through, where the module counts
+    them; None means it does not, and then a run is never called red on
+    that ground."""
+    if problems and succeeded == 0:
+        return "red"
+    return "amber" if problems else "green"
+# ---- /DC-TONE --------------------------------------------------------------
+
+
+# The page's settings, by element id, remembered across launches (DC-FORM, 1.0.1).
+FORM_FIELDS = ("outdir",
+)
+# The page's other controls, which are NOT kept, and why: the log copy box.
+# Every control on the page is in one list or the other (_verify_pages.py).
+FORM_NOT_KEPT = (
+    "logfull",
+)
+
+
+# ---- DC-FORM 1 -------------------------------------------------------------
+# The page's settings, remembered across launches (1.0.1; the downloader kept
+# them for one launch since v1.34.2). After a restart, the image describer's
+# profile went back to the default and its report folder to the Desktop,
+# so a rerun meant for "Alt text only" ran Archival and wrote its report
+# somewhere unexpected. Every module that
+# runs a job keeps its page's settings in STATE["form"] and in a file beside
+# the suite's configuration (config/forms/<module id>.json). Clear for a new
+# run keeps them. Each module defines FORM_FIELDS, the ids of its page's
+# settings, injected into the page so the two lists cannot drift.
+# Duplicated verbatim; _verify_pages.py checks the copies agree and drives
+# each one through a restart.
+FORM_TEXT_MAX = 65536
+FORM_PARENTS_MAX = 5000
+FORM_PATH = None        # tests point this elsewhere; None means config/forms
+
+
+def form_file():
+    """Where this module's remembered form lives."""
+    if FORM_PATH is not None:
+        return Path(FORM_PATH)
+    return DEFAULT_SESSION.parent / "forms" / (MANIFEST["id"] + ".json")
+
+
+def validate_form_state(body, known_only=False):
+    """The form as the page sent it, checked; raises ValueError if not.
+
+    Only fields in FORM_FIELDS, each a bool (a box or a radio) or a string
+    (a text field or a choice), plus the checked parent structures as a
+    list of strings. From the page, anything else is refused whole rather
+    than half-stored. From a file an earlier version wrote (known_only), a
+    field this version no longer has is dropped instead."""
+    if not isinstance(body, dict):
+        raise ValueError("the form must be an object")
+    fields = body.get("fields", {})
+    parents = body.get("parents", [])
+    if not isinstance(fields, dict) or not isinstance(parents, list):
+        raise ValueError("fields must be an object and parents a list")
+    out = {}
+    for key, value in fields.items():
+        if key not in FORM_FIELDS:
+            if known_only:
+                continue
+            raise ValueError("unknown form field: {!r}".format(key))
+        if isinstance(value, bool):
+            out[key] = value
+        elif isinstance(value, str) and len(value) <= FORM_TEXT_MAX:
+            out[key] = value
+        else:
+            raise ValueError("form field {} has an unusable value"
+                             .format(key))
+    if len(parents) > FORM_PARENTS_MAX or not all(
+            isinstance(p, str) and len(p) <= 256 for p in parents):
+        raise ValueError("parents must be a list of structure ids")
+    return {"fields": out, "parents": list(parents)}
+
+
+def load_form():
+    """The form an earlier launch saved, or None. A file that cannot be
+    read or used is said in the log, and the page starts from its
+    defaults - never half-restored."""
+    path = form_file()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        log("NOTE: the page's saved settings ({}) could not be read - {}; "
+            "the page starts from its defaults.".format(
+                path.name, e.__class__.__name__))
+        return None
+    try:
+        return validate_form_state(raw, known_only=True)
+    except ValueError as e:
+        log("NOTE: the page's saved settings ({}) were not usable - {}; "
+            "the page starts from its defaults.".format(path.name, e))
+        return None
+
+
+def save_form(form):
+    """Write the form beside the configuration. "" or what went wrong."""
+    path = form_file()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(form, indent=1, ensure_ascii=False),
+                       encoding="utf-8")
+        os.replace(str(tmp), str(path))
+        return ""
+    except OSError as e:
+        return "{}: {}".format(e.__class__.__name__, e)
+
+
+def form_for_page():
+    """Put the remembered form in STATE the first time a page asks."""
+    with LOCK:
+        if STATE.get("form_loaded"):
+            return
+    form = load_form()
+    with LOCK:
+        if not STATE.get("form_loaded"):
+            STATE["form"] = form
+            STATE["form_loaded"] = True
+
+
+def remember_form_request(handler):
+    """POST /api/form. Accepted during a run too: it changes nothing about
+    the run, and a page reopened mid-run is the one that needs it.
+    Returns (payload, status code)."""
+    try:
+        length = int(handler.headers.get("Content-Length", 0) or 0)
+        form = validate_form_state(json.loads(
+            handler.rfile.read(length).decode("utf-8") or "{}"))
+    except ValueError as e:
+        return {"error": str(e)}, 400
+    with LOCK:
+        STATE["form"] = form
+        STATE["form_loaded"] = True
+        said = STATE.get("form_save_said")
+    why = save_form(form)
+    if why and not said:
+        # Kept for this launch; said once, not on every keystroke.
+        log("NOTE: the page's settings could not be saved for the next "
+            "launch - {}. They are kept until this module stops.".format(why))
+        with LOCK:
+            STATE["form_save_said"] = True
+    return {"ok": True, "saved": not why}, 200
+# ---- /DC-FORM --------------------------------------------------------------
 
 
 # ---- DC-RUN 1 -------------------------------------------------------------
@@ -653,7 +824,8 @@ def crawl_worker(session, out_dir):
         if stopped:
             summary = "Stopped early ({} of {} read). Partial report: {}" \
                 .format(len(parents), total, os.path.basename(path))
-        set_state(phase="done", last_file=path, summary=summary, paused=False)
+        set_state(phase="done", last_file=path, summary=summary, paused=False,
+                  outcome=outcome_tone(run_warnings()))
     except Exception as e:
         fail("Unexpected error: {}: {}".format(e.__class__.__name__, e))
 
@@ -745,21 +917,27 @@ PAGE = """<!DOCTYPE html>
   padding:.5rem .7rem;border-radius:6px;border:1px solid #9aa5ad;background:#eef1f5}
 .logfull{width:100%;margin-top:.4rem;font:12px/1.4 ui-monospace,monospace}
 /* /DC-LOG styles */
-/* DC-PALETTE 2 — one notification palette for the shell and every module.
-   Gray: instructions and neutral state. Green: something succeeded.
-   Red: errors and warnings. The same block, byte for byte, in every page;
+/* DC-PALETTE 3 — one notification palette for the shell and every module.
+   Gray: instructions and neutral state. Green: the state matches what the
+   operator intended. Amber (version 3): a run that finished, with problems
+   to look at. Red: errors, and a run that ended in error or in which
+   nothing succeeded. The same block, byte for byte, in every page;
    modules/_verify_pages.py fails the build if any copy differs, and checks
    each ink against its background for WCAG 2.1 AA contrast. It sits last in
    each page's <style>, so it wins over the older per-page colors. */
 :root{--dc-info-bg:#eef1f5;--dc-info-line:#9aa5ad;--dc-info-ink:#2c3440;
  --dc-ok-bg:#eaf5ec;--dc-ok-line:#1d6b34;--dc-ok-ink:#14522a;
- --dc-bad-bg:#fbecec;--dc-bad-line:#a3252c;--dc-bad-ink:#7c1c22}
+ --dc-bad-bg:#fbecec;--dc-bad-line:#a3252c;--dc-bad-ink:#7c1c22;
+ --dc-amber-bg:#fff4d6;--dc-amber-line:#b07d12;--dc-amber-ink:#6b4300}
 #status,#status.waiting,#cerr.notice,.sum,.sum.warn,.status.info{
  background:var(--dc-info-bg);border-color:var(--dc-info-line);color:var(--dc-info-ink)}
 #status.done,#cerr.ok,.sum.loaded,.status.good,.notice{
  background:var(--dc-ok-bg);border-color:var(--dc-ok-line);color:var(--dc-ok-ink)}
 #status.error,#cerr,.sum.bad,.status.bad,.status.warn,.notice.err{
  background:var(--dc-bad-bg);border-color:var(--dc-bad-line);color:var(--dc-bad-ink)}
+#status.amber,#cerr.amber,.status.amber{
+ background:var(--dc-amber-bg);border-color:var(--dc-amber-line);color:var(--dc-amber-ink)}
+.dc-amber{color:var(--dc-amber-ink)}
 .dc-ok{color:var(--dc-ok-ink)}
 .dc-bad{color:var(--dc-bad-ink)}
 .dc-info{color:var(--dc-info-ink)}
@@ -784,7 +962,7 @@ PAGE = """<!DOCTYPE html>
 <form id="form">
  <fieldset><legend>Output</legend>
   <label for="outdir" style="display:block;margin-bottom:.3rem">Output folder</label>
-  <input type="text" id="outdir" name="outdir" value="~/Desktop"
+  <input type="text" id="outdir" name="outdir" value=""
          autocomplete="off" spellcheck="false">
  </fieldset>
  <div class="controls">
@@ -823,7 +1001,7 @@ PAGE = """<!DOCTYPE html>
    and snapped the scroll back to the tail. So: render only on change,
    append rather than replace, follow the tail only from the tail, and do
    not touch the DOM at all while a selection is live inside the box.
-   Reported by Jeff on 2026-09-08 while trying to copy a log line.
+   Found by an operator trying to copy one line out of a running log.
 ------------------------------------------------------------------------ */
 var logShown = null;
 var LOG_TAIL_SLOP = 24;      /* px from the bottom that still counts as "at the tail" */
@@ -985,6 +1163,95 @@ function logStateSeen(s){
   });
 })();
 /* /DC-LOG */
+/* DC-TONE 1: the color of a finished run (1.0.1). Green (done): the state
+   matches what the operator intended. Amber: it finished, with problems to
+   look at. Red (error): it ended in error, or nothing it attempted
+   succeeded. The module decides, in s.outcome; this only shows it. Shared
+   by every module with a log and duplicated verbatim. */
+function logTone(s){
+  if(!s) return '';
+  if(s.phase === 'error') return 'error';
+  if(s.phase !== 'done') return '';
+  if(s.outcome === 'amber') return 'amber';
+  if(s.outcome === 'red') return 'error';
+  return 'done';
+}
+/* /DC-TONE */
+const FORM_IDS=__FORM_FIELDS__;
+/* DC-FORM 1: the page's settings, remembered across launches (1.0.1).
+   Every field named in FORM_IDS (the module's FORM_FIELDS, defined by the
+   page before this block) is sent to the module as it changes, and put
+   back when the page loads from a file the module keeps beside the suite's
+   configuration. A choice whose option has not loaded yet is put back when
+   it appears. Shared by every module that runs a job and duplicated
+   verbatim. A page may define formParents() (its checked structures) and
+   formRestoredHook(form) (what its own controls need afterwards). Every
+   page's poll() calls formSeen(s) with the state it just read. */
+var formRestored = false, formTimer = null, formPending = {};
+function formState(){
+  var fields = {};
+  FORM_IDS.forEach(function(id){
+    var el = document.getElementById(id); if(!el) return;
+    fields[id] = (el.type === 'checkbox' || el.type === 'radio') ? el.checked : el.value;
+  });
+  return {fields: fields,
+          parents: (typeof formParents === 'function') ? formParents() : []};
+}
+function saveForm(){
+  if(!formRestored) return;      /* never overwrite what is about to load */
+  clearTimeout(formTimer);
+  formTimer = setTimeout(function(){
+    fetch('/api/form', {method:'POST', cache:'no-store',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(formState())});
+  }, 400);
+}
+function formHasOption(el, v){
+  if(!el.options) return true;
+  for(var i = 0; i < el.options.length; i++){
+    if(el.options[i].value === v) return true;
+  }
+  return false;
+}
+function formFire(el){
+  if(el.dispatchEvent && typeof Event === 'function') el.dispatchEvent(new Event('change'));
+}
+function restoreForm(form){
+  var changed = [];
+  if(form && form.fields){
+    Object.keys(form.fields).forEach(function(id){
+      if(FORM_IDS.indexOf(id) < 0) return;
+      var el = document.getElementById(id); if(!el) return;
+      var v = form.fields[id];
+      if(el.type === 'checkbox' || el.type === 'radio'){ el.checked = !!v; }
+      else if(formHasOption(el, String(v))){ el.value = String(v); }
+      else { formPending[id] = String(v); return; }
+      changed.push(el);
+    });
+  }
+  formRestored = true;
+  FORM_IDS.forEach(function(id){
+    var el = document.getElementById(id); if(!el) return;
+    el.addEventListener('change', saveForm);
+    el.addEventListener('input', saveForm);
+  });
+  changed.forEach(function(el){ if(el.type !== 'radio' || el.checked) formFire(el); });
+  if(typeof formRestoredHook === 'function') formRestoredHook(form);
+}
+function formRetryPending(){
+  Object.keys(formPending).forEach(function(id){
+    var el = document.getElementById(id);
+    if(!el || !formHasOption(el, formPending[id])) return;
+    el.value = formPending[id];
+    delete formPending[id];
+    formFire(el);
+  });
+}
+function formSeen(s){
+  if(!formRestored){ restoreForm(s && s.form); return; }
+  formRetryPending();
+}
+/* /DC-FORM */
 
 (function(){
   const box = logEl(), btn = document.getElementById('logcopy');
@@ -1052,7 +1319,6 @@ form.addEventListener('submit', async (e)=>{
   e.preventDefault();
   clearErr();   // a fixed problem takes its message down
   const outdir=form.outdir.value.trim();
-  if(!outdir){showErr('Enter an output folder.');return;}
   go.disabled=true;
   const r=await fetch('/api/start',{method:'POST',
     headers:{'Content-Type':'application/json'},
@@ -1077,7 +1343,7 @@ stopBtn.addEventListener('click', async ()=>{
 
 async function poll(){
   const s=await (await fetch('/api/state')).json();
-  renderLog(s.log); logStateSeen(s);
+  renderLog(s.log); formSeen(s); logStateSeen(s);
   paused=!!s.paused;
   pauseBtn.textContent=paused?'Resume':'Pause';
   const running=['starting','scraping','writing'].includes(s.phase);
@@ -1089,7 +1355,7 @@ async function poll(){
   const msg=p.msg?' — '+p.msg:'';
   const dl='<br><a id="dl" href="/download">Download workbook</a>';
   if(s.phase==='done'){
-    status.className='done';
+    status.className=logTone(s);
     status.innerHTML='Done: '+esc(s.summary)+(s.last_file?dl:'');
   }else if(s.phase==='error'){
     status.className='error';
@@ -1126,6 +1392,7 @@ def build_page(session: dict) -> bytes:
     primary = colors.get("primary", FALLBACK_BRAND["primary"])
     page = PAGE
     for token, value in {
+        "__FORM_FIELDS__": json.dumps(list(FORM_FIELDS)),
         "__NAME__": MANIFEST["name"],
         "__SUITE__": brand.get("suite_name", "DC Admin Suite"),
         "__INSTITUTION__": brand.get("institution", ""),
@@ -1143,6 +1410,29 @@ def build_page(session: dict) -> bytes:
 # HTTP server
 # ---------------------------------------------------------------------------
 _LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1", "[::1]", "")
+
+
+# ---- DC-FOLDER 1 -----------------------------------------------------------
+# Folder fields carry no default (1.0.1). The pages used to fill every folder
+# field with ~/Desktop, a guess that goes wrong on a Windows computer whose
+# Desktop is redirected to OneDrive: a report lands in a folder the operator
+# does not see as the Desktop. Every folder a request names is judged here,
+# and the message names the field the way the page labels it. Duplicated
+# verbatim into every module with a folder field (modules are standalone);
+# _verify_pages.py checks that the copies agree and drives each one.
+def folder_error(label, path, optional=False):
+    """"" when `path` names an existing folder, or is blank and the field is
+    optional. Otherwise a message that names the field."""
+    if not path:
+        if optional:
+            return ""
+        return ("The \u201c{}\u201d field is empty — choose a folder "
+                "(it must exist already).".format(label))
+    if not os.path.isdir(path):
+        return ("The folder in \u201c{}\u201d does not exist: {} — "
+                "create it first, or choose another.".format(label, path))
+    return ""
+# ---- /DC-FOLDER ------------------------------------------------------------
 
 
 def request_allowed(handler) -> bool:
@@ -1183,6 +1473,7 @@ def make_handler(session: dict, page: bytes):
             if self.path == "/api/log":
                 return send_run_log(self)
             if self.path == "/api/state":
+                form_for_page()
                 with LOCK:
                     return self._json(dict(STATE))
             if self.path == "/download":
@@ -1211,6 +1502,9 @@ def make_handler(session: dict, page: bytes):
         def do_POST(self):
             if not request_allowed(self):
                 return self._json({"error": "Forbidden (non-local request)."}, 403)
+            if self.path == "/api/form":
+                payload, code = remember_form_request(self)
+                return self._json(payload, code)
             if self.path == "/api/clear":
                 with LOCK:
                     busy = STATE["phase"] in RUNNING_PHASES
@@ -1227,11 +1521,9 @@ def make_handler(session: dict, page: bytes):
                     out_dir = os.path.expanduser(str(req["out_dir"]).strip())
                 except (KeyError, ValueError, json.JSONDecodeError):
                     return self._json({"error": "Bad request."}, 400)
-                if not out_dir:
-                    return self._json({"error": "Enter an output folder."}, 400)
-                if not os.path.isdir(out_dir):
-                    return self._json(
-                        {"error": "Output folder does not exist: " + out_dir}, 400)
+                err_ = folder_error("Output folder", out_dir)
+                if err_:
+                    return self._json({"error": err_}, 400)
                 if not start_run(crawl_worker, (session, out_dir),
                                  events=(STOP_EVENT, PAUSE_EVENT)):
                     return self._json({"error": "A crawl is already running."}, 409)

@@ -38,9 +38,31 @@ import dc_file_downloader as M          # noqa: E402
 import atexit as _atexit                # noqa: E402
 import shutil as _shutil                # noqa: E402
 M.RUN_LOCK_DIR = tempfile.mkdtemp(prefix="dcfd-runlock-")
+# DC-FORM (1.0.1): a test must never write the operator's remembered form.
+M.FORM_PATH = os.path.join(M.RUN_LOCK_DIR, "form.json")
 _atexit.register(_shutil.rmtree, M.RUN_LOCK_DIR, True)
 
 PASS, FAIL = [], []
+# A check that could not run is neither a pass nor a failure, and must not
+# be silent. 1.0.0 had five ways to say nothing: two counted a skip as a
+# pass ("True, 'skipped'"), one returned True to its caller, two returned
+# without a word. Every check that needs Node.js (or another optional
+# piece) now goes through skip(), and the summary lists what did not run.
+SKIP = []
+
+
+def skip(name, why):
+    SKIP.append("{} ({})".format(name, why))
+
+
+def node_or_skip(name):
+    """The path to node, or None after recording `name` as skipped. The only
+    place this suite looks for node; a structural check holds it to that."""
+    import shutil as _sh
+    found = _sh.which("node")
+    if not found:
+        skip(name, "Node.js not found - this check did not run")
+    return found
 
 
 def _identity_markers():
@@ -126,18 +148,18 @@ BASE = "https://digitalcommons.example.edu"
 def test_content_link_type():
     cases = [
         ("query native",
-         "/cgi/viewcontent.cgi?article=1000&context=jesuit-gallery161"
+         "/cgi/viewcontent.cgi?article=1000&context=photo-gallery161"
          "&type=native", "native"),
         ("query pdf with extras",
          "/cgi/viewcontent.cgi?article=12&context=series&type=pdf"
          "&unstamped=yes&date=1699999999&preview_mode=1", "pdf"),
         ("path form native",
-         "/context/jesuit-gallery161/article/1000/type/native/viewcontent",
+         "/context/photo-gallery161/article/1000/type/native/viewcontent",
          "native"),
         ("path form, type last segment",
          "/context/c/article/9/type/native", "native"),
         ("bare link, no type at all",
-         "/cgi/viewcontent.cgi?article=1000&context=jesuit-gallery161", ""),
+         "/cgi/viewcontent.cgi?article=1000&context=photo-gallery161", ""),
         ("additional file, query",
          "/cgi/viewcontent.cgi?filename=2&type=additional"
          "&preview_mode=1", "additional"),
@@ -163,7 +185,7 @@ def test_content_link_type():
 def test_native_variant():
     # A query-form link is rewritten into the PATH form, not given
     # "&type=native". The CGI ignores that parameter and answers with the
-    # "No PDF has been provided" page — verified against jesuit-gallery25
+    # "No PDF has been provided" page — verified against photo-gallery25
     # article 1000 on 2026-09-07. This assertion previously pinned the
     # broken shape, which is how the defect survived 95 green tests.
     check("native_variant · query form is rewritten to the path form",
@@ -171,8 +193,8 @@ def test_native_variant():
           BASE + "/context/c/article/1/type/native/viewcontent?preview_mode=1")
     check("native_variant · query form keeps extra parameters out of it",
           M.native_variant(BASE + "/cgi/viewcontent.cgi?article=1000"
-                                  "&context=jesuit-gallery25&preview_mode=1"),
-          BASE + "/context/jesuit-gallery25/article/1000/type/native"
+                                  "&context=photo-gallery25&preview_mode=1"),
+          BASE + "/context/photo-gallery25/article/1000/type/native"
                  "/viewcontent?preview_mode=1")
     check("native_variant · no fallback without both article and context",
           M.native_variant(BASE + "/cgi/viewcontent.cgi?article=1"), "")
@@ -228,7 +250,7 @@ def test_parse_pickvers():
     #     gallery item looks like. v1.1 discarded this link and downloaded
     #     nothing even in all-versions mode.
     html = _pickvers_html([
-        ['<a href="/context/jesuit-gallery161/article/1000/type/native'
+        ['<a href="/context/photo-gallery161/article/1000/type/native'
          '/viewcontent">GAS009628.CR2</a>']])
     revs = M.parse_pickvers(html)
     check("pickvers · native-only row yields one file",
@@ -443,10 +465,10 @@ def test_build_filename():
 
     # The Image Description Generator parses <ctx>_<article>_… back out of
     # this name. Extension may change; token order may not.
-    name = M.build_filename("jesuit-gallery161", "1000", "native", "public",
+    name = M.build_filename("photo-gallery161", "1000", "native", "public",
                             "current", "", "", png)
     check_true("filename · leading tokens still <ctx>_<article>_<kind>",
-               name.startswith("jesuit-gallery161_1000_native_"), name)
+               name.startswith("photo-gallery161_1000_native_"), name)
 
 
 # ---------------------------------------------------------------------------
@@ -460,8 +482,8 @@ def test_native_file_url():
     native-only record on 2026-09-07.
     """
     check("native_file_url is the path form",
-          M.native_file_url(BASE, "jesuit-gallery25", "1000"),
-          BASE + "/context/jesuit-gallery25/article/1000/type/native"
+          M.native_file_url(BASE, "photo-gallery25", "1000"),
+          BASE + "/context/photo-gallery25/article/1000/type/native"
                  "/viewcontent?preview_mode=1")
     check_true("native_file_url is not the query form",
                "viewcontent.cgi?" not in M.native_file_url(BASE, "c", "1"),
@@ -521,7 +543,7 @@ def test_dedupe_jobs():
           len(M.dedupe_jobs(jobs)), 2)
 
     # The stamped default stream and the unstamped revision copy differ in
-    # bytes (sspeach 1000: 254,280 against 235,659) and are both kept.
+    # bytes (a journal record: 254,280 against 235,659) and are both kept.
     jobs = [
         {"kind": "primary", "visibility": "public", "version": "current",
          "version_date": "",
@@ -718,7 +740,7 @@ def test_endpoints():
 # ---------------------------------------------------------------------------
 # 12 · The listing stage.
 #
-# Added 2026-09-07, after Jeff reported that the revisions made to support
+# Added 2026-09-07, after the operator reported that the revisions made to support
 # book and image galleries appear to have broken the module for every
 # structure type. This suite had 95 passing tests and could not have caught
 # it: nothing here referenced parse_edikit_listing, parse_gallery_listing,
@@ -2466,7 +2488,7 @@ def test_the_paged_fallback_still_works_if_showall_is_ignored():
                    any("x_showall worked" in m for m in said),
                    "{!r}".format(said))
 
-        # Everything below is the defect Jeff saw within minutes of v1.13
+        # Everything below is the defect the operator saw within minutes of v1.13
         # shipping: the line fired where it meant nothing, and claimed a
         # success that had not happened.
         #
@@ -2516,7 +2538,7 @@ def test_the_paged_fallback_still_works_if_showall_is_ignored():
 def test_progress_and_eta_measure_records_not_structures():
     """Both read 'nothing is happening' on a single-structure run.
 
-    Jeff, mid-run on 2026-09-08: "the progress bar is full blue." It was:
+    The operator, mid-run: "the progress bar is full blue." It was:
     the item loop passed the STRUCTURE index as the bar's position and the
     structure COUNT as its maximum, so one structure read 1 of 1 from the
     first record onward. The same mistake gave `ETA --:--` on every run of
@@ -3254,7 +3276,7 @@ def test_the_embargo_parser_harvests_no_links():
 # ---------------------------------------------------------------------------
 # 27 · An absence is not a failure (v1.20).
 #
-# The first on-campus run asked for `native` on 86 records of 2017 PDF
+# The first full run asked for `native` on 86 records of 2017 PDF
 # uploads. Every one answered 404 — the server saying, definitely, that
 # there is no separate native — and the log filled with WARNING lines on a
 # run where nothing had broken.
@@ -3463,12 +3485,12 @@ def test_the_early_exits_record_what_they_never_reached():
 # under the wrong heading — a silent, plausible, wrong report.
 # ---------------------------------------------------------------------------
 def test_a_failed_one_page_listing_falls_back_to_paging():
-    """2026-09-10, on campus: the ETD `published` state answered
+    """Measured: the ETD `published` state answered
 
         RemoteDisconnected: Remote end closed connection without response
 
     after about sixty seconds. 3,106 records, ~4.8 MB — and the very same
-    request had succeeded off campus the evening before, so this is a
+    request had succeeded from another network the evening before, so this is a
     marginal cost of asking for everything at once, not a property of the
     state.
 
@@ -3562,7 +3584,7 @@ def test_a_failed_one_page_listing_falls_back_to_paging():
 
 
 def test_a_run_of_403s_is_a_block_not_eighty_problems():
-    """Measured off campus 2026-09-09, and again on campus 2026-09-11.
+    """Measured from two networks, on two days.
 
     09-09: 99 files downloaded, then 80 refusals in an unbroken row, every
     one on a record whose release option reads "open access", with four
@@ -3842,7 +3864,7 @@ def test_a_blocked_rerun_stops_and_says_so_once():
 
 
 def test_a_bounce_is_recognized_by_where_the_bytes_came_from():
-    """Measured 2026-09-22 — and it had been checked the weaker way.
+    """Measured (v1.33.8) — and it had been checked the weaker way.
 
     An expired session bounced an admin request to /cgi/login.cgi.
     urllib followed it, so the body read was the login page's — but the
@@ -3926,7 +3948,7 @@ def test_a_bounce_is_recognized_by_where_the_bytes_came_from():
 
 
 def test_an_empty_listing_is_not_every_record_going_away():
-    """Measured 2026-09-22, on a one-record re-run that should have been
+    """Measured (v1.33.9), on a one-record re-run that should have been
     boring.
 
     The session had expired. The listing bounced to the login page, which
@@ -4014,7 +4036,7 @@ def test_the_browser_never_loads_the_big_listing():
 
     import inspect, ast, tempfile
     body = inspect.getsource(M.download_worker)
-    # v1.28 sent the browser to the PAGED listing and two campus runs still
+    # v1.28 sent the browser to the PAGED listing and two runs still
     # died at exactly 120.0s, so the invariant is stronger than "a smaller
     # admin page": the browser does not navigate to a cgi admin page at
     # all. Its only job is to look at the site page; everything else goes
@@ -4098,7 +4120,30 @@ def test_the_browser_never_loads_the_big_listing():
     # The one that actually bit: a guard on `is not None` that skipped
     # silently when the attribute was None.
     check_true("big-listing . a skipped lever is named, not silent",
-               "FAILED (" in attach and "levers" in attach, attach[:1200])
+               "unavailable (" in attach and "levers" in attach,
+               attach[:1200])
+    # 1.0.1: the line leads with the verdict, and an unavailable lever is
+    # never called a failure in front of a connection that got its time.
+    # Behavioral: the pure function that builds the line, on the three
+    # outcomes a real Selenium produces.
+    ok_line = M.timeout_report(
+        300, 300, "class-level lever unavailable (AttributeError) | "
+        "instance: _timeout, conn.set_timeout", True)
+    check_true("bridge-line . a connection that got its time says so first",
+               ok_line.startswith("command timeout 300s, as asked"), ok_line)
+    check_true("bridge-line . and no FAILED anywhere in it",
+               "FAILED" not in ok_line.upper().replace("NOT SET", ""),
+               ok_line)
+    short = M.timeout_report(120, 300, "instance: _timeout", True)
+    check_true("bridge-line . a connection short of it says NOT, with the "
+               "number", "is 120s, NOT the 300s asked" in short, short)
+    unread = M.timeout_report(None, 300, "", "NOT set (WebDriverException)")
+    check_true("bridge-line . an unreadable timeout is not called a success",
+               "could not be read back" in unread
+               and "as asked" not in unread, unread)
+    check_true("bridge-line . a page-load timeout that failed is named",
+               "page-load timeout NOT set (WebDriverException)" in unread,
+               unread)
     src2 = Path(M.__file__).read_text(encoding="utf-8")
     body2 = src2[src2.index("def download_worker("):]
     body2 = body2[:body2.index("def read_failed_rows(")]
@@ -4140,7 +4185,7 @@ def test_the_rerun_summary_counts_what_happened():
     check_true("rerun-sum . un-attempted rows are not called failures",
                "failed row(s)" not in code, code[:400])
 
-    # The arithmetic itself, on the shape of Jeff's actual run.
+    # The arithmetic itself, on the shape of an actual run.
     rows, recovered, absent = 228, 153, 75
     still = rows - recovered - absent
     check("rerun-sum . the real run's remainder is zero, not negative",
@@ -4250,13 +4295,14 @@ def test_pages_and_downloads_are_paced_apart():
 
 
 def test_a_session_is_capped_in_both_units():
-    """Jeff's design, 2026-09-11.
+    """The operator's design, v1.32.
 
-    Which unit Digital Commons rations is not known. Measured on campus:
+    Which unit Digital Commons rations is not known. Measured from one
+    network:
     379 files / 322 MB across four runs unblocked; 167 files / 442 MB
     blocked; 158 files / 766 MB blocked. A file count does not predict it —
     176 files went through in one run on 09-09 and 158 blocked the next
-    day. Megabytes fit those three better, and off campus blocked lower in
+    day. Megabytes fit those three better, and another network blocked lower in
     both units, so the address matters as well.
 
     Rather than pick a theory and ship it, the module carries both limits,
@@ -4483,10 +4529,8 @@ def _check_job_mode(page):
     import subprocess as _sp
     import tempfile as _tf
 
-    node = _shutil.which("node")
+    node = node_or_skip("rerun-ui . job-mode behavior")
     if not node:
-        check_true("rerun-ui . job-mode behavior (node not installed)",
-                   True, "skipped")
         return
 
     start = page.find("const jobNew=")
@@ -4574,7 +4618,7 @@ def _check_job_mode(page):
 
 
 def test_the_page_does_not_shout_its_evidence_at_staff():
-    """Jeff, 2026-09-11: "the dev UI has gotten long with development notes,
+    """The operator, v1.30: "the dev UI has gotten long with development notes,
     and the organization may confuse staff in a few places if it ships."
 
     Every control's hint had grown into the full measurement narrative that
@@ -4604,7 +4648,7 @@ def test_the_page_does_not_shout_its_evidence_at_staff():
 
     # The message callout scrolls itself into view. At the FOOT of the page
     # that meant every scan result dragged the reader to the bottom, away
-    # from the control they had just used — Jeff's third point.
+    # from the control they had just used — the operator's third point.
     check_true("ui-scroll . the message callout sits above the form",
                page.index('id="cerr"') < page.index("<fieldset"),
                "it is still below the form, so it scrolls the page away")
@@ -4618,7 +4662,7 @@ def test_the_page_does_not_shout_its_evidence_at_staff():
 
 
 def test_a_session_re_reads_the_listing_before_it_fetches():
-    """The plan is a snapshot, and Jeff was explicit that it should stay one.
+    """The plan is a snapshot, and the operator was explicit that it should stay one.
 
     "Snapshot sessions are fine so long as they don't choke on records that
     are removed or change status since the plan was created (I'm not
@@ -5169,7 +5213,7 @@ def test_a_stopped_rerun_records_what_it_never_reached():
 
 
 def test_a_blocked_run_stops_instead_of_grinding():
-    """Measured 2026-09-10: after the ceiling, 24 more minutes and 285 more
+    """Measured: after the ceiling, 24 more minutes and 285 more
     requests were spent being told no. On an overnight run that is hours."""
     import inspect
     check_true("blocked . ServerRefusing IS a StopRequested",
@@ -5817,7 +5861,7 @@ def test_two_simultaneous_starts_produce_one_run():
 
 
 def test_the_rerun_control_is_findable_and_honestly_named():
-    """Jeff asked how to fill in "1 . Hierarchy source" for a re-run.
+    """The operator asked how to fill in "1 . Hierarchy source" for a re-run.
 
     He asked because the fieldsets are numbered 1 to 4 and the re-run field
     was buried at the bottom of 4, so the page implied three mandatory steps
@@ -5843,7 +5887,7 @@ def test_the_rerun_control_is_findable_and_honestly_named():
 
     # Until 2026-09-11 the re-run controls sat AFTER four numbered
     # sections, none of which a re-run uses, and the page said which ones
-    # applied only in a hint at the very bottom. Jeff asked twice whether
+    # applied only in a hint at the very bottom. The operator asked twice whether
     # to fill in a hierarchy source before re-running, which makes it the
     # page's fault. The mode is now the first thing asked.
     mode = at('id="sec0"', "the mode question")
@@ -6007,7 +6051,7 @@ class _Tab:
         # tab frozen on the challenge page throughout. Without this the
         # fake's downloads are instantaneous, `settle` finds the file on
         # its first look and never glances at the tab at all — which is
-        # why the off-campus run of 2026-09-18 recorded a prompt the
+        # why one run from outside the network recorded a prompt the
         # suite could not reproduce.
         self.timed_transfer = None
         # (seconds, title, source): a page that goes on screen AFTER the
@@ -6023,7 +6067,7 @@ class _Tab:
         # page-load timeout set for this navigation expires, so the page
         # renders only when that allowance is at least `seconds`;
         # otherwise the navigation stalls with nothing on screen. That is
-        # the missing native measured on 2026-10-01: 404 at 15.2 s
+        # the missing native measured live: 404 at 15.2 s
         # against a 15.0 s allowance, and a fixture that rendered
         # regardless of the allowance could not tell the two apart.
         self.answers_after = None
@@ -6097,6 +6141,13 @@ class _FakeBrowser:
         # rendered, so the preflight's failure case was inexpressible.
         self.downloads_blocked = False
         self.preflights = []
+        # What the fake's own timer threads failed to do. They swallow
+        # OSError because a thread can outlive the test's temporary
+        # folder — but a swallowed failure DURING the test is a fixture
+        # that silently stopped behaving like the world, and a test that
+        # then fails reads like a module defect. Recorded, so a failing
+        # check can say so (CI, Windows/3.9, 1.0.1: one unexplained red).
+        self.fixture_errors = []
 
     def _cleared(self):
         if self._timed_cleared:
@@ -6236,16 +6287,16 @@ class _FakeBrowser:
                 try:
                     with open(part, "wb") as fh:
                         fh.write(data[:1])
-                except OSError:
-                    pass
+                except OSError as e:
+                    self.fixture_errors.append("{}: {}".format('timed_transfer begin', e))
 
             def _end():
                 try:
                     with open(part, "wb") as fh:
                         fh.write(data)
                     os.replace(part, os.path.join(self.folder, name))
-                except OSError:
-                    pass
+                except OSError as e:
+                    self.fixture_errors.append("{}: {}".format('timed_transfer end', e))
 
             for delay, fn in ((begins, _begin), (ends, _end)):
                 t = _th.Timer(delay, fn)
@@ -6286,8 +6337,8 @@ class _FakeBrowser:
                     with open(tmp, "wb") as fh:
                         fh.write(data)
                     os.replace(tmp, os.path.join(self.folder, name))
-                except OSError:
-                    pass
+                except OSError as e:
+                    self.fixture_errors.append("{}: {}".format('timed_clear', e))
 
             t = _th.Timer(delay, _clear)
             t.daemon = True
@@ -6521,7 +6572,7 @@ def test_a_challenge_does_not_spend_a_second_request_on_the_native():
 def test_a_missing_native_is_given_time_to_say_so():
     """v1.34.2: the native page-load allowance, against the measurement.
 
-    A HAR of 2026-10-01: a missing native's URL redirects in 93 ms to the
+    A browser network capture: a missing native's URL redirects in 93 ms to the
     CGI form, which answers 404 — "Sorry, that file doesn't exist" — after
     15,210 ms. The module allowed a native navigation 15.0 s, so the load
     was stopped just before the answer and the row ended "not confirmed".
@@ -6774,7 +6825,7 @@ def test_the_prompt_record_is_the_audit_trail():
     check_true("audit . with nothing asked it says so, not nothing",
                "No verification prompt was seen" in v.summary(),
                v.summary())
-    v.context = "honors-theses"
+    v.context = "theses"
     v.requests = 257
     v.record(257, 256, 2.0, "Just a moment...")
     v.requests = 500
@@ -6783,7 +6834,7 @@ def test_the_prompt_record_is_the_audit_trail():
     check("audit . one row per prompt", len(rows), 2)
     check("audit . a row is the width of the sheet", len(rows[0]),
           len(M.VERIFY_HEADERS))
-    check("audit . it records the structure", rows[0][2], "honors-theses")
+    check("audit . it records the structure", rows[0][2], "theses")
     check("audit . where in the run it arrived", rows[0][3], 257)
     check("audit . and how much ran between prompts", rows[0][4], 256)
     check("audit . a cleared prompt says how long it took", rows[0][5], 2.0)
@@ -6931,7 +6982,7 @@ def test_the_in_flight_records_remaining_files_are_not_lost():
     been planned. Everything the run had not reached was therefore in no
     file anywhere.
     """
-    ctx = "honors-theses"
+    ctx = "theses"
     item = {"article": "1495", "title": "A thesis"}
     jobs = [{"kind": "primary", "visibility": "public", "version": "current",
              "version_date": "", "orig_hint": "a.pdf", "access": "open",
@@ -7302,9 +7353,10 @@ def test_the_page_offers_the_fetch_path_and_the_window():
     check_true("fetch-ui . the long explanation is behind a disclosure",
                "<details><summary>What the two paths do differently"
                in page)
-    check_true("fetch-ui . the tab title changes for a prompt",
-               _title_rule_behaves(page),
-               "on a second screen the tab title is what gets noticed")
+    _titled = _title_rule_behaves(page)
+    if _titled is not None:
+        check_true("fetch-ui . the tab title changes for a prompt", _titled,
+                   "on a second screen the tab title is what gets noticed")
     # The CALL SITE, separately, and source-checked because poll() cannot
     # be executed without a server to answer /api/state. Asserted on the
     # live value rather than on the function's name: a call that passes a
@@ -7345,9 +7397,9 @@ def _title_rule_behaves(page):
     import shutil as _shutil
     import subprocess as _sp
 
-    node = _shutil.which("node")
+    node = node_or_skip("fetch-ui . the tab title changes for a prompt")
     if not node:
-        return True                        # nothing to say without node
+        return None                        # recorded as skipped, not passed
     start = page.find("const PAGETITLE=")
     end = page.find("function idleStatus()")
     if start < 0 or end < 0:
@@ -7865,7 +7917,7 @@ def test_a_redirect_to_the_site_root_is_noticed_not_concluded():
 
     Measured on the live run of 2026-09-15.
 
-    A native file was requested for every record in honors-theses, where
+    A native file was requested for every record in theses, where
     most uploads were already PDFs and have no separate native. The
     content URL for a file that does not exist **redirects to the
     repository's home page** — no status code, no marker phrase, just a
@@ -7949,7 +8001,7 @@ def test_a_redirect_to_the_site_root_is_noticed_not_concluded():
 
 
 def test_a_redirect_from_the_page_it_redirects_to_is_still_a_redirect():
-    """Measured on the live off-campus run of 2026-09-21: 51 rows.
+    """Measured on a live run from outside the network: 51 rows.
 
         BrowserFetchFailed: nothing began arriving within 8s
         — tab: '<the repository>',
@@ -8237,7 +8289,7 @@ def test_a_hold_that_ends_in_bytes_waits_instead_of_asking_again():
 def test_a_redirect_is_judged_by_the_page_it_lands_on():
     """v1.34: what a redirect says is on the page, not in the redirect.
 
-    Measured 2026-09-29. A native with no file lands on the CGI form of
+    Measured (v1.34). A native with no file lands on the CGI form of
     its own URL, which says — title and body worded differently —
     "Sorry, that file does not exist" / "Sorry, that file doesn't
     exist." That IS an absence, in the page's own words. And article
@@ -8373,7 +8425,7 @@ def test_whatever_ended_the_hold_a_transfer_in_progress_is_waited_for():
 def test_a_frozen_challenge_page_is_not_a_new_prompt_every_time():
     """The most expensive defect of the week, and the cheapest to state.
 
-    2026-09-15, honors-theses: 148 verification prompts recorded in 858
+    2026-09-15, theses: 148 verification prompts recorded in 858
     file requests. Three had work between them — 239, 241 and 230 files
     — and were real. **The other 145 showed "0 files since previous"
     and "cleared in 2s", one per download**, and none of them happened.
@@ -8731,7 +8783,7 @@ def test_a_completed_navigation_that_changed_nothing_is_read_as_nothing():
 
 
 def test_a_resume_does_not_re_report_the_prompt_it_is_resuming_from():
-    """Live proof, 2026-09-18, off campus: three prompts recorded where
+    """Live proof, from outside the network: three prompts recorded where
     two had happened.
 
         1 | 10:51:53 | at request 12  | 11 files since | Cleared while
@@ -8781,10 +8833,10 @@ def test_a_resume_does_not_re_report_the_prompt_it_is_resuming_from():
 #
 # Driving a real browser buys the ability to answer a verification prompt
 # and pays for it in status codes. For most outcomes the tab substitutes.
-# For a 404 it does not substitute at all: measured 2026-09-22, the
+# For a 404 it does not substitute at all: measured (v1.33.9), the
 # navigation never commits, no page renders, the document identity is
 # unchanged and nothing arrives — so the tab is not merely ambiguous, it
-# is silent. Two off-campus runs wrote 51 such rows as `Failed:` while the
+# is silent. Two runs from outside the network wrote 51 such rows as `Failed:` while the
 # server had answered HTTP 404 both times.
 #
 # THE FIXTURE MUST BEHAVE LIKE THE WORLD. Every case below starts the tab
@@ -8862,7 +8914,7 @@ def _silent_browser(folder, script=None):
         folder, script if script is not None else [_Tab(stall=True)],
         at=("Example Commons", "https://dc.example.edu/",
             "<html><body>welcome</body></html>"))
-    return f, drv, ("https://dc.example.edu/context/honors-theses/"
+    return f, drv, ("https://dc.example.edu/context/theses/"
                     "article/1003/type/native/viewcontent?preview_mode=1")
 
 
@@ -9226,7 +9278,7 @@ def _late_sorry(page, delay=0.05):
 def test_a_page_left_by_an_earlier_request_is_not_an_absence():
     """The stale-tab absence — v1.34's first fix.
 
-    Measured 2026-09-29: a native navigation usually never commits, so
+    Measured (v1.34): a native navigation usually never commits, so
     the tab keeps whatever the LAST rendered request put there. When
     that was an absence page, every later native that never committed
     was written "No native file" from it — 178 of 181 in one run. A
@@ -9304,7 +9356,7 @@ def test_a_page_left_by_an_earlier_request_is_not_an_absence():
             urllib.request.urlopen = real
             M.reset_rate_state()
 
-        # 3. Off campus the network cannot answer. Then NOTHING is
+        # 3. From outside the network it cannot answer. Then NOTHING is
         #    established, and the message says the page was not this
         #    request's — rather than naming it as if it were.
         f, _drv = _browser_fetcher(os.path.join(d, "_c"),
@@ -9338,7 +9390,7 @@ def test_a_page_left_by_an_earlier_request_is_not_an_absence():
 def test_a_native_is_asked_about_before_the_browser_is_sent():
     """v1.34: headers first for natives, Chrome only for a file that exists.
 
-    Measured 2026-09-29: a native with no file costs about 44 s through
+    Measured (v1.34): a native with no file costs about 44 s through
     the browser (a navigation that never commits, the wait for a file,
     then the second opinion) and about one second asked directly. The
     file itself, when there is one, still comes through Chrome.
@@ -9423,7 +9475,7 @@ def test_a_native_is_asked_about_before_the_browser_is_sent():
         finally:
             urllib.request.urlopen = real
 
-        # 4. Off campus: challenged. The browser path runs, and the network
+        # 4. From outside: challenged. The browser path runs, and the network
         #    is NOT asked a second time about the same URL.
         f, drv = fetcher("_d", [_Tab(stall=True)])
         asked = _asking(_challenge_error())
@@ -9463,7 +9515,7 @@ def test_a_native_is_asked_about_before_the_browser_is_sent():
 def test_a_row_that_cannot_be_confirmed_here_has_a_status_of_its_own():
     """v1.34, decision F: neither downloaded, nor absent, nor retried blindly.
 
-    Measured 2026-09-29 off campus: 337 native rows where the network
+    Measured from outside the network: 337 native rows where the network
     layer was challenged. Every one was a failure that a re-run from the
     same network would meet again, one request at a time.
     """
@@ -9552,7 +9604,7 @@ def test_a_row_that_cannot_be_confirmed_here_has_a_status_of_its_own():
 def test_a_large_download_is_waited_for_by_its_progress():
     """v1.34, items I and J: no total ceiling; a stall is the limit.
 
-    Measured 2026-09-29: a 3.05 GB video took about three minutes, close
+    Measured (v1.34): a 3.05 GB video took about three minutes, close
     to the old fixed 300 s ceiling, and the module now has to expect
     10 GB. A transfer that was still growing used to be abandoned at
     300 s and its partial thrown away, so the row failed on every re-run.
@@ -9725,7 +9777,7 @@ def test_a_body_the_network_fetches_is_streamed_to_disk():
 def test_one_file_that_cannot_be_saved_does_not_end_the_run():
     """v1.34, item C: the filename cap, and SaveFailed.
 
-    Measured 2026-09-21: saved names reached 168 characters (214 with
+    Measured on one complete structure: saved names reached 168 characters (214 with
     natives), and 2 of 1,133 would pass Windows' 260-character path limit
     at a plausible destination. `save_as` then raised OSError, the nearest
     handler in BOTH workers was the whole-run one, and one file ended the
@@ -9735,12 +9787,12 @@ def test_one_file_that_cannot_be_saved_does_not_end_the_run():
     import importlib.util
     # 1. The cap keeps the tokens infer_meta reads, and the extension.
     long_orig = "A" * 300 + ".docx"
-    name = M.build_filename("honors-theses", "1363", "native", "public",
+    name = M.build_filename("theses", "1363", "native", "public",
                             "current", long_orig)
     check_true("filename-cap . a long original name is capped",
                len(name) <= M.FILENAME_MAX_CHARS, str(len(name)))
     check_true("filename-cap . the leading tokens survive",
-               name.startswith("honors-theses_1363_native_public_current_"),
+               name.startswith("theses_1363_native_public_current_"),
                name)
     check_true("filename-cap . and so does the extension",
                name.endswith(".docx"), name)
@@ -9756,14 +9808,14 @@ def test_one_file_that_cannot_be_saved_does_not_end_the_run():
         spec.loader.exec_module(mod)
         with tempfile.TemporaryDirectory() as d:
             root = os.path.join(d, "run")
-            fpath = os.path.join(root, "honors-theses", name)
+            fpath = os.path.join(root, "theses", name)
             meta = mod.infer_meta(fpath, root)
             check("filename-cap . the Image Description Generator still "
                   "relinks it", (meta.get("ctx"), meta.get("article")),
-                  ("honors-theses", "1363"))
+                  ("theses", "1363"))
     else:
-        check_true("filename-cap . relink (image describer absent)", True,
-                   "skipped")
+        skip("filename-cap . the Image Description Generator still relinks "
+             "it", "the image describer is not in this copy")
 
     # 2. A save the operating system refuses is one failed file.
     class _Refused:
@@ -10100,10 +10152,20 @@ def test_a_refused_start_names_the_field_and_is_logged():
         M._LAST_LOG[0] = real_last
     # The bridge line leads with the outcome and never says FAILED.
     src = inspect.getsource(M.attach_chrome)
-    check_true("bridge-line . leads with what the connection reports",
-               '"command timeout: connection reports {}' in src)
-    check_true("bridge-line . a lever that is unavailable is not FAILED",
-               'set_via = "FAILED' not in src)
+    # 1.0.1: the line is built by timeout_report() (driven above, on all
+    # three outcomes); attach_chrome must hand it the measured value, and
+    # nothing in attach_chrome may write the word FAILED.
+    check_true("bridge-line . attach_chrome builds the line from what the "
+               "connection reports",
+               "timeout_report(\n        actual, DRIVER_COMMAND_TIMEOUT" in src,
+               src[-500:])
+    import ast as _ast
+    _lits = [n.value for n in _ast.walk(_ast.parse(textwrap.dedent(src)))
+             if isinstance(n, _ast.Constant) and isinstance(n.value, str)]
+    check_true("bridge-line . no string attach_chrome writes says FAILED "
+               "(ast: literals only, comments excluded)",
+               not any("FAILED" in s for s in _lits),
+               repr([s for s in _lits if "FAILED" in s]))
     import ast
     tree = ast.parse(inspect.getsource(M))
     node = next(n for n in ast.walk(tree)
@@ -10232,7 +10294,7 @@ def test_a_challenge_the_network_meets_is_not_a_hold():
     disguise this project will not build.
 
     So raising VerificationRequired from a urllib 403 manufactured a
-    hold against the wrong witness. Measured off campus, 2026-09-22:
+    hold against the wrong witness. Measured from outside the network (v1.33.10):
     three prompts in three file requests, no files fetched, ~23s to
     raise each one and 2s to "clear" it, three holds on one file, run
     over as NotVerified. 886 rows never requested.
@@ -10317,7 +10379,7 @@ def test_a_challenge_the_browser_shows_is_still_a_hold():
             stopping=lambda: False, now=time.time)
         M.reset_rate_state()
         try:
-            # The network layer is challenged too — off campus it would
+            # The network layer is challenged too — from outside it would
             # be. It must not matter: the tab is the one being answered.
             urllib.request.urlopen = _asking(_challenge_error())
             try:
@@ -10329,7 +10391,10 @@ def test_a_challenge_the_browser_shows_is_still_a_hold():
             except Exception as e:
                 check_true("network-challenge . a prompt on the TAB still "
                            "delivers the file", False,
-                           "got {}: {}".format(type(e).__name__, e))
+                           "got {}: {} | navigations: {} | prompts: {} | "
+                           "fixture errors: {}".format(
+                               type(e).__name__, e, len(_drv.visited),
+                               v.prompts, _drv.fixture_errors or "none"))
             check_true("network-challenge . and it is still recorded",
                        len(v.prompts) >= 1,
                        "prompts: {}".format(v.prompts))
@@ -10822,7 +10887,7 @@ def _report_rows(run_dir):
 def _rerun_one_record(pickvers_html, answer, plan_opts, ctx="ev", rows=None):
     """Re-run one Not-attempted RECORD row through retry_worker.
 
-    That is exactly what re-running the honors_symposium _PARTIAL does:
+    That is exactly what re-running the symposium _PARTIAL does:
     the record is re-planned from the Plan the report recorded, then its
     files are fetched. `answer(url, native_url)` plays the server and
     returns a Fetched or raises; every call is recorded.
@@ -10974,7 +11039,7 @@ _ALL_NATIVES = {"primary": True, "supp": False, "native": True,
 def test_a_video_is_fetched_once_in_all_versions_mode():
     """THE PLANT for the duplicate defect, v1.34.2.
 
-    honors_symposium, 2026-10-01, All versions with natives on: each video
+    symposium, 2026-10-01, All versions with natives on: each video
     record came down three times — X.mp4, X_2.mp4, X_3.mp4, identical
     sizes — because three jobs named one file at three addresses:
 
@@ -11012,7 +11077,7 @@ def test_a_video_is_fetched_once_in_all_versions_mode():
             return M.Fetched(data=CURRENT, name="talk.mp4", used_native=True)
         raise M.NoFileAvailable("No PDF has been provided")
 
-    # BOTH workers. honors_symposium was a fresh Start (download_worker);
+    # BOTH workers. symposium was a fresh Start (download_worker);
     # re-running its _PARTIAL is retry_worker. A check on one of them is
     # the one-of-a-pair failure, in the suite.
     for who, drive in (("start", _start_one_record),
@@ -11045,7 +11110,7 @@ def test_a_video_is_fetched_once_in_all_versions_mode():
 
 
 def test_a_pdf_record_keeps_stamped_and_unstamped_named_apart():
-    """The sspeach shape, v1.34.2.
+    """The two-current-revisions shape, v1.34.2.
 
     A Word upload in a peer-reviewed journal, All versions with natives on.
     The editor selected the current PDF from the NEWER revision and the
@@ -11130,7 +11195,7 @@ def test_a_rerun_stopped_mid_record_keeps_the_rest_of_the_record():
     did. Reproduced by driving the worker before the fix: one row,
     `native current Downloaded`, and the original revision nowhere.
 
-    Re-running the honors_symposium _PARTIAL is exactly this case: 344
+    Re-running the symposium _PARTIAL is exactly this case: 344
     record rows, each re-planned in All-versions mode, any of which a
     prompt or a Stop can interrupt.
     """
@@ -11261,7 +11326,7 @@ def _get(port, path):
 
 
 def test_a_clean_start_keeps_the_settings_and_the_hierarchy():
-    """Jeff, 2026-10-01: a way to clear the module and its log for a clean
+    """The operator, v1.34.2: a way to clear the module and its log for a clean
     start, only when no run is active. Driven through the endpoints."""
     session = M.load_session(Path("/nonexistent/session.json"))
     session["hub_url"] = "http://127.0.0.1:8750"
@@ -11383,7 +11448,7 @@ def test_the_form_is_kept_for_a_reopened_page():
     endpoint and then the page's own restore code in node."""
     good = {"fields": {"rptdir": "/Volumes/Reports", "jobresume": True,
                        "jobnew": False, "verall": True},
-            "parents": ["etd", "honors_symposium"]}
+            "parents": ["etd", "symposium"]}
     check("form . a good form is accepted",
           M.validate_form_state(good)["fields"]["rptdir"], "/Volumes/Reports")
     for bad, why in ((dict(good, fields={"evil": "x"}), "an unknown field"),
@@ -11402,19 +11467,23 @@ def test_the_form_is_kept_for_a_reopened_page():
 
     import shutil as _shutil
     import subprocess as _sp
-    node = _shutil.which("node")
+    node = node_or_skip("form . the page restores its fields")
     if not node:
         return
-    start = page.find("const FORM_IDS=")
-    end = page.find("FORM_IDS.forEach(id=>{\n  const el=document."
-                    "getElementById(id); if(!el) return;\n  el.addEvent")
-    check_true("form . the restore code was found", start > 0 and end > start)
-    js = page[start:end]
+    # 1.0.1: the shared DC-FORM block restores the fields; this page's own
+    # hook brings back the checked structures and the job mode.
+    import re as _re
+    block = _re.search(r"const FORM_IDS=.*?/\* /DC-FORM \*/", page, _re.S)
+    a = page.find("let pendingParents=null;")
+    b = page.find("\n}\n", page.find("function formRestoredHook(", a)) + 3
+    check_true("form . the restore code was found",
+               block is not None and a > 0 and b > a)
+    js = (block.group(0) if block else "") + "\n" + page[a:b]
     harness = (
         "const els={};\n"
         "M_FIELDS.forEach(id=>{els[id]={id:id,type:(id==='rptdir'||"
         "id==='dldir'||id==='retryrpt'||id==='repdir')?'text':'checkbox',"
-        "value:'',checked:false};});\n"
+        "value:'',checked:false,addEventListener(){}};});\n"
         "els.jobnew.checked=true;\n"
         "const document={getElementById:id=>els[id]||null};\n"
         "let checked=new Set(); let hierLoaded=false, nodes=[];\n"
@@ -11435,7 +11504,7 @@ def test_the_form_is_kept_for_a_reopened_page():
         check("form . and its mode", got[1:3], [True, False])
         check("form . and its options", got[3], True)
         check("form . and the parents it had checked, for the hierarchy",
-              got[4], ["etd", "honors_symposium"])
+              got[4], ["etd", "symposium"])
         check("form . and shows the steps for that mode", got[5] >= 1, True)
     else:
         check_true("form . node said", False, r.stderr[-300:])
@@ -11446,7 +11515,7 @@ def test_the_idle_line_says_what_to_do_next():
     in re-run mode, which needs none. Run in node against the page."""
     import shutil as _shutil
     import subprocess as _sp
-    node = _shutil.which("node")
+    node = node_or_skip("idle-line . says what to do next")
     if not node:
         return
     page = M.build_page({"base_url": "https://dc", "settings": {}}).decode()
@@ -11483,7 +11552,7 @@ def test_the_messages_say_only_what_is_true():
                "after the previous prompt" in
                M.prompt_announcement(151, 149, first=False),
                M.prompt_announcement(151, 149, first=False))
-    stopped = [(1, "honors_symposium", "Event", 391, 47, 2, 0,
+    stopped = [(1, "symposium", "Event", 391, 47, 2, 0,
                 "STOPPED mid-structure (487 row(s): 142 downloaded, 345 "
                 "never reached)", "17:37", "x.xlsx")]
     check("msg . a structure stopped part-way is not 'done'",
@@ -11624,8 +11693,99 @@ def test_a_rerun_takes_a_records_primary_before_its_native():
           ["primary", "coverletter", "native", "supp1"])
 
 
+def test_a_finished_run_says_how_it_went():
+    """1.0.1, DC-TONE. Both workers, driven: a run that fetched what it was
+    asked for is green; a run where some files did not arrive is amber; a
+    run where none did is red; a Stop the operator pressed, with nothing
+    wrong, is green - it is what they intended."""
+    cur = ("viewcontent.cgi?type=native&article=1000&unstamped=yes"
+           "&date=1592928048&preview_mode=1&context=ev&/1592928048-text.native")
+    html = _pickvers_real([
+        ("Tue Jun 23 09:00:00 2020", [(cur, "MPEG-4", "text.native", True)])])
+
+    def fine(url, native_url):
+        return M.Fetched(data=b"%PDF-1.4 fine", name="talk.pdf")
+
+    def broken(url, native_url):
+        raise M.BrowserFetchFailed("tab title 'x'; nothing arrived")
+
+    def half(url, native_url):
+        if "native" in url and not native_url:
+            raise M.BrowserFetchFailed("tab title 'x'; nothing arrived")
+        return M.Fetched(data=b"%PDF-1.4 fine", name="talk.pdf")
+
+    opts = {"primary": True, "supp": False, "native": True,
+            "public": True, "hidden": True, "versions": "current",
+            "published": True, "unpublished": False}
+    for who, drive in (("start", _start_one_record),
+                       ("re-run", _rerun_one_record)):
+        for case, answer, want in (("all fetched", fine, "green"),
+                                   ("one of two failed", half, "amber"),
+                                   ("nothing arrived", broken, "red")):
+            with M.LOCK:
+                M.STATE["outcome"] = "unset"
+            drive(html, answer, opts)
+            with M.LOCK:
+                got = (M.STATE.get("phase"), M.STATE.get("outcome"))
+            check("tone . {}: {} is {}".format(who, case, want), got,
+                  ("done", want))
+    with M.LOCK:
+        M.STATE["outcome"] = "unset"
+    _start_one_record(html, fine, opts, stop_after=1)
+    with M.LOCK:
+        got = (M.STATE.get("phase"), M.STATE.get("outcome"))
+    check("tone . start: a Stop the operator pressed is green", got,
+          ("done", "green"))
+
+
+def test_a_check_that_cannot_run_says_so():
+    """1.0.1. A skip is neither a pass nor silence. Structural, with ast:
+    this suite looks for node in one place only (node_or_skip, which records
+    the skip), and no check_true passes a literal True with a "skip" note,
+    which is how 1.0.0 counted two skipped checks as passes."""
+    import ast as _ast
+    tree = _ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    finders = []
+    for fdef in [n for n in _ast.walk(tree) if isinstance(n, _ast.FunctionDef)]:
+        for c in _ast.walk(fdef):
+            if (isinstance(c, _ast.Call) and isinstance(c.func, _ast.Attribute)
+                    and c.func.attr == "which" and c.args
+                    and isinstance(c.args[0], _ast.Constant)
+                    and c.args[0].value == "node"):
+                finders.append(fdef.name)
+    check("skip . node is looked for only in node_or_skip", finders,
+          ["node_or_skip"])
+    fake_passes = []
+    for c in _ast.walk(tree):
+        if (isinstance(c, _ast.Call) and isinstance(c.func, _ast.Name)
+                and c.func.id == "check_true" and len(c.args) >= 3
+                and isinstance(c.args[1], _ast.Constant)
+                and c.args[1].value is True
+                and isinstance(c.args[2], _ast.Constant)
+                and "skip" in str(c.args[2].value).lower()):
+            fake_passes.append(c.lineno)
+    check("skip . no skipped check is counted as a pass", fake_passes, [])
+    # Behavioral: with node absent, the helper records the skip and hands
+    # back nothing a caller could mistake for a path.
+    import shutil as _sh
+    real, before = _sh.which, len(SKIP)
+    try:
+        _sh.which = lambda *_a, **_k: None
+        got = node_or_skip("skip . probe")
+    finally:
+        _sh.which = real
+    added = SKIP[before:]
+    del SKIP[before:]
+    check("skip . with no node the helper returns nothing", got, None)
+    check_true("skip . and records the check as skipped, by name",
+               len(added) == 1 and added[0].startswith("skip . probe"),
+               repr(added))
+
+
 def main():
-    for fn in (test_a_rerun_on_a_tab_that_does_not_answer_touches_nothing,
+    for fn in (test_a_check_that_cannot_run_says_so,
+               test_a_finished_run_says_how_it_went,
+               test_a_rerun_on_a_tab_that_does_not_answer_touches_nothing,
                test_a_tab_that_does_not_answer_stops_the_run_before_anything,
                test_every_downloaded_row_says_how_it_was_fetched,
                test_fetch_commentary_is_progress_in_both_workers,
@@ -11823,6 +11983,11 @@ def main():
         M.MANIFEST["version"]))
     print("  passed: {}".format(len(PASS)))
     print("  failed: {}".format(len(FAIL)))
+    if SKIP:
+        print("  SKIPPED: {} check(s) did not run - not passed, not failed"
+              .format(len(SKIP)))
+        for s_ in SKIP:
+            print("  SKIP  " + s_)
     if XFAIL:
         print("  expected failures: {} (suspected defects, not breakage)"
               .format(len(XFAIL)))
