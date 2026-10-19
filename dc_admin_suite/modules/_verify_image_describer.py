@@ -637,7 +637,7 @@ class ReportShape(unittest.TestCase):
             wb = openpyxl.load_workbook(str(path))
             head = [c.value for c in wb["Images"][1]]
             self.assertEqual(head, M.REPORT_HEADERS)
-            self.assertEqual(wb["Images"][2][len(M.REPORT_HEADERS) - 1]
+            self.assertEqual(wb["Images"][2][M.REPORT_HEADERS.index("Flags")]
                              .value, "CLAIMS CLEAN READ")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -956,7 +956,7 @@ class ClientDrift(unittest.TestCase):
                              raw)
 
     def test_both_modules_declare_the_same_client(self):
-        self.assertEqual(M.AI_CLIENT_VERSION, "1.5")
+        self.assertEqual(M.AI_CLIENT_VERSION, "1.6")
         self.assertEqual(M.AI_CLIENT_VERSION, OCR.AI_CLIENT_VERSION)
 
     def test_the_usage_normaliser_is_the_same_in_both(self):
@@ -1228,6 +1228,365 @@ class ProfileDuplicate(unittest.TestCase):
         self.assertEqual(M.validate_profiles(cand), "")
         cand["profiles"][-1]["name"] = cand["profiles"][0]["name"].upper()
         self.assertIn("Duplicate profile name", M.validate_profiles(cand))
+
+
+# ---------------------------------------------------------------------------
+# 1.9.0 / client 1.6 — the model the provider says answered
+# ---------------------------------------------------------------------------
+# Captured reply shapes, one per provider. Each names the model that
+# answered somewhere different; the request named "test-model" throughout.
+SERVED_STREAMS = {
+    "gemini": ['data: {"candidates":[{"content":{"parts":[{"text":"OK"}]},'
+               '"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":4,'
+               '"candidatesTokenCount":1},"modelVersion":"gemini-3.8-flash"}'],
+    "anthropic": ['event: message_start',
+                  'data: {"type":"message_start","message":{"model":'
+                  '"claude-opus-5-5","usage":{"input_tokens":4}}}',
+                  'data: {"type":"content_block_delta","delta":{"type":'
+                  '"text_delta","text":"OK"}}',
+                  'data: {"type":"message_delta","delta":{"stop_reason":'
+                  '"end_turn"},"usage":{"output_tokens":1}}',
+                  'event: message_stop', 'data: {"type":"message_stop"}'],
+    "openai": ['data: {"model":"gpt-x-2026-01-01","choices":[{"delta":'
+               '{"content":"OK"},"finish_reason":"stop"}]}',
+               'data: {"model":"gpt-x-2026-01-01","choices":[],"usage":'
+               '{"prompt_tokens":4,"completion_tokens":1}}',
+               'data: [DONE]'],
+}
+SERVED_NAMES = {"gemini": "gemini-3.8-flash", "anthropic": "claude-opus-5-5",
+                "openai": "gpt-x-2026-01-01"}
+SHARED_SERVED = ("served_model", "merge_served", "same_model",
+                 "served_note", "with_served")
+
+
+def _ast_of(path, name):
+    import ast
+    tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+    for node in tree.body:
+        if getattr(node, "name", None) == name:
+            return ast.dump(node)
+        if isinstance(node, ast.Assign) and any(
+                getattr(t, "id", None) == name for t in node.targets):
+            return ast.dump(node)
+    return None
+
+
+class ServedModel(unittest.TestCase):
+
+    def test_the_three_copies_are_the_same_code(self):
+        copies = (M.__file__, OCR.__file__, SHELL.__file__)
+        for name in SHARED_SERVED + ("_SNAPSHOT_SUFFIX_RE",):
+            dumps = [_ast_of(p, name) for p in copies]
+            self.assertIsNotNone(dumps[0], name)
+            self.assertEqual(dumps.count(dumps[0]), 3,
+                             "{} differs between the copies".format(name))
+
+    def test_each_provider_names_the_model_in_its_own_place(self):
+        self.assertEqual(M.served_model("gemini", {"modelVersion": " g-1 "}),
+                         "g-1")
+        self.assertEqual(M.served_model(
+            "anthropic", {"type": "message_start",
+                          "message": {"model": "c-1"}}), "c-1")
+        self.assertEqual(M.served_model(
+            "anthropic", {"type": "message", "model": "c-1"}), "c-1")
+        self.assertIsNone(M.served_model(
+            "anthropic", {"type": "message_delta", "model": "c-1"}))
+        self.assertEqual(M.served_model("openai", {"model": "o-1"}), "o-1")
+        for kind in ("gemini", "anthropic", "openai"):
+            self.assertIsNone(M.served_model(kind, {}))
+            self.assertIsNone(M.served_model(kind, None))
+            self.assertIsNone(M.served_model(kind, "text"))
+
+    def test_a_dated_snapshot_is_the_same_model_and_a_sibling_is_not(self):
+        same = M.same_model
+        self.assertTrue(same("gemini-3.8-flash", "gemini-3.8-flash"))
+        self.assertTrue(same("gemini-3.8-flash", "models/gemini-3.8-flash"))
+        self.assertTrue(same("gemini-3.8-flash", "gemini-3.8-flash-001"))
+        self.assertTrue(same("claude-opus-5-5", "claude-opus-5-5-20261001"))
+        self.assertFalse(same("gemini-3.8-flash", "gemini-3.8-flash-lite"))
+        self.assertFalse(same("gemini-3.7-flash", "gemini-3.8-flash"))
+        self.assertFalse(same("gemini-3.8-flash", ""))
+        self.assertFalse(same("", "gemini-3.8-flash"))
+
+    def test_the_note_says_what_was_observed(self):
+        self.assertEqual(M.served_note("gemini-3.8-flash", "gemini-3.8-flash"),
+                         "Answered by gemini-3.8-flash.")
+        self.assertEqual(
+            M.served_note("gemini-3.7-flash", "gemini-3.8-flash"),
+            "Requested gemini-3.7-flash, but the provider says "
+            "gemini-3.8-flash answered.")
+        self.assertEqual(
+            M.served_note("gemini-3.8-flash", None),
+            "The provider did not say which model answered (requested "
+            "gemini-3.8-flash).")
+        self.assertIn("gemini-3.7-flash, gemini-3.8-flash", M.served_note(
+            "gemini-3.7-flash", "gemini-3.7-flash, gemini-3.8-flash"))
+        for mod in (OCR, SHELL):
+            for args in (("a", "a"), ("a", "b"), ("a", None), ("a", "a-1")):
+                self.assertEqual(mod.served_note(*args),
+                                 M.served_note(*args), args)
+
+    def test_merging_keeps_each_model_once_in_order(self):
+        self.assertEqual(M.merge_served("", "a"), "a")
+        self.assertEqual(M.merge_served("a", "a"), "a")
+        self.assertEqual(M.merge_served("a", "b"), "a, b")
+        self.assertEqual(M.merge_served("a, b", "a"), "a, b")
+        self.assertEqual(M.merge_served(None, None), "")
+
+    def test_usage_sums_counts_and_merges_the_model(self):
+        total = M.sum_usage({"in": 1, "out": 2, "think": 0, "cache_read": 0,
+                             "model": "a"},
+                            {"in": 3, "out": 4, "model": "b"})
+        self.assertEqual(total, {"in": 4, "out": 6, "think": 0,
+                                 "cache_read": 0, "model": "a, b"})
+        # No name anywhere: no key at all, so an absence stays an absence.
+        self.assertNotIn("model", M.sum_usage(None, {"in": 1}))
+
+    def test_every_provider_stream_carries_the_served_model(self):
+        for mod in (M, OCR):
+            for kind, lines in SERVED_STREAMS.items():
+                with StreamPatch(lines):
+                    text, usage = mod.ai_generate(ep(kind), "p", b"img")
+                self.assertEqual(text, "OK", (mod.__name__, kind))
+                self.assertEqual(usage.get("model"), SERVED_NAMES[kind],
+                                 (mod.__name__, kind))
+
+    def test_a_stream_that_names_no_model_adds_no_key(self):
+        lines = ['data: {"candidates":[{"content":{"parts":[{"text":"x"}]}}],'
+                 '"usageMetadata":{"promptTokenCount":9,'
+                 '"candidatesTokenCount":3}}']
+        for mod in (M, OCR):
+            with StreamPatch(lines):
+                _t, usage = mod.ai_generate(ep("gemini"), "p", b"img")
+            self.assertEqual(usage, {"in": 9, "out": 3, "think": 0,
+                                     "cache_read": 0})
+
+    def test_a_refused_reply_still_says_who_refused(self):
+        lines = ['data: {"candidates":[{"content":{"parts":[{"text":"x"}]},'
+                 '"finishReason":"MAX_TOKENS"}],"modelVersion":"g-9"}']
+        for mod in (M, OCR):
+            with StreamPatch(lines):
+                with self.assertRaises(mod.AIError) as cm:
+                    mod.ai_generate(ep("gemini"), "p", b"img")
+            self.assertEqual(cm.exception.usage.get("model"), "g-9")
+
+    def test_the_endpoint_ping_reads_the_served_model(self):
+        replies = {
+            "gemini": {"candidates": [{"content": {"parts": [{"text": "OK"}]}}],
+                       "modelVersion": "gemini-3.8-flash"},
+            "anthropic": {"type": "message", "model": "claude-opus-5-5",
+                          "content": [{"type": "text", "text": "OK"}]},
+            "openai": {"model": "gpt-x-2026-01-01", "choices": [
+                {"message": {"content": "OK"}}]}}
+        for mod in (M, OCR):
+            for kind, reply in replies.items():
+                with StreamPatch([json.dumps(reply)]):
+                    text, usage = mod.ai_generate(ep(kind), "p",
+                                                  stream=False)
+                self.assertEqual(text, "OK")
+                self.assertEqual(usage.get("model"), SERVED_NAMES[kind])
+
+    def test_retries_record_every_model_that_answered(self):
+        calls = []
+
+        def flaky(*_a, **_k):
+            calls.append(1)
+            if len(calls) == 1:
+                err = M.AIError("cut off", transient=True)
+                err.usage = {"in": 1, "out": 1, "think": 0, "cache_read": 0,
+                             "model": "g-old"}
+                raise err
+            return "OK", {"in": 2, "out": 2, "think": 0, "cache_read": 0,
+                          "model": "g-new"}
+        real = M.ai_generate
+        M.ai_generate = flaky
+        try:
+            _t, usage, tries = M.ai_generate_with_retry(
+                ep("gemini"), "p", b"i", "image/png", 2, lambda s: None,
+                lambda m: None)
+        finally:
+            M.ai_generate = real
+        self.assertEqual(tries, 1)
+        self.assertEqual(usage["model"], "g-old, g-new")
+        self.assertEqual(usage["in"], 3)
+
+
+class ServedModelInTheRun(unittest.TestCase):
+    """Driven through describe_worker with the REAL process_one, the real
+    client and a replayed stream: only the image read and the workbook write
+    are stubbed. The request names gemini-3.7-flash; the stream says
+    gemini-3.8-flash answered — a silent redirect, replayed."""
+
+    def run_worker(self, lines, statuses_of=None):
+        tmp = tempfile.mkdtemp()
+        img = os.path.join(tmp, "a.jpg")
+        Path(img).write_bytes(b"x")
+        entry = {"path": img, "name": "a.jpg", "rel": "a.jpg", "ctx": "",
+                 "article": "", "title": "", "size": 1, "admin_url": "",
+                 "sidecar": ""}
+        written = {}
+
+        def capture(path, rows, pairs, rgb):
+            written["rows"], written["pairs"] = rows, dict(pairs)
+        said = []
+        real = (M.prepare_image, M.write_report, M.log)
+        M.prepare_image = lambda p, d, h: (b"img", "image/png", "")
+        M.write_report = capture
+        M.log = lambda m, *a: said.append(str(m))
+        try:
+            cfg = {"entries": [entry], "dest": "beside", "concurrency": 1,
+                   "delay": 0, "out_dir": tmp, "run_stamp": "t",
+                   "source": "test", "max_dim": 2000, "retries": 0,
+                   "max_tokens": 8000, "skip": False, "endpoint": "G",
+                   "profile": "P", "have_pymupdf": False}
+            with StreamPatch(lines):
+                M.describe_worker({"branding": {}}, cfg,
+                                  ep("gemini", model="gemini-3.7-flash"),
+                                  {"name": "P", "prompt": "p",
+                                   "max_alt_chars": 125})
+            sidecar = Path(M.sidecar_for(img)).read_text(encoding="utf-8")
+            return written, sidecar, said
+        finally:
+            M.prepare_image, M.write_report, M.log = real
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def reply(self, model=None):
+        body = {"candidates": [{"content": {"parts": [{"text": REPLY}]},
+                                "finishReason": "STOP"}]}
+        if model:
+            body["modelVersion"] = model
+        return ["data: " + json.dumps(body)]
+
+    def test_the_redirect_is_on_the_sidecar_the_row_and_the_summary(self):
+        written, sidecar, said = self.run_worker(
+            self.reply("gemini-3.8-flash"))
+        self.assertIn("Model:         gemini-3.7-flash", sidecar)
+        self.assertIn("Served by:     gemini-3.8-flash", sidecar)
+        row = written["rows"][0]
+        self.assertTrue(str(row[M.REPORT_HEADERS.index("Status")])
+                        .startswith("Described"), row)
+        self.assertEqual(row[M.REPORT_HEADERS.index("Served Model")],
+                         "gemini-3.8-flash")
+        note = ("Requested gemini-3.7-flash, but the provider says "
+                "gemini-3.8-flash answered.")
+        self.assertEqual(written["pairs"]["Model served"], note)
+        self.assertIn("Model: " + note, said)
+
+    def test_an_unnamed_model_is_said_to_be_unnamed(self):
+        written, sidecar, _said = self.run_worker(self.reply(None))
+        self.assertIn("Served by:     not named by the provider", sidecar)
+        self.assertEqual(
+            written["rows"][0][M.REPORT_HEADERS.index("Served Model")], "")
+        self.assertIn("did not say which model answered",
+                      written["pairs"]["Model served"])
+
+    def test_a_failed_row_keeps_the_model_that_refused(self):
+        body = {"candidates": [{"content": {"parts": [{"text": "x"}]},
+                                "finishReason": "MAX_TOKENS"}],
+                "modelVersion": "gemini-3.8-flash"}
+        tmp = tempfile.mkdtemp()
+        try:
+            img = os.path.join(tmp, "a.jpg")
+            Path(img).write_bytes(b"x")
+            entry = {"path": img, "name": "a.jpg", "rel": "a.jpg", "ctx": "",
+                     "article": "", "title": "", "size": 1, "admin_url": "",
+                     "sidecar": ""}
+            cfg = {"dest": "beside", "skip": False, "have_pymupdf": False,
+                   "max_dim": 2000, "retries": 0, "max_tokens": 300}
+            real = (M.prepare_image, M.log)
+            M.prepare_image = lambda p, d, h: (b"img", "image/png", "")
+            M.log = lambda *a, **k: None
+            try:
+                with StreamPatch(["data: " + json.dumps(body)]):
+                    row = M.process_one(entry, 1, cfg, ep("gemini"),
+                                        {"name": "P", "prompt": "p",
+                                         "max_alt_chars": 125})
+            finally:
+                M.prepare_image, M.log = real
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        self.assertTrue(row["status"].startswith("Failed:"), row["status"])
+        self.assertEqual(row["served"], "gemini-3.8-flash")
+
+    def test_a_skipped_row_asked_nothing(self):
+        rows = [{"status": "Skipped (sidecar exists)", "served": ""}]
+        self.assertEqual(M.run_served_note(rows, {"model": "m"}),
+                         "No request was sent in this run.")
+
+    def test_the_served_model_is_the_last_column(self):
+        self.assertEqual(M.REPORT_HEADERS[-1], "Served Model")
+        self.assertEqual(OCR.REPORT_HEADERS[-1], "Served Model")
+        self.assertEqual(len(M.REPORT_WIDTHS), len(M.REPORT_HEADERS))
+        self.assertEqual(len(OCR.REPORT_WIDTHS), len(OCR.REPORT_HEADERS))
+
+
+class ServedModelInTheEndpointTests(unittest.TestCase):
+    """The three Test buttons: the shell's Settings page and each AI
+    module's endpoint list. Each server is driven over HTTP (the modules)
+    or through test_endpoint (the shell)."""
+
+    REPLY = {"candidates": [{"content": {"parts": [{"text": "OK"}]}}],
+             "modelVersion": "gemini-3.8-flash"}
+    NOTE = ("Requested gemini-3.7-flash, but the provider says "
+            "gemini-3.8-flash answered.")
+
+    def test_the_shell_test_says_which_model_answered(self):
+        real = SHELL.urllib.request.urlopen
+        SHELL.urllib.request.urlopen = (
+            lambda req, timeout=None: FakeResponse(
+                json.dumps(self.REPLY).encode("utf-8")))
+        try:
+            out = SHELL.test_endpoint(ep("gemini", model="gemini-3.7-flash"))
+        finally:
+            SHELL.urllib.request.urlopen = real
+        self.assertEqual(out, {"ok": True, "reply": "OK", "note": self.NOTE})
+
+    def test_each_module_test_says_which_model_answered(self):
+        import threading
+        import urllib.request as ur
+        from http.server import ThreadingHTTPServer
+        target = ep("gemini", name="G", model="gemini-3.7-flash")
+        for mod in (M, OCR):
+            real = (mod.load_ai_config, mod.urllib.request.urlopen)
+            mod.load_ai_config = lambda: {"endpoints": [target],
+                                          "default": "G"}
+            session = mod.load_session(Path("/nonexistent/session.json"))
+            srv = ThreadingHTTPServer(
+                ("127.0.0.1", 0),
+                mod.make_handler(session, mod.build_page(session)))
+            port = srv.server_address[1]
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            # The module's own outbound call is faked AFTER the server is
+            # up, and the test's own request goes through a saved opener.
+            opener = ur.build_opener(ur.ProxyHandler({}))
+            mod.urllib.request.urlopen = (
+                lambda req, timeout=None: FakeResponse(
+                    json.dumps(self.REPLY).encode("utf-8")))
+            try:
+                req = ur.Request(
+                    "http://127.0.0.1:{}/api/ai/test".format(port),
+                    data=json.dumps({"name": "G"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json",
+                             "Host": "127.0.0.1:{}".format(port)},
+                    method="POST")
+                with opener.open(req, timeout=10) as resp:
+                    out = json.loads(resp.read().decode("utf-8"))
+            finally:
+                srv.shutdown()
+                srv.server_close()
+                mod.load_ai_config, mod.urllib.request.urlopen = real
+            self.assertEqual(out.get("note"), self.NOTE, mod.__name__)
+
+    def test_each_page_shows_the_note(self):
+        """Text, not behavior: the line is one expression inside a click
+        handler that needs a page's worth of stubs to drive. What is
+        asserted is that the served bytes carry it."""
+        for mod in (M, OCR):
+            html = mod.build_page({"branding": {}}).decode("utf-8")
+            self.assertIn("(data.note?' · '+data.note:'')", html,
+                          mod.__name__)
+        ui = (ROOT / "app" / "ui.py").read_text(encoding="utf-8")
+        self.assertIn('(r.note ? " · " + esc(r.note) : "")', ui)
 
 
 if __name__ == "__main__":

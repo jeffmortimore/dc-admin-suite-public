@@ -148,7 +148,7 @@ MANIFEST = {
     "id": "ocr-toolkit",
     "name": "OCR & Accessibility Toolkit",
     "description": "OCR, evaluate, and remediate PDFs, images, Word, and PowerPoint files toward WCAG 2.1 AA, with filterable accessibility reports.",
-    "version": "1.10.0",
+    "version": "1.12.0",
     "requires": ["pymupdf", "pikepdf", "ocrmypdf", "python-docx",
                  "python-pptx", "openpyxl"],
 }
@@ -532,7 +532,10 @@ def find_endpoint(cfg: dict, name: str):
 #     1.3  early-stop detection (finishReason / stop_reason / finish_reason)
 #     1.4  reasoning-trace tokens captured as usage["think"]
 #     1.5  billed usage carried on AIError; retries sum every attempt
-AI_CLIENT_VERSION = "1.5"
+#     1.6  the served model: usage["model"] is what the provider says
+#          answered (served_model, merge_served, same_model,
+#          served_note, with_served)
+AI_CLIENT_VERSION = "1.6"
 
 # The reply ceiling a builder falls back to. The image module lets a
 # description profile choose its own; this module has one job per prompt and
@@ -662,6 +665,84 @@ def collect_usage(kind, obj, usage):
     # stream_options.include_usage was set on the request.
     if isinstance(obj.get("usage"), dict):
         return dict(obj["usage"])
+    return usage
+
+
+# ---- Served model (client 1.6) ---------------------------------------------
+# The model a request NAMES is not always the model that ANSWERS it. A
+# provider can retire a model and route every request that names it to a
+# successor, silently: the same 200, the same stream, no warning. Every
+# sidecar and report would go on naming the retired model.
+# Each provider names the model that answered in its own reply, so the client
+# reads it there and carries it on the usage dict as "model" — present only
+# when the provider named one, so an absence stays visible as an absence.
+# These functions are part of the shared client: duplicated verbatim in both
+# AI modules, and in app/ai_endpoints.py for the shell's endpoint test.
+_SNAPSHOT_SUFFIX_RE = re.compile(r"-\d[\d-]*$")
+
+
+def served_model(kind, obj):
+    """The model the provider says answered, from one reply or streamed
+    event, or None when this object does not name one."""
+    if not isinstance(obj, dict):
+        return None
+    if kind == "gemini":
+        name = obj.get("modelVersion")
+    elif kind == "anthropic":
+        if obj.get("type") == "message_start":
+            name = (obj.get("message") or {}).get("model")
+        elif obj.get("type") == "message":
+            name = obj.get("model")
+        else:
+            name = None
+    else:
+        name = obj.get("model")
+    name = str(name).strip() if name else ""
+    return name or None
+
+
+def merge_served(first, second):
+    """Distinct model names in first-seen order, joined by ", "."""
+    names = []
+    for part in (first or "").split(",") + (second or "").split(","):
+        part = part.strip()
+        if part and part not in names:
+            names.append(part)
+    return ", ".join(names)
+
+
+def same_model(requested, served):
+    """True when `served` is the requested model, or a dated snapshot of it
+    (claude-x-1 answered by claude-x-1-20261001; gemini-y by gemini-y-001).
+    A different suffix is a different model: gemini-y-lite is not gemini-y."""
+    def bare(name):
+        name = str(name or "").strip().lower()
+        return name[len("models/"):] if name.startswith("models/") else name
+    req, got = bare(requested), bare(served)
+    if not req or not got:
+        return False
+    if got == req:
+        return True
+    return (got.startswith(req)
+            and bool(_SNAPSHOT_SUFFIX_RE.fullmatch(got[len(req):])))
+
+
+def served_note(requested, served):
+    """One sentence saying which model answered, for a report or a test."""
+    names = [n.strip() for n in str(served or "").split(",") if n.strip()]
+    if not names:
+        return ("The provider did not say which model answered "
+                "(requested {}).".format(requested or "no model"))
+    if all(same_model(requested, n) for n in names):
+        return "Answered by {}.".format(", ".join(names))
+    return ("Requested {}, but the provider says {} answered.".format(
+        requested or "no model", ", ".join(names)))
+
+
+def with_served(usage, served):
+    """Attach the served model to a normalised usage dict, when named."""
+    if served:
+        usage["model"] = served
     return usage
 
 
@@ -866,7 +947,8 @@ def ai_generate(ep, prompt, image_bytes=None, image_mime="image/png",
     """One request to the endpoint. Raises AIError (with .status/.transient).
 
     Returns (text, usage) where usage is the normalised token dict — see
-    normalize_usage.
+    normalize_usage. Client 1.6: usage also carries "model", the model the
+    provider says answered, when the provider names one (served_model).
 
     stream=False is kept only for the tiny endpoint-test ping; every real
     request streams (see the module note above).
@@ -885,12 +967,13 @@ def ai_generate(ep, prompt, image_bytes=None, image_mime="image/png",
             # The endpoint-test ping only; it reports zeros rather than
             # pretending to a measurement.
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return (parse(json.loads(
-                    resp.read().decode("utf-8", "replace"))),
-                    normalize_usage(kind, None))
+                obj = json.loads(resp.read().decode("utf-8", "replace"))
+            return parse(obj), with_served(normalize_usage(kind, None),
+                                           served_model(kind, obj))
         chunks = []
         usage = {}
         finish = None
+        served = None
         done = not _STREAM_DONE.get(kind)   # providers with no terminator
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             for raw in resp:
@@ -921,6 +1004,7 @@ def ai_generate(ep, prompt, image_bytes=None, image_mime="image/png",
                     done = True
                 usage = collect_usage(kind, obj, usage)
                 finish = stop_reason(kind, obj) or finish
+                served = served_model(kind, obj) or served
                 chunks.append(delta(obj))
     except urllib.error.HTTPError as e:
         raise _http_error(e)
@@ -948,7 +1032,7 @@ def ai_generate(ep, prompt, image_bytes=None, image_mime="image/png",
             "The endpoint stopped generating early after {} characters "
             "(the provider gave the reason '{}'), so the reply is "
             "incomplete".format(len(text), finish))
-        err.usage = normalize_usage(kind, usage)     # billed all the same
+        err.usage = with_served(normalize_usage(kind, usage), served)     # billed all the same
         raise err
     if not done:
         # Cut off mid-answer. Retry rather than keep a truncated result that
@@ -957,19 +1041,26 @@ def ai_generate(ep, prompt, image_bytes=None, image_mime="image/png",
                       "(stream ended without a completion signal)"
                       .format(len(text)))
         err.transient = True
-        err.usage = normalize_usage(kind, usage)
+        err.usage = with_served(normalize_usage(kind, usage), served)
         raise err
     if not text.strip():
         err = AIError("The endpoint returned an empty reply")
-        err.usage = normalize_usage(kind, usage)
+        err.usage = with_served(normalize_usage(kind, usage), served)
         raise err
-    return text, normalize_usage(kind, usage)
+    return text, with_served(normalize_usage(kind, usage), served)
 
 
 def sum_usage(total, more):
     """Sum two normalised usage dicts; None counts as nothing reported."""
     out = dict(total or {"in": 0, "out": 0, "think": 0, "cache_read": 0})
     for k, v in (more or {}).items():
+        if k == "model":
+            # Client 1.6: not a count. A retried request can be
+            # answered by two models; both are kept, once each.
+            merged = merge_served(out.get("model"), v)
+            if merged:
+                out["model"] = merged
+            continue
         out[k] = out.get(k, 0) + _int(v)
     return out
 
@@ -1064,6 +1155,10 @@ def add_usage(sink, usage):
             total[key] = total.get(key, 0) + int(src.get(key, 0) or 0)
         except (TypeError, ValueError):
             pass
+    # 1.11.0: the served model rides along (client 1.6), merged, not summed.
+    merged = merge_served(total.get("model"), src.get("model"))
+    if merged:
+        total["model"] = merged
 
 
 _REFUSAL_RE = re.compile(r"the provider gave the reason '([^']+)'")
@@ -2318,6 +2413,23 @@ def new_ai_ctx(cfg, ep):
             "alt_failed": 0}
 
 
+def run_served_note(rows, ep):
+    """The Summary's "Model served" line, from the rows that sent at
+    least one AI request (their token counts say so)."""
+    asked = [r for r in rows
+             if (r.get("in_tok") or r.get("out_tok") or r.get("served"))]
+    if not asked:
+        return "No AI request was billed in this run."
+    served = ""
+    for r in asked:
+        served = merge_served(served, r.get("served"))
+    note = served_note(ep.get("model"), served)
+    unnamed = sum(1 for r in asked if not r.get("served"))
+    if served and unnamed:
+        note += " {} row(s) did not say.".format(unnamed)
+    return note
+
+
 def apply_ai_results(row, ai_ctx, manual, review):
     """Fold one file's AI context into its report row.
 
@@ -2332,6 +2444,7 @@ def apply_ai_results(row, ai_ctx, manual, review):
     row["out_tok"] = usage.get("out", 0)
     row["think_tok"] = usage.get("think", 0)
     row["cache_tok"] = usage.get("cache_read", 0)
+    row["served"] = usage.get("model", "")
     pages = ai_ctx.get("pages") or []
     row["ai_pages"] = len(pages)
     flags, counts = page_flags(pages)
@@ -2435,10 +2548,11 @@ REPORT_HEADERS = ["Order", "File", "Format", "Context ID", "Article ID",
                   "Accessibility", "Next Steps", "Output File", "Status",
                   "Time", "Admin Record URL",
                   "In Tok", "Out Tok", "Think Tok", "Cached Tok",
-                  "AI Pages", "Alt Max Chars", "Alt Over Limit", "Flags"]
+                  "AI Pages", "Alt Max Chars", "Alt Over Limit", "Flags",
+                  "Served Model"]
 REPORT_WIDTHS = [8, 44, 11, 26, 10, 36, 15, 8, 11, 11, 18, 14, 12, 10,
                  8, 11, 11, 24, 70, 52, 34, 9, 60,
-                 10, 10, 11, 12, 10, 14, 14, 46]
+                 10, 10, 11, 12, 10, 14, 14, 46, 26]
 REPORT_LINK_COLS = (23,)
 
 # The checks no automated pass can make — one Summary block, not per-row
@@ -3336,7 +3450,7 @@ def process_one(entry, idx, cfg, ep, run_dir):
            # Seeded zeroed so a Failed or Skipped row still sums cleanly.
            "in_tok": 0, "out_tok": 0, "think_tok": 0, "cache_tok": 0,
            "ai_pages": 0, "alt_chars": 0, "alt_over": "", "flags": "",
-           "flag_counts": {}}
+           "flag_counts": {}, "served": ""}
     try:
         if entry["format"] == "pdf":
             row = process_pdf_entry(entry, cfg, ep, run_dir, row)
@@ -3397,7 +3511,8 @@ def _row_values(row):
             row.get("in_tok") or "", row.get("out_tok") or "",
             row.get("think_tok") or "", row.get("cache_tok") or "",
             row.get("ai_pages") or "", row.get("alt_chars") or "",
-            row.get("alt_over") or "", row.get("flags") or ""]
+            row.get("alt_over") or "", row.get("flags") or "",
+            row.get("served") or ""]
 
 
 def process_worker(session, cfg, ep):
@@ -3444,6 +3559,8 @@ def process_worker(session, cfg, ep):
                               cfg.get("max_tokens", DEFAULT_REPLY_LIMIT))))
             pairs.append(("Max AI raster dimension",
                           "{} px".format(AI_OCR_MAX_DIM)))
+            pairs.append(("Model requested", ep.get("model") or "—"))
+            pairs.append(("Model served", run_served_note(rows, ep)))
             tok_in = sum(r.get("in_tok") or 0 for r in rows)
             tok_out = sum(r.get("out_tok") or 0 for r in rows)
             tok_think = sum(r.get("think_tok") or 0 for r in rows)
@@ -3528,6 +3645,8 @@ def process_worker(session, cfg, ep):
             rows.append(process_one(entry, idx, cfg, ep, run_dir))
         set_state(phase="writing")
         set_progress(total, total, "Writing report…")
+        if ep and (cfg["engine"] == "ai" or cfg["ai_alt"]):
+            log("Model: " + run_served_note(rows, ep))
         path = finish_report()
         with LOCK:
             n_warn = STATE["warnings"]
@@ -3684,6 +3803,14 @@ PAGE = r"""<!DOCTYPE html>
   padding:.5rem .7rem;border-radius:6px;border:1px solid #9aa5ad;background:#eef1f5}
 .logfull{width:100%;margin-top:.4rem;font:12px/1.4 ui-monospace,monospace}
 /* /DC-LOG styles */
+/* DC-BROWSE 1 styles */
+.browse-row{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap}
+.browse-row>input{flex:1 1 16rem;min-width:0}
+.browse-row>button{flex:0 0 auto;white-space:nowrap}
+.browse-files{margin-top:.3rem}
+.browse-msg{display:block;font-size:.9em;margin-top:.2rem}
+.browse-msg:empty{display:none}
+/* /DC-BROWSE styles */
 /* DC-PALETTE 3 — one notification palette for the shell and every module.
    Gray: instructions and neutral state. Green: the state matches what the
    operator intended. Amber (version 3): a run that finished, with problems
@@ -3745,7 +3872,7 @@ PAGE = r"""<!DOCTYPE html>
   <div>
    <label for="srcdir" id="srcdirlabel">Downloader run folder (or the folder
     that holds it)</label>
-   <input type="text" id="srcdir" value="" autocomplete="off" spellcheck="false">
+   <span class="browse-row"><input type="text" id="srcdir" data-path="folder" value="" autocomplete="off" spellcheck="false"><button type="button" class="small secondary" data-browse="folder" data-for="srcdir" data-title="Downloader run folder (or the folder that holds it)" aria-label="Browse for Downloader run folder (or the folder that holds it)" hidden>Browse…</button></span><span class="browse-msg" id="srcdir-browsemsg" role="status" aria-live="polite"></span>
   </div>
   <div style="flex:0;min-width:auto" id="recwrap">
    <div class="inline"><input type="checkbox" id="recursive">
@@ -3755,8 +3882,8 @@ PAGE = r"""<!DOCTYPE html>
  </div>
  <div id="pathswrap" hidden>
   <label for="pathbox">File paths</label>
-  <textarea id="pathbox" spellcheck="false"
-   placeholder="/Users/you/Desktop/scan1.pdf&#10;/Users/you/Desktop/thesis.docx"></textarea>
+  <textarea id="pathbox" data-path="files" spellcheck="false"
+   placeholder="/Users/you/Desktop/scan1.pdf&#10;/Users/you/Desktop/thesis.docx"></textarea><div class="browse-row browse-files"><button type="button" class="small secondary" data-browse="files" data-for="pathbox" data-title="File paths" aria-label="Browse for files to add to File paths" hidden>Browse…</button></div><span class="browse-msg" id="pathbox-browsemsg" role="status" aria-live="polite"></span>
   <div class="row"><button type="button" id="scanpaths" class="small">Add files</button></div>
  </div>
  <div id="filesum" class="sum" role="status" aria-live="polite">No files queued yet.</div>
@@ -3900,7 +4027,7 @@ PAGE = r"""<!DOCTYPE html>
  <div class="row">
   <div>
    <label for="outdir" id="outdirlabel">Output folder (report always saves here)</label>
-   <input type="text" id="outdir" value="" autocomplete="off" spellcheck="false">
+   <span class="browse-row"><input type="text" id="outdir" data-path="folder" value="" autocomplete="off" spellcheck="false"><button type="button" class="small secondary" data-browse="folder" data-for="outdir" data-title="Output folder (report always saves here)" aria-label="Browse for Output folder (report always saves here)" hidden>Browse…</button></span><span class="browse-msg" id="outdir-browsemsg" role="status" aria-live="polite"></span>
   </div>
   <div id="sufwrap">
    <label for="suffix">Filename suffix for copies (optional)</label>
@@ -4221,6 +4348,126 @@ function formSeen(s){
   formRetryPending();
 }
 /* /DC-FORM */
+/* DC-BROWSE 1: Browse... beside every path field (1.0.4). A button marked
+   data-browse="folder|file|files" and data-for="<field id>" asks the module
+   to open this computer's own dialog; the choice fills the field (a path
+   list gains the chosen files, skipping any already listed) and fires the
+   field's input and change events, so the page saves and reacts as if the
+   path had been typed. Buttons stay hidden when the computer has no dialog,
+   and the first path field says why. Shared by every module with a path
+   field and duplicated verbatim. */
+var browseState = {mechanism: null, none: '', busy: false};
+var BROWSE_NL = String.fromCharCode(10);
+function browseJoin(existing, picked){
+  var lines = String(existing || '').split(BROWSE_NL)
+    .map(function(s){ return s.trim(); })
+    .filter(function(s){ return s.length > 0; });
+  (picked || []).forEach(function(p){ if(lines.indexOf(p) < 0) lines.push(p); });
+  return lines.join(BROWSE_NL);
+}
+function browseStartFrom(kind, value){
+  if(kind !== 'files') return String(value || '').trim();
+  var lines = browseJoin(value, []).split(BROWSE_NL);
+  return lines[lines.length - 1] || '';
+}
+function browseButtons(){
+  if(typeof document === 'undefined' || !document.querySelectorAll) return [];
+  return Array.prototype.slice.call(document.querySelectorAll('button[data-browse]'));
+}
+function browseField(btn){ return document.getElementById(btn.getAttribute('data-for')); }
+function browseSay(btn, text, tone){
+  var el = document.getElementById(btn.getAttribute('data-for') + '-browsemsg');
+  if(!el) return;
+  el.textContent = text || '';
+  el.className = 'browse-msg' + (tone ? ' dc-' + tone : '');
+}
+function browseSync(){
+  browseButtons().forEach(function(btn){
+    var field = browseField(btn);
+    btn.hidden = !browseState.mechanism;
+    btn.disabled = browseState.busy || !field || !!field.disabled || !!field.readOnly;
+  });
+}
+function browseFire(el, type){
+  if(el.dispatchEvent && typeof Event === 'function') el.dispatchEvent(new Event(type));
+}
+function browseApply(btn, paths){
+  var field = browseField(btn);
+  if(!field || !paths || !paths.length) return 0;
+  var before = field.value;
+  if(btn.getAttribute('data-browse') === 'files'){
+    field.value = browseJoin(field.value, paths);
+  } else {
+    field.value = paths[0];
+  }
+  browseFire(field, 'input');
+  browseFire(field, 'change');
+  if(field.focus) field.focus();
+  return field.value === before ? 0 : 1;
+}
+function browseClick(btn){
+  var field = browseField(btn);
+  if(!field || field.disabled || field.readOnly || browseState.busy
+     || !browseState.mechanism) return Promise.resolve(null);
+  var kind = btn.getAttribute('data-browse');
+  var label = btn.textContent;
+  browseState.busy = true;
+  browseSync();
+  btn.textContent = 'Choosing…';
+  browseSay(btn, 'A dialog is open. If you do not see it, it may be behind this browser window.', 'info');
+  return fetch('/api/browse', {method:'POST', cache:'no-store',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({kind: kind, start: browseStartFrom(kind, field.value),
+                            title: btn.getAttribute('data-title') || ''})})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if(j && j.error){ browseSay(btn, j.error, 'bad'); }
+      else if(!j || j.cancelled || !j.paths || !j.paths.length){
+        browseSay(btn, 'Nothing was chosen; the field is unchanged.', 'info');
+      } else if(kind === 'files'){
+        var had = browseJoin(field.value, []).split(BROWSE_NL).filter(function(s){ return s; }).length;
+        browseApply(btn, j.paths);
+        var now = browseJoin(field.value, []).split(BROWSE_NL).filter(function(s){ return s; }).length;
+        var added = now - had, skipped = j.paths.length - added;
+        browseSay(btn, added + (added === 1 ? ' path added' : ' paths added')
+          + (skipped ? '; ' + skipped + ' already listed' : '') + '.', 'ok');
+      } else {
+        browseApply(btn, j.paths);
+        browseSay(btn, '', '');
+      }
+      return j;
+    })
+    .catch(function(){
+      browseSay(btn, 'The module did not answer the Browse request. Is it still running?', 'bad');
+      return null;
+    })
+    .then(function(j){
+      browseState.busy = false;
+      btn.textContent = label;
+      browseSync();
+      return j;
+    });
+}
+function browseInit(){
+  var buttons = browseButtons();
+  if(!buttons.length) return;
+  buttons.forEach(function(btn){
+    btn.addEventListener('click', function(){ browseClick(btn); });
+  });
+  if(typeof setInterval === 'function') setInterval(browseSync, 500);
+  browseSync();
+  fetch('/api/browse', {cache:'no-store'})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      browseState.mechanism = (j && j.mechanism) || null;
+      browseState.none = (j && j.none) || '';
+      browseSync();
+      if(!browseState.mechanism && browseState.none) browseSay(buttons[0], browseState.none, 'info');
+    })
+    .catch(function(){});
+}
+browseInit();
+/* /DC-BROWSE */
 
 (function(){
   const box = logEl(), btn = document.getElementById('logcopy');
@@ -4433,7 +4680,7 @@ testep.addEventListener('click',async()=>{
  epstatus.textContent='Testing '+endpoint.value+'…';
  const data=await api('/api/ai/test',{name:endpoint.value});
  if(data.error)setMsg(epstatus,'Test failed: '+data.error,true);
- else setMsg(epstatus,'Test OK — reply: '+data.reply,false,true);
+ else setMsg(epstatus,'Test OK — reply: '+data.reply+(data.note?' · '+data.note:''),false,true);
 });
 
 function renderTools(t){
@@ -4583,6 +4830,372 @@ def folder_error(label, path, optional=False):
                 "create it first, or choose another.".format(label, path))
     return ""
 # ---- /DC-FOLDER ------------------------------------------------------------
+
+
+# ---- DC-BROWSE 1 ----------------------------------------------------------
+# A Browse... button beside every path field (1.0.4). The page asks this
+# module, and the module opens the operating system's own dialog on this
+# computer: osascript on macOS, PowerShell on Windows, tkinter otherwise.
+# On Windows the dialog is the shell's own file dialog (IFileOpenDialog,
+# which also picks folders), owned by an invisible always-on-top window
+# that is shown first: Windows will not bring a background process's
+# window to the front, but a dialog owned by a shown topmost window stays
+# above ordinary windows such as the browser.
+# The text field stays; the button only fills it. The start folder and the
+# title travel as arguments or environment variables, never inside the
+# dialog's script text. One dialog at a time per module. Duplicated
+# verbatim into every module with a path field (modules are standalone);
+# _verify_pages.py checks that the copies agree and drives each one with
+# the dialog faked.
+import base64 as _browse_b64
+import shutil as _browse_shutil
+import subprocess as _browse_subprocess
+
+BROWSE_KINDS = ("folder", "file", "files")
+BROWSE_TIMEOUT = 600          # seconds a dialog may stay open
+BROWSE_CANCELLED = 3          # exit status the PowerShell and tkinter scripts use
+BROWSE_NONE = ("No file dialog is available on this computer (osascript, "
+               "PowerShell and tkinter were each looked for). Type the path "
+               "into the field instead.")
+BROWSE_BUSY = ("A dialog is already open for this module. Choose or cancel "
+               "there first; it may be behind the browser window.")
+_BROWSE = {"mechanism": None}
+_BROWSE_LOCK = threading.Lock()
+_BROWSE_OPEN = threading.Lock()
+
+_BROWSE_OSA = """on run argv
+set startPath to item 1 of argv
+set promptText to item 2 of argv
+set mode to item 3 of argv
+activate
+try
+set loc to (POSIX file startPath) as alias
+on error
+set loc to path to home folder
+end try
+if mode is "folder" then
+return POSIX path of (choose folder with prompt promptText default location loc)
+else if mode is "file" then
+return POSIX path of (choose file with prompt promptText default location loc)
+else
+set picked to choose file with prompt promptText default location loc with multiple selections allowed
+set out to ""
+repeat with f in picked
+set out to out & (POSIX path of f) & linefeed
+end repeat
+return out
+end if
+end run
+"""
+
+_BROWSE_PS = """$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+# COMPILE-START
+Add-Type -Language CSharp -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class DcPicker {
+  [ComImport, Guid("DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7")]
+  class FileOpenDialogRCW {}
+  [ComImport, Guid("d57c7288-d4ad-4768-be02-9d969532d960"),
+   InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  interface IFileOpenDialog {
+    [PreserveSig] int Show(IntPtr owner);
+    void SetFileTypes(uint count, IntPtr types);
+    void SetFileTypeIndex(uint index);
+    void GetFileTypeIndex(out uint index);
+    void Advise(IntPtr events, out uint cookie);
+    void Unadvise(uint cookie);
+    void SetOptions(uint fos);
+    void GetOptions(out uint fos);
+    void SetDefaultFolder(IShellItem item);
+    void SetFolder(IShellItem item);
+    void GetFolder(out IShellItem item);
+    void GetCurrentSelection(out IShellItem item);
+    void SetFileName([MarshalAs(UnmanagedType.LPWStr)] string name);
+    void GetFileName([MarshalAs(UnmanagedType.LPWStr)] out string name);
+    void SetTitle([MarshalAs(UnmanagedType.LPWStr)] string title);
+    void SetOkButtonLabel([MarshalAs(UnmanagedType.LPWStr)] string text);
+    void SetFileNameLabel([MarshalAs(UnmanagedType.LPWStr)] string text);
+    void GetResult(out IShellItem item);
+    void AddPlace(IShellItem item, int place);
+    void SetDefaultExtension([MarshalAs(UnmanagedType.LPWStr)] string ext);
+    void Close(int hr);
+    void SetClientGuid(ref Guid guid);
+    void ClearClientData();
+    void SetFilter(IntPtr filter);
+    void GetResults(out IShellItemArray items);
+    void GetSelectedItems(out IShellItemArray items);
+  }
+  [ComImport, Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE"),
+   InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  interface IShellItem {
+    void BindToHandler(IntPtr pbc, ref Guid bhid, ref Guid riid, out IntPtr ppv);
+    void GetParent(out IShellItem item);
+    void GetDisplayName(uint sigdn, out IntPtr name);
+    void GetAttributes(uint mask, out uint attrs);
+    void Compare(IShellItem item, uint hint, out int order);
+  }
+  [ComImport, Guid("B63EA76D-1F85-456F-A19C-48159EFA858B"),
+   InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  interface IShellItemArray {
+    void BindToHandler(IntPtr pbc, ref Guid bhid, ref Guid riid, out IntPtr ppv);
+    void GetPropertyStore(int flags, ref Guid riid, out IntPtr ppv);
+    void GetPropertyDescriptionList(IntPtr key, ref Guid riid, out IntPtr ppv);
+    void GetAttributes(int flags, uint mask, out uint attrs);
+    void GetCount(out uint count);
+    void GetItemAt(uint index, out IShellItem item);
+    void EnumItems(out IntPtr items);
+  }
+  [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = false)]
+  static extern void SHCreateItemFromParsingName(string path, IntPtr pbc,
+      ref Guid riid, out IShellItem item);
+  const uint SIGDN_FILESYSPATH = 0x80058000;
+  const int CANCELLED = unchecked((int)0x800704C7);
+  static string PathOf(IShellItem item) {
+    IntPtr p;
+    item.GetDisplayName(SIGDN_FILESYSPATH, out p);
+    try { return Marshal.PtrToStringUni(p); } finally { Marshal.FreeCoTaskMem(p); }
+  }
+  public static string[] Pick(IntPtr owner, string kind, string start, string title) {
+    IFileOpenDialog d = (IFileOpenDialog)new FileOpenDialogRCW();
+    uint fos;
+    d.GetOptions(out fos);
+    fos |= 0x40 | 0x800;              /* file system only; the path must exist */
+    if (kind == "folder") fos |= 0x20; /* pick folders */
+    else fos |= 0x1000;                /* the file must exist */
+    if (kind == "files") fos |= 0x200; /* several at once */
+    d.SetOptions(fos);
+    if (!String.IsNullOrEmpty(title)) d.SetTitle(title);
+    if (!String.IsNullOrEmpty(start)) {
+      try {
+        Guid iid = new Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE");
+        IShellItem folder;
+        SHCreateItemFromParsingName(start, IntPtr.Zero, ref iid, out folder);
+        d.SetFolder(folder);
+      } catch (Exception) { }
+    }
+    int hr = d.Show(owner);
+    if (hr == CANCELLED) return null;
+    if (hr != 0) Marshal.ThrowExceptionForHR(hr);
+    if (kind == "files") {
+      IShellItemArray items;
+      d.GetResults(out items);
+      uint n;
+      items.GetCount(out n);
+      string[] paths = new string[n];
+      for (uint i = 0; i < n; i++) {
+        IShellItem item;
+        items.GetItemAt(i, out item);
+        paths[i] = PathOf(item);
+      }
+      return paths;
+    }
+    IShellItem one;
+    d.GetResult(out one);
+    return new string[] { PathOf(one) };
+  }
+}
+'@
+# COMPILE-END
+$owner = New-Object System.Windows.Forms.Form
+$owner.TopMost = $true
+$owner.ShowInTaskbar = $false
+$owner.FormBorderStyle = 'None'
+$owner.Opacity = 0
+$owner.StartPosition = 'CenterScreen'
+$owner.Size = New-Object System.Drawing.Size(1, 1)
+$owner.Show()
+$owner.Activate()
+try {
+  $got = [DcPicker]::Pick($owner.Handle, $env:DC_BROWSE_KIND,
+                          $env:DC_BROWSE_START, $env:DC_BROWSE_TITLE)
+} catch {
+  [Console]::Error.WriteLine($_.Exception.Message)
+  exit 1
+} finally {
+  $owner.Close()
+  $owner.Dispose()
+}
+if ($null -eq $got -or $got.Count -eq 0) { exit 3 }
+[Console]::Out.Write(($got -join [Environment]::NewLine))
+"""
+
+_BROWSE_TK = """import os, sys
+import tkinter
+from tkinter import filedialog
+root = tkinter.Tk()
+root.withdraw()
+root.attributes('-topmost', True)
+kind = os.environ.get('DC_BROWSE_KIND', 'folder')
+opts = dict(parent=root, title=os.environ.get('DC_BROWSE_TITLE', ''),
+            initialdir=os.environ.get('DC_BROWSE_START', ''))
+if kind == 'folder':
+    got = filedialog.askdirectory(mustexist=True, **opts)
+    got = [got] if got else []
+elif kind == 'file':
+    got = filedialog.askopenfilename(**opts)
+    got = [got] if got else []
+else:
+    got = list(filedialog.askopenfilenames(**opts))
+root.destroy()
+if not got:
+    sys.exit(3)
+sys.stdout.buffer.write(chr(10).join(got).encode('utf-8'))
+"""
+
+
+def browse_kind_error(kind):
+    """"" for a kind the dialogs know; otherwise a message (contract 11:
+    the one validator both endpoints use)."""
+    if kind in BROWSE_KINDS:
+        return ""
+    return "Unknown Browse request {!r}: expected one of {}.".format(
+        kind, ", ".join(BROWSE_KINDS))
+
+
+def start_folder(value):
+    """Where a dialog opens: the field's folder if it exists; for a file or
+    a path that does not exist yet, its nearest existing parent; otherwise
+    the home folder. A relative path is not guessed at."""
+    home = os.path.expanduser("~")
+    path = os.path.expanduser((value or "").strip())
+    if not path or not os.path.isabs(path):
+        return home
+    if os.path.isdir(path):
+        return path
+    cur = os.path.dirname(path)
+    while cur and not os.path.isdir(cur):
+        up = os.path.dirname(cur)
+        if up == cur:
+            break
+        cur = up
+    return cur if cur and os.path.isdir(cur) else home
+
+
+def _browse_tk_works():
+    try:
+        done = _browse_subprocess.run(
+            [sys.executable, "-c",
+             "import tkinter; r = tkinter.Tk(); r.withdraw(); r.destroy()"],
+            capture_output=True, timeout=20)
+    except (OSError, _browse_subprocess.SubprocessError):
+        return False
+    return done.returncode == 0
+
+
+def browse_mechanism():
+    """The dialog this computer can show: "osascript", "powershell",
+    "tkinter", or "" for none. Looked for once, on first use."""
+    with _BROWSE_LOCK:
+        if _BROWSE["mechanism"] is None:
+            if sys.platform == "darwin" and _browse_shutil.which("osascript"):
+                found = "osascript"
+            elif os.name == "nt" and (_browse_shutil.which("powershell")
+                                      or _browse_shutil.which("pwsh")):
+                found = "powershell"
+            elif _browse_tk_works():
+                found = "tkinter"
+            else:
+                found = ""
+            _BROWSE["mechanism"] = found
+        return _BROWSE["mechanism"]
+
+
+def browse_command(mechanism, kind, start, title):
+    """(argv, extra environment, stdin bytes) for one dialog. The start
+    folder and title are arguments or environment, never script text."""
+    env = {"DC_BROWSE_KIND": kind, "DC_BROWSE_START": start,
+           "DC_BROWSE_TITLE": title}
+    if mechanism == "osascript":
+        return (["osascript", "-", start, title, kind], {},
+                _BROWSE_OSA.encode("utf-8"))
+    if mechanism == "powershell":
+        exe = _browse_shutil.which("powershell") or _browse_shutil.which(
+            "pwsh") or "powershell"
+        code = _browse_b64.b64encode(_BROWSE_PS.encode("utf-16-le")).decode(
+            "ascii")
+        return ([exe, "-NoProfile", "-NonInteractive", "-STA",
+                 "-EncodedCommand", code], env, None)
+    return ([sys.executable, "-c", _BROWSE_TK], env, None)
+
+
+def _browse_clean(path, mechanism):
+    path = path.strip()
+    if mechanism == "osascript" and len(path) > 1 and path.endswith("/"):
+        path = path.rstrip("/") or "/"
+    return path
+
+
+def pick_paths(mechanism, kind, start, title):
+    """Open one dialog. {"paths": [...]}, {"cancelled": True}, or
+    {"error": message}. Cancel is not an error."""
+    argv, extra, stdin = browse_command(mechanism, kind, start, title)
+    env = dict(os.environ)
+    env.update(extra)
+    try:
+        done = _browse_subprocess.run(argv, input=stdin, capture_output=True,
+                                      timeout=BROWSE_TIMEOUT, env=env)
+    except _browse_subprocess.TimeoutExpired:
+        return {"error": "Nothing was chosen within {} minutes, so the "
+                         "dialog was closed. The field is unchanged."
+                         .format(BROWSE_TIMEOUT // 60)}
+    except OSError as e:
+        return {"error": "The {} dialog could not be started: {}"
+                         .format(mechanism, e)}
+    said = done.stderr.decode("utf-8", "replace").strip()
+    if done.returncode == BROWSE_CANCELLED or (
+            mechanism == "osascript" and "-128" in said):
+        return {"cancelled": True}
+    if done.returncode != 0:
+        last = said.splitlines()[-1] if said else "no message"
+        return {"error": "The {} dialog ended with status {}: {}".format(
+            mechanism, done.returncode, last[:300])}
+    out = done.stdout.decode("utf-8", "replace")
+    paths = [_browse_clean(p, mechanism) for p in out.splitlines()]
+    paths = [p for p in paths if p]
+    if not paths:
+        return {"cancelled": True}
+    if kind != "files":
+        paths = paths[:1]
+    return {"paths": paths}
+
+
+def browse_status():
+    """GET /api/browse: which dialog this computer offers ("" = none)."""
+    mech = browse_mechanism()
+    return {"mechanism": mech, "none": "" if mech else BROWSE_NONE}
+
+
+def browse_request(handler):
+    """POST /api/browse {kind, start, title}. Returns (payload, code)."""
+    try:
+        length = int(handler.headers.get("Content-Length", 0) or 0)
+        if length > 65536:
+            raise ValueError("request too large")
+        body = json.loads(handler.rfile.read(length).decode("utf-8") or "{}")
+        if not isinstance(body, dict):
+            raise ValueError("expected a JSON object")
+    except ValueError as e:
+        return {"error": "Unreadable Browse request: {}".format(e)}, 400
+    kind = body.get("kind")
+    why = browse_kind_error(kind)
+    if why:
+        return {"error": why}, 400
+    mech = browse_mechanism()
+    if not mech:
+        return {"error": BROWSE_NONE}, 409
+    if not _BROWSE_OPEN.acquire(blocking=False):
+        return {"error": BROWSE_BUSY}, 409
+    try:
+        title = str(body.get("title") or "Choose")[:200]
+        start = start_folder(str(body.get("start") or ""))
+        return pick_paths(mech, kind, start, title), 200
+    finally:
+        _BROWSE_OPEN.release()
+# ---- /DC-BROWSE ------------------------------------------------------------
 
 
 def request_allowed(handler) -> bool:
@@ -4751,6 +5364,8 @@ def make_handler(session: dict, page: bytes):
         def do_GET(self):
             if not request_allowed(self):
                 return self._json({"error": "Forbidden (non-local request)."}, 403)
+            if self.path == "/api/browse":
+                return self._json(browse_status())
             if self.path == "/api/log":
                 return send_run_log(self)
             if self.path == "/api/state":
@@ -4777,6 +5392,9 @@ def make_handler(session: dict, page: bytes):
         def do_POST(self):
             if not request_allowed(self):
                 return self._json({"error": "Forbidden (non-local request)."}, 403)
+            if self.path == "/api/browse":
+                payload, code = browse_request(self)
+                return self._json(payload, code)
             if self.path == "/api/form":
                 payload, code = remember_form_request(self)
                 return self._json(payload, code)
@@ -4853,7 +5471,9 @@ def make_handler(session: dict, page: bytes):
                         stream=False)
                 except AIError as e:
                     return self._json({"error": str(e)}, 400)
-                return self._json({"ok": True, "reply": reply[:80]})
+                return self._json({"ok": True, "reply": reply[:80],
+                                   "note": served_note(
+                                       ep.get("model"), _usage.get("model"))})
 
             if self.path == "/api/tools/check":
                 tools = tool_status()

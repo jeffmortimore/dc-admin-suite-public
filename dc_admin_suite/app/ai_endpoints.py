@@ -32,6 +32,7 @@ own, and a key encrypted with a key stored next to it would only look safer.
 """
 
 import json
+import re
 import urllib.error
 import urllib.request
 
@@ -213,8 +214,87 @@ def _test_reply(kind, obj) -> str:
         return ""
 
 
+# ---- Served model (client 1.6) ---------------------------------------------
+# The model a request NAMES is not always the model that ANSWERS it. A
+# provider can retire a model and route every request that names it to a
+# successor, silently: the same 200, the same stream, no warning. Every
+# sidecar and report would go on naming the retired model.
+# Each provider names the model that answered in its own reply, so the client
+# reads it there and carries it on the usage dict as "model" — present only
+# when the provider named one, so an absence stays visible as an absence.
+# These functions are part of the shared client: duplicated verbatim in both
+# AI modules, and in app/ai_endpoints.py for the shell's endpoint test.
+_SNAPSHOT_SUFFIX_RE = re.compile(r"-\d[\d-]*$")
+
+
+def served_model(kind, obj):
+    """The model the provider says answered, from one reply or streamed
+    event, or None when this object does not name one."""
+    if not isinstance(obj, dict):
+        return None
+    if kind == "gemini":
+        name = obj.get("modelVersion")
+    elif kind == "anthropic":
+        if obj.get("type") == "message_start":
+            name = (obj.get("message") or {}).get("model")
+        elif obj.get("type") == "message":
+            name = obj.get("model")
+        else:
+            name = None
+    else:
+        name = obj.get("model")
+    name = str(name).strip() if name else ""
+    return name or None
+
+
+def merge_served(first, second):
+    """Distinct model names in first-seen order, joined by ", "."""
+    names = []
+    for part in (first or "").split(",") + (second or "").split(","):
+        part = part.strip()
+        if part and part not in names:
+            names.append(part)
+    return ", ".join(names)
+
+
+def same_model(requested, served):
+    """True when `served` is the requested model, or a dated snapshot of it
+    (claude-x-1 answered by claude-x-1-20261001; gemini-y by gemini-y-001).
+    A different suffix is a different model: gemini-y-lite is not gemini-y."""
+    def bare(name):
+        name = str(name or "").strip().lower()
+        return name[len("models/"):] if name.startswith("models/") else name
+    req, got = bare(requested), bare(served)
+    if not req or not got:
+        return False
+    if got == req:
+        return True
+    return (got.startswith(req)
+            and bool(_SNAPSHOT_SUFFIX_RE.fullmatch(got[len(req):])))
+
+
+def served_note(requested, served):
+    """One sentence saying which model answered, for a report or a test."""
+    names = [n.strip() for n in str(served or "").split(",") if n.strip()]
+    if not names:
+        return ("The provider did not say which model answered "
+                "(requested {}).".format(requested or "no model"))
+    if all(same_model(requested, n) for n in names):
+        return "Answered by {}.".format(", ".join(names))
+    return ("Requested {}, but the provider says {} answered.".format(
+        requested or "no model", ", ".join(names)))
+
+
+def with_served(usage, served):
+    """Attach the served model to a normalised usage dict, when named."""
+    if served:
+        usage["model"] = served
+    return usage
+
+
 def test_endpoint(ep) -> dict:
-    """{"ok": True, "reply": "..."} or {"ok": False, "error": "..."}."""
+    """{"ok": True, "reply": "...", "note": "..."} or
+    {"ok": False, "error": "..."}. The note says which model answered."""
     if not ep.get("api_key"):
         return {"ok": False, "error": "This endpoint has no API key."}
     try:
@@ -245,4 +325,6 @@ def test_endpoint(ep) -> dict:
         return {"ok": False,
                 "error": "The endpoint answered, but not in the shape this "
                          "kind expects — check the kind and model."}
-    return {"ok": True, "reply": reply[:80]}
+    kind = (ep.get("kind") or "").lower()
+    return {"ok": True, "reply": reply[:80],
+            "note": served_note(ep.get("model"), served_model(kind, obj))}

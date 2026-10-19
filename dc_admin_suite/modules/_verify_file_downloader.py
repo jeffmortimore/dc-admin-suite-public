@@ -1400,8 +1400,24 @@ def test_adaptive_delay():
     check_true("delay · the slowdown is capped",
                M.rate_state()["extra"] <= M.RATE_DELAY_CAP,
                "extra={}".format(M.rate_state()["extra"]))
-    check_true("delay · _throttle uses the added delay",
-               True)
+    # Driven since 1.0.2. Until then this was check_true(..., True): it
+    # claimed _throttle waits the added delay and tested nothing. The
+    # expected waits are built from the state's parts, not from
+    # request_delay(), so a delay function that dropped the penalty fails.
+    import types as _types
+    st = M.rate_state()
+    slept, real_time = [], M.time
+    M.time = _types.SimpleNamespace(sleep=slept.append)
+    try:
+        M._throttle("file")
+        M._throttle("page")
+    finally:
+        M.time = real_time
+    check("delay · _throttle waits the base plus the added delay, for a "
+          "file and for an admin page",
+          [round(x, 6) for x in slept],
+          [round(st["base"] + st["extra"], 6),
+           round(st["page_base"] + st["extra"], 6)])
     M.reset_rate_state()
     st = M.rate_state()
     check("delay · reset clears the penalty for the next run",
@@ -2903,13 +2919,25 @@ def test_the_family_is_not_re_guessed_once_known():
         check_true("flip . which is where editor_gallery.cgi comes from",
                    "editor_gallery" in seen[1], seen[1])
 
-        # and the worker only allows it until a state has parsed
-        src = Path(M.__file__).read_text(encoding="utf-8")
-        body = src[src.index("def download_worker("):
-                   src.index("# UI — branded")]
+        # and the worker only allows it until a state has parsed. With
+        # ast since 1.0.2: the text match broke when the call moved
+        # inside until_stopped(), which is the reason not to match text.
+        import ast as _ast
+        calls = _planning_listing_calls()
+        flip = calls[0].get("allow_flip") if len(calls) == 1 else None
+        sets_known = any(
+            isinstance(n, _ast.Assign)
+            and any(getattr(t, "id", "") == "flavour_known" for t in n.targets)
+            and isinstance(n.value, _ast.Constant) and n.value.value is True
+            for n in _ast.walk(_worker_tree(M.download_worker)))
         check_true("flip . the worker stops allowing it once a state parsed",
-                   "allow_flip=not flavour_known" in body
-                   and "flavour_known = True" in body, "not wired")
+                   len(calls) == 1
+                   and isinstance(flip, _ast.UnaryOp)
+                   and isinstance(flip.op, _ast.Not)
+                   and getattr(flip.operand, "id", "") == "flavour_known"
+                   and sets_known,
+                   "not wired: {} planning call(s); allow_flip {}".format(
+                       len(calls), _ast.dump(flip) if flip else None))
     finally:
         M.fetch_html = real_fetch
         M._throttle = real_throttle
@@ -3060,8 +3088,12 @@ def test_access_state_is_read_and_never_guessed():
         # A generic copy has no named profile, so there is nothing to
         # search FOR. Say that. Printing nothing here would read exactly
         # like a clean scan, and the build refuses for the same reason.
-        check_true("access . NOTHING WAS CHECKED — no institution profile, "
-                   "so no marker to search for", True)
+        # 1.0.2: a skip, not a pass. Until then this line was recorded as a
+        # pass, and the summary prints only failures, so nothing on screen
+        # said the identity scan had not run.
+        skip("access . identity markers",
+             "no institution profile, so no marker to search for - "
+             "NOTHING WAS CHECKED")
     check("access . the same wording classifies for any institution",
           {M.access_state("Thesis (restricted to " + who + ")")
            for who in ("A University", "B College", "C Institute")},
@@ -4067,11 +4099,18 @@ def test_the_browser_never_loads_the_big_listing():
               "helper".format(worker.__name__), direct, [])
 
     # And the driver's page must NOT be handed to crawl_listing, or the
-    # first state of every structure silently gives up x_showall.
-    crawl = body[body.index("rows, gallery = crawl_listing("):]
-    crawl = crawl[:crawl.index("flavour_known = True")]
+    # first state of every structure silently gives up x_showall. With
+    # ast since 1.0.2, by the argument's position as well as its name.
+    import ast as _ast
+    calls = _planning_listing_calls()
+    given = [c.get("first_html") for c in calls]
     check_true("big-listing . the driver's page is not reused as the listing",
-               "first_html" not in crawl, crawl[:300])
+               len(calls) == 1 and all(
+                   g is None or (isinstance(g, _ast.Constant)
+                                 and g.value is None) for g in given),
+               "{} planning call(s); first_html {}".format(
+                   len(calls), [_ast.dump(g) if g is not None else None
+                                for g in given]))
 
     # Bounds, so a slow page is a slow page and not an unhandled error.
     check_true("big-listing . a listing gets its own, longer timeout",
@@ -5945,7 +5984,9 @@ def test_a_stopped_run_accounts_for_every_row():
     body = inspect.getsource(M.download_worker)
     flush = body[body.index("def flush_pending"):
                  body.index("def finish_master")]
-    for name, token in (("downloaded", '== "Downloaded"'),
+    # is_downloaded() since 1.0.2; test_every_success_count_asks_how_the_
+    # status_begins holds the whole module to it with ast.
+    for name, token in (("downloaded", "is_downloaded(r[COL_STATUS])"),
                         ("not present", "ABSENT_PREFIXES"),
                         ("never reached", "NOT_ATTEMPTED")):
         check_true("stop-count . the flush counts {}".format(name),
@@ -7465,8 +7506,9 @@ def test_the_modules_wording_names_no_vendor_and_no_agreement():
     else:
         # A public copy declares nothing private, so there is nothing to
         # search FOR. Say that, as the identity check does.
-        check_true("wording . NOTHING WAS CHECKED for private terms — no "
-                   "profile declares any", True)
+        # 1.0.2: a skip, not a pass, as the identity check above.
+        skip("wording . private terms",
+             "no profile declares any - NOTHING WAS CHECKED")
     check_true("wording . the source never says 'bepress'",
                re.search(r"\bbepress\b", lowered) is None, "")
     check_true("wording . and it does say what actually happens",
@@ -8982,6 +9024,10 @@ def test_a_404_the_browser_cannot_hear_is_still_an_answer():
             except Exception as e:
                 check_true("second-opinion . 410 is an absence too", False,
                            "got {}: {}".format(type(e).__name__, e))
+            else:
+                # 1.0.2: a fetch that returned was recorded as nothing.
+                check_true("second-opinion . 410 is an absence too", False,
+                           "it returned without raising")
         finally:
             urllib.request.urlopen = real
             M.reset_rate_state()
@@ -9120,6 +9166,9 @@ def test_pushback_is_never_flattened_into_a_browser_failure():
                 check_true("second-opinion . a throttle stays a throttle",
                            False,
                            "got {}: {}".format(type(e).__name__, e))
+            else:
+                check_true("second-opinion . a throttle stays a throttle",
+                           False, "it returned without raising")
 
             f2, _d2, url2 = _silent_browser(os.path.join(d, "_inc2"))
             f2.use_cookie("c=1")
@@ -9138,6 +9187,9 @@ def test_pushback_is_never_flattened_into_a_browser_failure():
                 check_true("second-opinion . a session expiry stays one",
                            False,
                            "got {}: {}".format(type(e).__name__, e))
+            else:
+                check_true("second-opinion . a session expiry stays one",
+                           False, "it returned without raising")
         finally:
             urllib.request.urlopen = real
             M._sleep = real_sleep
@@ -9262,6 +9314,10 @@ def test_an_absence_the_tab_states_is_not_re_asked():
                     check_true("second-opinion . a stated absence is "
                                "believed — {}".format(what), False,
                                "got {}: {}".format(type(e).__name__, e))
+                else:
+                    check_true("second-opinion . a stated absence is "
+                               "believed — {}".format(what), False,
+                               "it returned without raising")
                 check("second-opinion . and costs no second request — {}"
                       .format(what), len(asked.asked), 0)
             finally:
@@ -10624,8 +10680,15 @@ def test_every_downloaded_row_says_how_it_was_fetched():
           len(M.REPORT_WIDTHS), len(M.REPORT_HEADERS))
     for worker in (M.download_worker, M.retry_worker):
         tree = ast.parse(_tw.dedent(inspect.getsource(worker)))
+        # The success row's status is the literal "Downloaded", or since
+        # 1.0.2 the status settle_saved() returned (it may name an
+        # identical copy).
         done = [n for n in ast.walk(tree) if isinstance(n, ast.Tuple)
-                and any(isinstance(e, ast.Constant) and e.value == "Downloaded"
+                and isinstance(n.ctx, ast.Load)     # a row, not a target
+                and any((isinstance(e, ast.Constant)
+                         and e.value == "Downloaded")
+                        or (isinstance(e, ast.Name)
+                            and e.id == "saved_status")
                         for e in n.elts)]
         check_true("fetched-via . {} builds a Downloaded row".format(
                    worker.__name__), bool(done))
@@ -10944,8 +11007,41 @@ def _rerun_one_record(pickvers_html, answer, plan_opts, ctx="ev", rows=None):
     return calls, got, files, logs
 
 
+def _worker_tree(worker):
+    import ast as _ast
+    import inspect
+    return _ast.parse(inspect.getsource(worker).lstrip())
+
+
+def _planning_listing_calls():
+    """download_worker's calls to crawl_listing, each as {parameter: node},
+    whether made directly or through until_stopped(crawl_listing, ...)
+    (1.0.2). Arguments are bound to crawl_listing's own parameter names,
+    read from its signature, so a positional None and first_html=None are
+    the same thing."""
+    import ast as _ast
+    import inspect
+    names = list(inspect.signature(M.crawl_listing).parameters)
+    found = []
+    for n in _ast.walk(_worker_tree(M.download_worker)):
+        if not isinstance(n, _ast.Call):
+            continue
+        fn = getattr(n.func, "id", None)
+        if fn == "crawl_listing":
+            args = list(n.args)
+        elif (fn == "until_stopped" and n.args
+              and getattr(n.args[0], "id", None) == "crawl_listing"):
+            args = list(n.args[1:])
+        else:
+            continue
+        bound = dict(zip(names, args))
+        bound.update({k.arg: k.value for k in n.keywords})
+        found.append(bound)
+    return found
+
+
 def _start_one_record(pickvers_html, answer, opts, ctx="ev",
-                      stop_after=None):
+                      stop_after=None, listing=None, stubs=None):
     """Drive download_worker — a fresh Start — over one record.
 
     download_worker was long described as undrivable ("it needs Chrome and
@@ -10960,6 +11056,8 @@ def _start_one_record(pickvers_html, answer, opts, ctx="ev",
     server through `answer(url, native_url)`. Everything between — the
     planner, the dedupe, SavedFiles, the rows and the report — is real.
     `stop_after` = raise StopRequested on that fetch call (1-based).
+    `listing` replaces the one-record listing (1.0.2, a slow read);
+    `stubs` replaces any of the other stubbed seams by name (1.0.2).
     Returns (calls, rows, saved filenames, log lines).
     """
     base = "https://dc.example.edu"
@@ -10987,7 +11085,12 @@ def _start_one_record(pickvers_html, answer, opts, ctx="ev",
             ("_attach_or_fail", "cookie_header", "ready_the_tab",
              "make_fetcher", "preflight_downloads", "session_still_open",
              "hold_if_challenged", "crawl_listing", "fetch_html",
-             "fetch_one", "_throttle", "log", "MODEL")}
+             "fetch_one", "_throttle", "log", "MODEL",
+             "tab_ready_check", "write_plan_workbook")}
+    unknown = set(stubs or {}) - set(keep)
+    if unknown:
+        raise ValueError("not a seam of this harness: {}".format(
+            sorted(unknown)))
     with tempfile.TemporaryDirectory() as d:
         out = os.path.join(d, "out")
         os.makedirs(out, exist_ok=True)
@@ -10999,13 +11102,16 @@ def _start_one_record(pickvers_html, answer, opts, ctx="ev",
             M.preflight_downloads = lambda *a, **k: []
             M.session_still_open = lambda *a, **k: ("", False)
             M.hold_if_challenged = lambda *a, **k: None
-            M.crawl_listing = lambda *a, **k: ([dict(item)], False)
+            M.crawl_listing = listing or (
+                lambda *a, **k: ([dict(item)], False))
             M._throttle = lambda *a, **k: None
             M.fetch_html = (lambda url, cookie, timeout=0:
                             pickvers_html if "pickvers" in url
                             else "<html><body></body></html>")
             M.fetch_one = _fetch_one
             M.log = lambda msg: lines.append(msg)
+            for k, v in (stubs or {}).items():
+                setattr(M, k, v)
             with M.LOCK:
                 M.MODEL = {"levels": {ctx: 1}, "types": {ctx: "Event"},
                            "chains": [["root", ctx]]}
@@ -11022,7 +11128,14 @@ def _start_one_record(pickvers_html, answer, opts, ctx="ev",
                         M.MODEL = v
                 else:
                     setattr(M, k, v)
-        got = _report_rows(out)
+        try:
+            got = _report_rows(out)
+        except AssertionError:
+            # Only a run stopped while it was still reading the listing
+            # (the `listing` seam) is entitled to have planned nothing.
+            if listing is None:
+                raise
+            got = None
         files = sorted(n for _r, _d, fs in os.walk(out) for n in fs
                        if not n.endswith(".xlsx")
                        and not n.startswith("DC_FileDownload_Log_"))
@@ -11182,6 +11295,170 @@ def test_a_pdf_record_keeps_stamped_and_unstamped_named_apart():
                    "own URL".format(who),
                    old_pdf is not None and "1691017077" in old_pdf["File URL"],
                    str(old_pdf and old_pdf["File URL"]))
+
+
+def test_an_inventory_run_is_driven_to_its_plan():
+    """1.0.2. Inventory mode was checked by reading the worker's source
+    and by calling write_plan_workbook() directly - never by running the
+    worker - and every inventory with rows died at the end of its first
+    structure ("too many values to unpack")."""
+    inv = dict(_ALL_NATIVES, inventory=True)
+    for cap, says in ((0, "one session takes it all"),
+                      (1, "sessions of 1 (the limit of 1 file(s) per "
+                          "session")):
+        calls, rows, files, lines, logs = _start_one_record(
+            "<html></html>", lambda url, native: None,
+            dict(inv, max_files=cap))
+        with M.LOCK:
+            phase = M.STATE.get("phase")
+        tag = "inventory-run cap {} . ".format(cap)
+        check(tag + "finishes", phase, "done")
+        check(tag + "requests no file", calls, [])
+        check_true(tag + "writes its plan, sized by the page's limit",
+                   any("plan written" in str(l) and says in str(l)
+                       for l in lines), "\n".join(map(str, lines[-6:])))
+
+    # A failure AFTER the rows exist: they are written out, and the line
+    # that says so calls them what they are.
+    def _refuse(*a, **k):
+        raise OSError(28, "No space left on device")
+    calls, rows, files, lines, logs = _start_one_record(
+        "<html></html>", lambda url, native: None, inv,
+        stubs={"write_plan_workbook": _refuse})
+    said = [str(l) for l in lines if "inside 'ev'" in str(l)]
+    check_true("inventory-run . a failure after the rows writes them out",
+               len(said) == 1, "\n".join(map(str, lines[-6:])))
+    check_true("inventory-run . calling them inventoried, not failed",
+               bool(said) and "inventoried" in said[0]
+               and "failed)" not in said[0] and "failed," not in said[0],
+               said[0] if said else "(no such line)")
+
+
+def test_every_success_count_asks_how_the_status_begins():
+    """1.0.2: a Downloaded status may go on ("Downloaded — byte-identical
+    to ..."), so no count in the module may compare it exactly."""
+    import ast as _ast
+    tree = _ast.parse(Path(M.__file__).read_text(encoding="utf-8"))
+    exact = [n.lineno for n in _ast.walk(tree)
+             if isinstance(n, _ast.Compare)
+             and any(isinstance(c, _ast.Constant) and c.value == "Downloaded"
+                     for c in [n.left] + list(n.comparators))]
+    check("success . no exact comparison with 'Downloaded'", exact, [])
+    check("success . is_downloaded reads the beginning",
+          [M.is_downloaded(s) for s in (
+              "Downloaded", "Downloaded — byte-identical to x.pdf, so this "
+              "second copy was not kept", "Failed: x", M.INVENTORIED, None)],
+          [True, True, False, False, False])
+
+
+def test_byte_identical_copies_are_kept_once():
+    """1.0.2: a collection-scale run brought down three byte-identical
+    pairs (equal SHA-256): one record's native `original` revision was the
+    same file as its `current` native, and two records' stamped PDF was
+    the same file as the revisions table's unstamped copy.
+    Planning cannot know; the bytes can. The server here answers as that
+    one did, and BOTH workers must keep one copy and record both rows."""
+    cur = ("viewcontent.cgi?type=native&article=1000&unstamped=yes"
+           "&date=1592928048&preview_mode=1&context=ev&/1592928048-text.native")
+    old = ("viewcontent.cgi?type=native&article=1000&unstamped=yes"
+           "&date=1592926724&preview_mode=1&context=ev&/1592926724-text.native")
+    video = _pickvers_real([
+        ("Tue Jun 23 09:00:00 2020", [(cur, "MPEG-4", "text.native", True)]),
+        ("Tue Jun 23 08:38:00 2020", [(old, "MPEG-4", "text.native", False)]),
+    ])
+    SAME = b"\x00\x00\x00\x18ftypmp42-the-one-upload"
+
+    def video_answer(url, native_url):
+        if "type/native" in url or "type=native" in url:
+            return M.Fetched(data=SAME, name="talk.mp4")
+        if native_url:
+            return M.Fetched(data=SAME, name="talk.mp4", used_native=True)
+        raise M.NoFileAvailable("No PDF has been provided")
+
+    pdf_new = ("viewcontent.cgi?type=pdf&article=1000&unstamped=yes"
+               "&date=1701352305&preview_mode=1&context=jj&/1701352305-text.pdf")
+    pdf = _pickvers_real([
+        ("Thu Nov 30 05:51:00 2023", [(pdf_new, "PDF", "text.pdf", True)]),
+    ])
+    PDF = b"%PDF-no-cover-page-so-both-are-this"
+
+    def pdf_answer(url, native_url):
+        if "type/native" in url or "type=native" in url:
+            raise M.NoFileAvailable("no native")
+        return M.Fetched(data=PDF, name="Program.pdf")
+
+    cases = (("video", video, video_answer, "ev", 2, 1),
+             ("pdf", pdf, pdf_answer, "jj", 2, 1))
+    for who, drive in (("start", _start_one_record),
+                       ("re-run", _rerun_one_record)):
+        for shape, html, answer, ctx, n_rows, n_files in cases:
+            got = drive(html, answer, _ALL_NATIVES, ctx=ctx)
+            rows, files = got[1], got[2]
+            done = [r for r in rows
+                    if str(r["Status"]).startswith("Downloaded")]
+            tag = "identical {} {} . ".format(who, shape)
+            check(tag + "both identities keep a Downloaded row", len(done),
+                  n_rows)
+            check(tag + "one copy on disk", len(files), n_files)
+            twins = [r for r in done if "byte-identical to" in r["Status"]]
+            check(tag + "exactly one row says it is the second copy",
+                  len(twins), 1)
+            check(tag + "both rows name the one file that holds the bytes",
+                  sorted({r["Saved Filename"] for r in done}), sorted(files))
+            check_true(tag + "and the second row names it in its status",
+                       bool(twins) and files and files[0] in twins[0]["Status"],
+                       twins[0]["Status"] if twins else "(no such row)")
+
+    # The copy that cannot be removed: both are kept, and the row says so.
+    # An optimization that fails costs disk, never data.
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        first, second = os.path.join(d, "a.pdf"), os.path.join(d, "b.pdf")
+        for p_ in (first, second):
+            with open(p_, "wb") as fh:
+                fh.write(b"%PDF-same")
+        s_ = M.SavedFiles()
+        M.settle_saved(s_, "c", "1", {"kind": "primary", "version": "current",
+                                      "url": "u1"}, first)
+        real_remove = os.remove
+
+        def _refuse(path):
+            raise PermissionError(13, "Permission denied", path)
+        try:
+            os.remove = _refuse
+            name, status = M.settle_saved(
+                s_, "c", "1", {"kind": "primary",
+                               "version": M.VERSION_CURRENT_UNSTAMPED,
+                               "url": "u2"}, second)
+        finally:
+            os.remove = real_remove
+        check("identical . a copy that cannot be removed is kept",
+              sorted(os.listdir(d)), ["a.pdf", "b.pdf"])
+        check("identical . and its row names itself", name, "b.pdf")
+        check_true("identical . and says it could not be removed",
+                   status.startswith("Downloaded")
+                   and "could not be removed" in status, status)
+        check("identical . and it is not counted as a copy not kept",
+              s_.identical, 0)
+
+    # Same SIZE, different bytes: a different file, and both stay. A size
+    # match alone must never remove anything.
+    with tempfile.TemporaryDirectory() as d:
+        first, second = os.path.join(d, "a.pdf"), os.path.join(d, "b.pdf")
+        with open(first, "wb") as fh:
+            fh.write(b"%PDF-AAAA")
+        with open(second, "wb") as fh:
+            fh.write(b"%PDF-BBBB")
+        s_ = M.SavedFiles()
+        M.settle_saved(s_, "c", "1", {"kind": "primary", "version": "current",
+                                      "url": "u1"}, first)
+        name, status = M.settle_saved(
+            s_, "c", "1", {"kind": "primary",
+                           "version": M.VERSION_CURRENT_UNSTAMPED,
+                           "url": "u2"}, second)
+        check("identical . same size, different bytes: both stay",
+              (sorted(os.listdir(d)), name, status),
+              (["a.pdf", "b.pdf"], "b.pdf", "Downloaded"))
 
 
 def test_a_rerun_stopped_mid_record_keeps_the_rest_of_the_record():
@@ -11523,12 +11800,20 @@ def test_the_idle_line_says_what_to_do_next():
     end = page.find("\n}\n", start) + 3
     js = page[start:end]
     out = []
-    for loaded, resume in ((False, False), (True, False), (False, True)):
+    words = page[page.find("function goWord(){"):
+                 page.find("/* Says what to do NEXT")]
+    cases = ((False, False, False), (True, False, False),
+             (False, True, False), (True, False, True))
+    for loaded, resume, inv in cases:
         harness = ("const status={className:'',textContent:'Idle.'};\n"
                    "const jobResume={checked:%s}; let hierLoaded=%s;\n"
+                   "const kinventory={checked:%s};\n"
+                   "const cap=t=>t.charAt(0).toUpperCase()+t.slice(1)+'…';\n"
                    % ("true" if resume else "false",
-                      "true" if loaded else "false")
-                   + js + "\nidleStatus(); console.log(status.textContent);")
+                      "true" if loaded else "false",
+                      "true" if inv else "false")
+                   + words + js
+                   + "\nidleStatus(); console.log(status.textContent);")
         r = _run_node(node, harness)
         out.append(r.stdout.strip() if r.returncode == 0 else r.stderr[-200:])
     check("idle . nothing loaded asks for a hierarchy",
@@ -11537,6 +11822,23 @@ def test_the_idle_line_says_what_to_do_next():
           out[1], "Idle — choose the scope and options, then Start downloads.")
     check("idle . re-run mode asks for the report, not a hierarchy",
           out[2], "Idle — name the previous report, then Re-run from report.")
+    check("idle . with Inventory only ticked, it says Start inventory",
+          out[3], "Idle — choose the scope and options, then Start inventory.")
+    # 1.0.2: the button and the running status are worded by the mode.
+    harness = ("const kinventory={checked:true};\n"
+               "const cap=t=>t.charAt(0).toUpperCase()+t.slice(1)+'…';\n"
+               + words +
+               "\nconsole.log([goWord(),"
+               "phaseWord({phase:'downloading',inventory:true}),"
+               "phaseWord({phase:'downloading',inventory:false}),"
+               "phaseWord({phase:'starting',inventory:true})].join('|'));"
+               "kinventory.checked=false; console.log(goWord());")
+    r = _run_node(node, harness)
+    check("idle . an inventory is worded as one, a download as one",
+          r.stdout.strip().splitlines() if r.returncode == 0
+          else r.stderr[-200:],
+          ["Start inventory|Inventorying…|Downloading…|Starting…",
+           "Start downloads"])
     check_true("idle . and the poller repaints it every time it is idle",
                "}else if(s.phase==='idle'){\n    idleStatus();" in page,
                "the old guard repainted only an empty line")
@@ -11738,6 +12040,57 @@ def test_a_finished_run_says_how_it_went():
           ("done", "green"))
 
 
+def _silent_tries(tree):
+    """Line numbers of every `try` that records a pass in an `except` and
+    records nothing when the call returns: no else, and no failure in its
+    own body. Four "second-opinion" checks were that until 1.0.2, and a
+    fetch that returned left no line in either list (planted and seen)."""
+    import ast as _ast
+
+    def is_check(n):
+        return (isinstance(n, _ast.Call) and isinstance(n.func, _ast.Name)
+                and n.func.id in ("check_true", "check"))
+
+    def passes(n):
+        return (is_check(n) and n.func.id == "check_true"
+                and len(n.args) >= 2 and isinstance(n.args[1], _ast.Constant)
+                and n.args[1].value is True)
+
+    def fails(stmts):
+        for st in stmts:
+            for n in _ast.walk(st):
+                if isinstance(n, _ast.Raise):
+                    return True
+                if (is_check(n) and len(n.args) >= 2
+                        and isinstance(n.args[1], _ast.Constant)
+                        and n.args[1].value is False):
+                    return True
+                if (is_check(n) and n.func.id == "check"
+                        and len(n.args) >= 3
+                        and all(isinstance(a, _ast.Constant)
+                                for a in n.args[1:3])
+                        and n.args[1].value != n.args[2].value):
+                    return True
+                if (isinstance(n, _ast.Call)
+                        and isinstance(n.func, _ast.Attribute)
+                        and n.func.attr == "append"
+                        and isinstance(n.func.value, _ast.Name)
+                        and n.func.value.id == "FAIL"):
+                    return True
+        return False
+
+    silent = []
+    for t in _ast.walk(tree):
+        if not isinstance(t, _ast.Try):
+            continue
+        if not any(passes(x) for h in t.handlers for s_ in h.body
+                   for x in _ast.walk(s_)):
+            continue
+        if not fails(t.body) and not fails(t.orelse):
+            silent.append(t.lineno)
+    return silent
+
+
 def test_a_check_that_cannot_run_says_so():
     """1.0.1. A skip is neither a pass nor silence. Structural, with ast:
     this suite looks for node in one place only (node_or_skip, which records
@@ -11765,6 +12118,20 @@ def test_a_check_that_cannot_run_says_so():
                 and "skip" in str(c.args[2].value).lower()):
             fake_passes.append(c.lineno)
     check("skip . no skipped check is counted as a pass", fake_passes, [])
+    # 1.0.2: nor one whose own name says nothing was checked. The two
+    # "NOTHING WAS CHECKED" lines were passes until then.
+    said_nothing = []
+    for c in _ast.walk(tree):
+        if (isinstance(c, _ast.Call) and isinstance(c.func, _ast.Name)
+                and c.func.id in ("check_true", "check") and c.args
+                and isinstance(c.args[0], _ast.Constant)
+                and isinstance(c.args[0].value, str)
+                and "nothing was checked" in c.args[0].value.lower()):
+            said_nothing.append(c.lineno)
+    check("skip . no check that says it did not run is recorded as one",
+          said_nothing, [])
+    check("skip . every try that passes in an except also records the "
+          "call returning", _silent_tries(tree), [])
     # Behavioral: with node absent, the helper records the skip and hands
     # back nothing a caller could mistake for a path.
     import shutil as _sh
@@ -11782,8 +12149,308 @@ def test_a_check_that_cannot_run_says_so():
                repr(added))
 
 
+def test_stop_does_not_wait_for_the_drift_check():
+    """1.0.2. The drift check reads each listing in one request when
+    x_showall works - about 12 s on 391 records - and Stop was honored
+    only between pages, so the operator watched Stop do nothing for the
+    length of the read. Driven: a listing read that ignores Stop, as
+    urllib does, and Stop pressed while it is in flight."""
+    import tempfile
+    import urllib.error
+
+    base = "https://dc.example.edu"
+    adm = base + "/cgi/editor.cgi?display=submission&article={}&context=etd"
+    rows = [_row(i, str(i), "primary", "public", "current",
+                 "Failed: HTTP 429 Too Many Requests",
+                 base + "/cgi/viewcontent.cgi?article={}&context=etd".format(i),
+                 adm.format(i), access=M.ACCESS_OPEN,
+                 release="Thesis (open access)")
+            for i in (1, 2, 3)]
+
+    class _FakeDriver:
+        page_source = "<html><body>admin</body></html>"
+        current_url = base + "/"
+        title = "Digital Commons"
+
+        def get(self, url):
+            pass
+
+    READ_SECONDS = 3.0
+    release = threading.Event()
+    asked = []
+
+    def _slow_listing(base_url, ctx, gallery, state, cookie, first_html=None,
+                      allow_flip=True):
+        # One request that does not look at Stop, as urllib does not. It
+        # then FAILS, so a read nobody is waiting for any more would warn
+        # into the log - which it must not.
+        release.wait(READ_SECONDS)
+        # The real crawl_listing logs as it finishes a read (showall_note,
+        # "listing: N record(s) over N page(s)"), so the fake does too.
+        M._note("listing: LATE NOTE from an abandoned read")
+        raise urllib.error.HTTPError(base, 400, "Bad Request", {}, None)
+
+    def _fetch(url, cookie, native_url=None, **kw):
+        asked.append(url)
+        return (b"x" * 16, "f.pdf", "application/pdf", False)
+
+    saved = {k: getattr(M, k) for k in
+             ("_attach_or_fail", "cookie_header", "fetch_record_file",
+              "crawl_listing", "LISTING_SETTLE")}
+    logs = []
+    real_log = M.log
+    with tempfile.TemporaryDirectory() as d:
+        path = _fake_report(d, "DC_FileDownload_Report_etd_S.xlsx", rows)
+        out = os.path.join(d, "out")
+        os.makedirs(out, exist_ok=True)
+        presser = threading.Timer(0.3, M.STOP_EVENT.set)
+        try:
+            M._attach_or_fail = lambda session: _FakeDriver()
+            M.cookie_header = lambda driver: "c=1"
+            M.LISTING_SETTLE = 0
+            M.crawl_listing = _slow_listing
+            M.fetch_record_file = _fetch
+            M.log = lambda msg: (logs.append(str(msg)), real_log(str(msg)))[0]
+            M.STOP_EVENT.clear()
+            presser.start()
+            t0 = time.time()
+            M.retry_worker({"base_url": base, "settings": {}}, out, path,
+                           {"delay": 0, "page_delay": 0, "cooldowns": 0,
+                            "fetch_path": M.FETCH_NETWORK,
+                            "reconcile": True},
+                           report_dir=out)
+            took = time.time() - t0
+            # Let the abandoned read finish, and fail, while the log is
+            # still being watched.
+            release.set()
+            time.sleep(0.3)
+        finally:
+            presser.cancel()
+            release.set()
+            for k, v in saved.items():
+                setattr(M, k, v)
+            M.log = real_log
+            M.STOP_EVENT.clear()
+        got = _rows_by_article(out)
+    with M.LOCK:
+        phase = (M.STATE.get("phase"), M.STATE.get("outcome"))
+
+    check_true("stop-drift . Stop is honored while a listing read is in "
+               "flight", took < 1.5,
+               "the run ended {:.1f}s after start; Stop was pressed at "
+               "0.3s and the read takes {:.0f}s".format(took, READ_SECONDS))
+    check("stop-drift . nothing is requested after Stop", asked, [])
+    check("stop-drift . every row is still in the report",
+          sorted(got), ["1", "2", "3"])
+    check("stop-drift . and the run ends as a Stop the operator pressed",
+          phase, ("done", "green"))
+    check("stop-drift . the abandoned read says nothing afterwards",
+          [l for l in logs if "could not re-read" in l
+           or "LATE NOTE" in l], [])
+
+
+def test_the_status_line_says_what_the_run_is_doing():
+    """1.0.2. The status line read "Attaching to Chrome…" from the attach
+    until the first record finished, while the log went through the tab
+    check, the preflight and the listing - about a minute on a large
+    structure. Each stub here records what the status line said at the
+    moment its step began, in BOTH workers."""
+    import tempfile
+    seen = {}
+
+    def status():
+        # What the page shows: the phase, then the message.
+        with M.LOCK:
+            return "{} — {}".format(
+                M.STATE.get("phase", ""),
+                (M.STATE.get("progress") or {}).get("msg", ""))
+
+    def spy(name, then):
+        def f(*a, **k):
+            seen.setdefault(name, status())
+            return then(*a, **k)
+        return f
+
+    # --- the re-run, through the drift-check harness -----------------------
+    base = "https://dc.example.edu"
+    adm = base + "/cgi/editor.cgi?display=submission&article={}&context=etd"
+    rows = [_row(1, "1", "primary", "public", "current",
+                 "Failed: HTTP 429 Too Many Requests",
+                 base + "/cgi/viewcontent.cgi?article=1&context=etd",
+                 adm.format(1), access=M.ACCESS_OPEN,
+                 release="Thesis (open access)")]
+
+    class _FakeDriver:
+        page_source = "<html><body>admin</body></html>"
+        current_url = base + "/"
+        title = "Digital Commons"
+
+        def get(self, url):
+            pass
+
+    keep = {k: getattr(M, k) for k in
+            ("_attach_or_fail", "cookie_header", "fetch_record_file",
+             "crawl_listing", "LISTING_SETTLE", "tab_ready_check",
+             "preflight_downloads", "log", "session_still_open")}
+    with tempfile.TemporaryDirectory() as d:
+        path = _fake_report(d, "DC_FileDownload_Report_etd_S.xlsx", rows)
+        out = os.path.join(d, "out")
+        os.makedirs(out, exist_ok=True)
+        try:
+            # What _attach_or_fail sets, so a status nobody updates shows.
+            M._attach_or_fail = lambda session: (
+                M.set_progress(0, 0, "Attaching to Chrome…"), _FakeDriver())[1]
+            M.cookie_header = lambda driver: "c=1"
+            M.LISTING_SETTLE = 0
+            M.tab_ready_check = spy("rerun tab", keep["tab_ready_check"])
+            M.session_still_open = spy("rerun site", keep["session_still_open"])
+            M.preflight_downloads = spy("rerun preflight",
+                                        keep["preflight_downloads"])
+            M.crawl_listing = spy("rerun listing", lambda *a, **k: (
+                [{"article": "1", "release": "Thesis (open access)",
+                  "access": M.ACCESS_OPEN}], False))
+            M.fetch_record_file = (lambda url, cookie, native_url=None, **kw:
+                                   (b"x" * 16, "f.pdf", "application/pdf",
+                                    False))
+            M.log = lambda msg: None
+            M.STOP_EVENT.clear()
+            M.retry_worker({"base_url": base, "settings": {}}, out, path,
+                           {"delay": 0, "page_delay": 0, "cooldowns": 0,
+                            "fetch_path": M.FETCH_NETWORK,
+                            "reconcile": True}, report_dir=out)
+        finally:
+            for k, v in keep.items():
+                setattr(M, k, v)
+
+    # --- a fresh Start, through _start_one_record ----------------------------
+    _start_one_record(
+        "<html></html>", lambda url, native: None, dict(_ALL_NATIVES),
+        listing=spy("start listing", lambda *a, **k: (
+            [{"article": "1000", "title": "A talk", "release": "",
+              "access": "", "af": 0}], False)),
+        stubs={"tab_ready_check": spy("start tab", lambda *a, **k: None),
+               "preflight_downloads": spy("start preflight",
+                                          lambda *a, **k: []),
+               "session_still_open": spy("start site",
+                                         lambda *a, **k: ("", False))})
+
+    want = {"rerun tab": "starting — Checking that the Chrome tab answers",
+            "rerun preflight": "starting — Preflight",
+            "rerun listing": "downloading — etd · checking the listing for "
+                             "changes",
+            "start tab": "starting — Checking that the Chrome tab answers",
+            "start preflight": "starting — Preflight",
+            "start listing": "downloading — ev · reading the 'Posted' "
+                             "listing",
+            # 1.0.2 again: it still said "Preflight…" here.
+            "rerun site": "starting — Checking the site page",
+            "start site": "downloading — ev · checking the site page"}
+    for step, words in sorted(want.items()):
+        check_true("status . during the {} step the status line says so"
+                   .format(step), words in seen.get(step, ""),
+                   "it said {!r}".format(seen.get(step, "(step not reached)")))
+
+
+def test_an_empty_structure_is_named_and_the_mode_is_published():
+    """1.0.2: a structure with no records in any state was never named
+    in the on-screen log. And the
+    page said "Downloading…" through an inventory; the worker now
+    publishes which it is, and the page words it (see the idle test)."""
+    for inv, word in ((False, "download"), (True, "inventory")):
+        calls, rows, files, lines, logs = _start_one_record(
+            "<html></html>", lambda url, native: None,
+            dict(_ALL_NATIVES, inventory=inv),
+            listing=lambda *a, **k: ([], False))
+        said = [str(l) for l in lines if str(l).startswith("ev: no records")]
+        check("empty . the {} run names the empty structure".format(word),
+              len(said), 1)
+        check_true("empty . and says there is nothing to {}".format(word),
+                   bool(said) and said[0].endswith(
+                       "nothing to {}.".format(word)),
+                   said[0] if said else "\n".join(map(str, lines[-5:])))
+        with M.LOCK:
+            published = M.STATE.get("inventory")
+        check("empty . the run says whether it is an inventory ({})"
+              .format(word), published, inv)
+
+
+def test_a_new_run_does_not_open_with_a_heartbeat():
+    """1.0.2. Every worker starts in _attach_or_fail; the heartbeat must
+    measure from THIS run, not from the last line of the one before."""
+    lines = []
+    keep = {k: getattr(M, k) for k in ("log", "get_driver")}
+    saved_last = M._LAST_LOG[0]
+    try:
+        M.log = lambda msg: (lines.append(str(msg)),
+                             M._LAST_LOG.__setitem__(0, time.time()))
+        M.get_driver = lambda session: object()
+        M._LAST_LOG[0] = time.time() - (M.HEARTBEAT_SECONDS + 100)
+        M._attach_or_fail({"chrome": {"debugger_address": "127.0.0.1:9222"}})
+    finally:
+        for k, val in keep.items():
+            setattr(M, k, val)
+        M._LAST_LOG[0] = saved_last
+    check("heartbeat . a run started long after the last one opens with "
+          "its own first line", lines[:1],
+          ["Attaching to debug Chrome at 127.0.0.1:9222…"])
+    check_true("heartbeat . and says nothing about still working",
+               not any("Still working" in l for l in lines), repr(lines))
+
+
+def test_stop_does_not_wait_for_the_planning_listing():
+    """1.0.2, the other half of the pair: a fresh Start reads each
+    structure's listing in one request too (3,106 records on 'etd')."""
+    READ_SECONDS = 3.0
+    release = threading.Event()
+
+    def _slow_listing(base_url, ctx, gallery, state, cookie, first_html=None,
+                      allow_flip=True):
+        release.wait(READ_SECONDS)
+        M._note("listing: LATE NOTE from an abandoned read")
+        return ([{"article": "1000", "title": "A talk", "release": "",
+                  "access": "", "af": 0}], False)
+
+    presser = threading.Timer(0.3, M.STOP_EVENT.set)
+    t0 = time.time()
+    try:
+        presser.start()
+        calls, got, files, lines, _logs = _start_one_record(
+            "<html></html>", lambda url, native: None,
+            dict(_ALL_NATIVES), listing=_slow_listing)
+        took = time.time() - t0
+        release.set()
+        time.sleep(0.3)
+    finally:
+        presser.cancel()
+        release.set()
+        M.STOP_EVENT.clear()
+    with M.LOCK:
+        phase = (M.STATE.get("phase"), M.STATE.get("outcome"))
+    check_true("stop-plan . Stop is honored while a listing read is in "
+               "flight", took < 1.5,
+               "the run ended {:.1f}s after start; Stop was pressed at "
+               "0.3s and the read takes {:.0f}s".format(took, READ_SECONDS))
+    check("stop-plan . nothing is requested after Stop", calls, [])
+    # Nothing was processed, so by design the page goes back to idle
+    # rather than reporting a finished run (download_worker's else-branch).
+    # The outcome field is not cleared on that path and is not read when
+    # idle, so it is not part of this check.
+    check("stop-plan . a Stop before any structure leaves the page idle",
+          phase[0], "idle")
+    check_true("stop-plan . and the log says it stopped before any "
+               "structure", any("Stopped before any structure" in str(l)
+                                for l in lines), "\n".join(map(str, lines)))
+    check("stop-plan . the abandoned read says nothing afterwards",
+          [l for l in lines if "LATE NOTE" in str(l)], [])
+
+
 def main():
     for fn in (test_a_check_that_cannot_run_says_so,
+               test_stop_does_not_wait_for_the_drift_check,
+               test_stop_does_not_wait_for_the_planning_listing,
+               test_the_status_line_says_what_the_run_is_doing,
+               test_a_new_run_does_not_open_with_a_heartbeat,
+               test_an_empty_structure_is_named_and_the_mode_is_published,
                test_a_finished_run_says_how_it_went,
                test_a_rerun_on_a_tab_that_does_not_answer_touches_nothing,
                test_a_tab_that_does_not_answer_stops_the_run_before_anything,
@@ -11903,6 +12570,9 @@ def main():
                test_a_record_that_will_not_replan_is_still_reported,
                test_a_video_is_fetched_once_in_all_versions_mode,
                test_a_pdf_record_keeps_stamped_and_unstamped_named_apart,
+               test_byte_identical_copies_are_kept_once,
+               test_an_inventory_run_is_driven_to_its_plan,
+               test_every_success_count_asks_how_the_status_begins,
                test_a_stop_between_fallback_and_native_leaves_no_duplicate_to_rerun,
                test_a_stop_after_the_fallback_leaves_no_duplicate_row,
                test_a_rerun_stopped_mid_record_keeps_the_rest_of_the_record,

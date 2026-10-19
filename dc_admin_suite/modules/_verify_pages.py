@@ -30,6 +30,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 SUITE = Path(__file__).resolve().parent.parent
@@ -1374,6 +1375,511 @@ def check_folder_fields_driven(group, problems):
                             "FOLDER_DRIVES".format(label))
 
 
+BROWSE_PY_RE = re.compile(r"# ---- DC-BROWSE (\d+) -+\n.*?# ---- /DC-BROWSE -+\n",
+                          re.S)
+BROWSE_JS_RE = re.compile(r"/\* DC-BROWSE (\d+):.*?/\* /DC-BROWSE \*/", re.S)
+BROWSE_CSS_RE = re.compile(r"/\* DC-BROWSE (\d+) styles \*/.*?"
+                           r"/\* /DC-BROWSE styles \*/", re.S)
+PATH_TAG_RE = re.compile(r"<(input|textarea)\b([^>]*)>", re.S | re.I)
+BROWSE_BTN_RE = re.compile(r"<button\b([^>]*\bdata-browse=[^>]*)>(.*?)</button>",
+                           re.S | re.I)
+# A field is a path field if its id ends in "dir" (the DC-FOLDER rule) or
+# its label says it takes a folder, a path or a place to save. Found on
+# every page by markup, never from a list.
+PATH_LABEL_RE = re.compile(r"\bfolders?\b|\bpaths?\b|\bsave\b.*\bto\b", re.I)
+BROWSE_WANT = {"folder": {"folder"}, "files": {"files"},
+               "file-or-folder": {"file", "folder"}}
+
+
+def _attr(attrs, name):
+    m = re.search(r'\b%s="([^"]*)"' % re.escape(name), attrs)
+    return m.group(1) if m else None
+
+
+def _label_text(html, fid):
+    m = re.search(r'<label\b[^>]*\bfor="%s"[^>]*>(.*?)</label>'
+                  % re.escape(fid), html, re.S)
+    if not m:
+        return ""
+    import html as _h
+    return " ".join(_h.unescape(re.sub(r"<[^>]+>", "", m.group(1))).split())
+
+
+def browse_fields(html):
+    """{id: (data-path kind or None, label)} for every path field on a page."""
+    found = {}
+    for m in PATH_TAG_RE.finditer(html):
+        tag, attrs = m.group(1).lower(), m.group(2)
+        fid = _attr(attrs, "id")
+        if not fid:
+            continue
+        if tag == "input" and (_attr(attrs, "type") or "text") != "text":
+            continue
+        label = _label_text(html, fid)
+        kind = _attr(attrs, "data-path")
+        if kind or fid.endswith("dir") or PATH_LABEL_RE.search(label):
+            found[fid] = (kind, label)
+    return found
+
+
+def check_browse_markup(served, problems):
+    """DC-BROWSE 1 (1.0.4). Every path field, found by markup, carries
+    data-path and the button(s) its kind needs; every button names a path
+    field, starts hidden, and is labelled for a screen reader with its
+    field's label. Every page with one carries the one DC-BROWSE script,
+    styles and Python block, and the copies agree. Returns the modules."""
+    group, fields_seen = [], 0
+    py, js, css = {}, {}, {}
+    for label, html in served:
+        fields = browse_fields(html)
+        buttons = [(m.group(1), m.group(2)) for m in BROWSE_BTN_RE.finditer(html)]
+        for fid, (kind, lab) in sorted(fields.items()):
+            if kind not in BROWSE_WANT:
+                problems.append("{}: path field {} ({!r}) has data-path={!r}"
+                                .format(label, fid, lab, kind))
+                continue
+            kinds = {_attr(a, "data-browse") for a, _t in buttons
+                     if _attr(a, "data-for") == fid}
+            if kinds != BROWSE_WANT[kind]:
+                problems.append("{}: path field {} ({!r}) has Browse kinds {} "
+                                "(want {})".format(label, fid, lab,
+                                                   sorted(k for k in kinds if k),
+                                                   sorted(BROWSE_WANT[kind])))
+            if 'id="{}-browsemsg"'.format(fid) not in html:
+                problems.append("{}: path field {} has no message region"
+                                .format(label, fid))
+        for attrs, text in buttons:
+            fid = _attr(attrs, "data-for")
+            if fid not in fields or not fields[fid][0]:
+                problems.append("{}: a Browse button names {!r}, which is not "
+                                "a path field".format(label, fid))
+                continue
+            aria = _attr(attrs, "aria-label") or ""
+            if fields[fid][1] not in aria:
+                problems.append("{}: Browse button for {} is labelled {!r}, "
+                                "not with its field's label".format(label, fid,
+                                                                    aria))
+            if _attr(attrs, "type") != "button" or not re.search(r"\shidden\b",
+                                                                 attrs):
+                problems.append("{}: Browse button for {} must be "
+                                "type=\"button\" and start hidden"
+                                .format(label, fid))
+            if not text.strip():
+                problems.append("{}: Browse button for {} has no visible text"
+                                .format(label, fid))
+        has = any(k for k, _l in fields.values())
+        fields_seen += len(fields)
+        if not has:
+            if label.startswith("modules/") and "DC-BROWSE" in html:
+                problems.append("{}: carries DC-BROWSE with no path field"
+                                .format(label))
+            continue
+        if not label.startswith("modules/"):
+            problems.append("{}: has path fields but is not a module".format(label))
+            continue
+        group.append(label)
+        src = (SUITE / label).read_text(encoding="utf-8")
+        py[label] = _one_block(label, src, BROWSE_PY_RE, "DC-BROWSE Python", problems)
+        js[label] = _one_block(label, html, BROWSE_JS_RE, "DC-BROWSE script", problems)
+        css[label] = _one_block(label, html, BROWSE_CSS_RE, "DC-BROWSE styles", problems)
+    for blocks, what in ((py, "DC-BROWSE Python"), (js, "DC-BROWSE script"),
+                         (css, "DC-BROWSE styles")):
+        _agree({k: v for k, v in blocks.items() if v}, what, problems)
+    return group, fields_seen
+
+
+def _http_h(port, path, body=None, headers=None, timeout=10):
+    import urllib.request
+    import urllib.error
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    req = urllib.request.Request("http://127.0.0.1:{}{}".format(port, path),
+                                 data=data,
+                                 method="GET" if body is None else "POST")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode("utf-8") or "{}")
+    except (urllib.error.URLError, OSError) as e:
+        # No answer at all (a request left waiting) is reported, not raised.
+        return None, {"error": "no answer: {}".format(e)}
+
+
+class _FakeRun:
+    """Stands in for subprocess.run inside pick_paths()."""
+    def __init__(self, rc=0, out=b"", err=b"", exc=None):
+        self.rc, self.out, self.err, self.exc = rc, out, err, exc
+        self.calls = []
+
+    def __call__(self, argv, **kw):
+        self.calls.append((argv, kw))
+        if self.exc is not None:
+            raise self.exc
+        import types
+        return types.SimpleNamespace(returncode=self.rc, stdout=self.out,
+                                     stderr=self.err)
+
+
+def check_browse_python(M, label, problems):
+    """The pure parts of one module's DC-BROWSE block, driven directly."""
+    import subprocess
+    tmp = tempfile.mkdtemp(prefix="dcbrowse-")
+    try:
+        home = os.path.expanduser("~")
+        sub = os.path.join(tmp, "a folder")
+        os.makedirs(sub)
+        afile = os.path.join(sub, "report.xlsx")
+        open(afile, "w").close()
+        cases = [("", home), ("   ", home), ("relative/x", home),
+                 (sub, sub), (afile, sub),
+                 (os.path.join(sub, "not", "yet"), sub),
+                 (os.path.join(tmp, "missing"), tmp)]
+        for value, want in cases:
+            got = M.start_folder(value)
+            if got != want:
+                problems.append("{}: start_folder({!r}) = {!r}, want {!r}"
+                                .format(label, value, got, want))
+        for kind in ("folder", "file", "files"):
+            if M.browse_kind_error(kind):
+                problems.append("{}: browse_kind_error refuses {!r}".format(label, kind))
+        for kind in ("dir", "", None, "FOLDER"):
+            if not M.browse_kind_error(kind):
+                problems.append("{}: browse_kind_error accepts {!r}".format(label, kind))
+        nasty = os.path.join(tmp, 'it\'s "quoted"; $(x) `y`')
+        title = 'Title "with" \'quotes\''
+        argv, env, stdin = M.browse_command("osascript", "folder", nasty, title)
+        if argv[:2] != ["osascript", "-"] or argv[2:] != [nasty, title, "folder"] \
+                or nasty.encode("utf-8") in (stdin or b""):
+            problems.append("{}: osascript command does not pass the start "
+                            "folder as an argument only: {!r}".format(label, argv))
+        for mech in ("powershell", "tkinter"):
+            argv, env, stdin = M.browse_command(mech, "files", nasty, title)
+            if any(nasty in a or title in a for a in argv) or \
+                    env.get("DC_BROWSE_START") != nasty or \
+                    env.get("DC_BROWSE_TITLE") != title or \
+                    env.get("DC_BROWSE_KIND") != "files":
+                problems.append("{}: {} command puts the start folder or "
+                                "title in its arguments".format(label, mech))
+        ps = M._BROWSE_PS
+        # The Windows dialog cannot be shown here; what CAN be checked is
+        # the script's shape (behavioral proof is a person on Windows):
+        # the owner is a shown topmost window before the dialog opens, and
+        # the page's values arrive only through the environment.
+        at_show, at_pick = ps.find("$owner.Show()"), ps.find("[DcPicker]::Pick(")
+        if not (0 <= at_show < at_pick) or "$owner.TopMost = $true" not in ps \
+                or "$env:DC_BROWSE_START" not in ps.split("# COMPILE-END")[-1]:
+            problems.append("{}: the Windows dialog is not owned by a shown "
+                            "topmost window, or does not read the start "
+                            "folder from the environment".format(label))
+        if "# COMPILE-START" not in ps or "# COMPILE-END" not in ps:
+            problems.append("{}: the Windows dialog script has lost its "
+                            "COMPILE markers".format(label))
+        real = subprocess.run
+        runs = [
+            ("osascript", "folder", _FakeRun(out=b"/Users/x/A Folder/\n"),
+             {"paths": ["/Users/x/A Folder"]}),
+            ("osascript", "files", _FakeRun(out=b"/a/1.jpg\n/a/2.jpg\n"),
+             {"paths": ["/a/1.jpg", "/a/2.jpg"]}),
+            ("powershell", "files", _FakeRun(out="C:\\a\\1.jpg\r\nC:\\a\\é.jpg"
+                                             .encode("utf-8")),
+             {"paths": ["C:\\a\\1.jpg", "C:\\a\\é.jpg"]}),
+            ("tkinter", "folder", _FakeRun(out=b"/one\n/two"),
+             {"paths": ["/one"]}),
+            ("powershell", "folder", _FakeRun(rc=3), {"cancelled": True}),
+            ("osascript", "file", _FakeRun(rc=1, err=b"execution error: User "
+                                           b"canceled. (-128)"),
+             {"cancelled": True}),
+            ("tkinter", "file", _FakeRun(out=b"  \n"), {"cancelled": True}),
+        ]
+        try:
+            for mech, kind, fake, want in runs:
+                subprocess.run = fake
+                got = M.pick_paths(mech, kind, tmp, "T")
+                if got != want:
+                    problems.append("{}: pick_paths({}, {}) = {!r}, want {!r}"
+                                    .format(label, mech, kind, got, want))
+                if fake.calls and fake.calls[0][1].get("timeout") != M.BROWSE_TIMEOUT:
+                    problems.append("{}: pick_paths runs without its timeout"
+                                    .format(label))
+            for fake, word in ((_FakeRun(rc=1, err=b"boom\nlast line"), "last line"),
+                               (_FakeRun(exc=subprocess.TimeoutExpired("x", 1)),
+                                "unchanged"),
+                               (_FakeRun(exc=OSError("no such program")),
+                                "no such program")):
+                subprocess.run = fake
+                got = M.pick_paths("osascript", "folder", tmp, "T")
+                if "error" not in got or word not in got["error"]:
+                    problems.append("{}: pick_paths on a failure said {!r} "
+                                    "(want an error naming {!r})"
+                                    .format(label, got, word))
+        finally:
+            subprocess.run = real
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def check_browse_windows_compile(group, problems):
+    """On Windows only: compile the dialog's C# exactly as the module
+    would (the part between the COMPILE markers) and confirm the type
+    exists, without showing anything. Elsewhere it cannot run, and the
+    summary says so. Returns what happened, for the summary."""
+    import base64
+    if os.name != "nt":
+        return "not compiled (not Windows; CI's Windows jobs compile it)"
+    exe = shutil.which("powershell") or shutil.which("pwsh")
+    if not exe:
+        problems.append("Windows, but no PowerShell found to compile the "
+                        "dialog's C#")
+        return "not compiled (no PowerShell)"
+    if not group:
+        return "not compiled (no module carries DC-BROWSE)"
+    M = _import_module(group[0])
+    ps = M._BROWSE_PS
+    part = ps.split("# COMPILE-START")[1].split("# COMPILE-END")[0]
+    script = ("$ErrorActionPreference = 'Stop'\n" + part
+              + "\nif ([DcPicker].GetMethod('Pick')) { 'COMPILED' }\n")
+    code = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    try:
+        done = subprocess.run([exe, "-NoProfile", "-NonInteractive",
+                               "-EncodedCommand", code],
+                              capture_output=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as e:
+        problems.append("the dialog's C# could not be compiled: {}".format(e))
+        return "not compiled"
+    said = done.stdout.decode("utf-8", "replace")
+    if done.returncode != 0 or "COMPILED" not in said:
+        problems.append("the Windows dialog's C# does not compile: {}".format(
+            done.stderr.decode("utf-8", "replace")[-400:]))
+        return "compile FAILED"
+    return "compiled with " + os.path.basename(exe)
+
+
+def check_browse_driven(group, problems):
+    """Each module's /api/browse, driven through its own server with the
+    dialog faked: the mechanism is reported, a choice is returned, the
+    start folder is the field's, a bad kind and a missing dialog are
+    refused without opening anything, a non-local request is refused
+    first, and a second dialog waits for the first."""
+    import threading
+    from http.server import ThreadingHTTPServer
+    for label in group:
+        M = _import_module(label)
+        quiet = M.log
+        M.log = lambda *_a, **_k: None
+        check_browse_python(M, label, problems)
+        calls = []
+        mode = {"mech": "osascript", "answer": {"paths": ["/chosen"]},
+                "gate": None}
+
+        def fake_pick(mech, kind, start, title):
+            calls.append((mech, kind, start, title))
+            if mode["gate"] is not None:
+                mode["gate"].wait(10)
+            return mode["answer"]
+        real_pick, real_mech = M.pick_paths, M.browse_mechanism
+        M.pick_paths = fake_pick
+        M.browse_mechanism = lambda: mode["mech"]
+        session = M.load_session(Path("/nonexistent/session.json"))
+        session["hub_url"] = "http://127.0.0.1:8750"
+        srv = ThreadingHTTPServer(("127.0.0.1", 0),
+                                  M.make_handler(session, M.build_page(session)))
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        tmp = tempfile.mkdtemp(prefix="dcbrowse-")
+        try:
+            def say(what, ok):
+                if not ok:
+                    problems.append("{} /api/browse: {}".format(label, what))
+            code, j = _http_h(port, "/api/browse")
+            say("GET gave {} {!r}".format(code, j),
+                code == 200 and j.get("mechanism") == "osascript")
+            code, j = _http_h(port, "/api/browse",
+                              {"kind": "folder", "title": "Reports folder",
+                               "start": os.path.join(tmp, "gone", "deeper")})
+            say("a choice gave {} {!r}".format(code, j),
+                code == 200 and j == {"paths": ["/chosen"]})
+            say("the dialog was asked {!r}".format(calls[-1:]),
+                calls[-1:] == [("osascript", "folder", tmp, "Reports folder")])
+            mode["answer"] = {"cancelled": True}
+            code, j = _http_h(port, "/api/browse", {"kind": "files"})
+            say("a cancel gave {} {!r}".format(code, j),
+                code == 200 and j == {"cancelled": True})
+            n = len(calls)
+            code, j = _http_h(port, "/api/browse", {"kind": "nonsense"})
+            say("a bad kind gave {} {!r}".format(code, j),
+                code == 400 and "nonsense" in j.get("error", "") and len(calls) == n)
+            for verb, body in (("GET", None), ("POST", {"kind": "folder"})):
+                code, j = _http_h(port, "/api/browse", body,
+                                  {"Origin": "http://elsewhere.example"})
+                say("a non-local {} gave {}".format(verb, code),
+                    code == 403 and len(calls) == n)
+            mode["mech"] = ""
+            code, j = _http_h(port, "/api/browse")
+            say("GET with no dialog gave {!r}".format(j),
+                code == 200 and j.get("mechanism") == "" and j.get("none"))
+            code, j = _http_h(port, "/api/browse", {"kind": "folder"})
+            say("POST with no dialog gave {} {!r}".format(code, j),
+                code == 409 and len(calls) == n)
+            mode["mech"] = "osascript"
+            mode["answer"] = {"paths": ["/first"]}
+            mode["gate"] = threading.Event()
+            first = {}
+            t = threading.Thread(target=lambda: first.update(
+                r=_http_h(port, "/api/browse", {"kind": "folder"})))
+            t.start()
+            for _ in range(200):
+                if len(calls) > n:
+                    break
+                time.sleep(0.01)
+            code, j = _http_h(port, "/api/browse", {"kind": "folder"},
+                              timeout=3)
+            say("a second dialog while one is open gave {} {!r}".format(code, j),
+                code == 409 and "already open" in j.get("error", ""))
+            mode["gate"].set()
+            t.join(10)
+            say("the first dialog then gave {!r}".format(first.get("r")),
+                first.get("r") == (200, {"paths": ["/first"]}))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            shutil.rmtree(tmp, ignore_errors=True)
+            M.pick_paths, M.browse_mechanism = real_pick, real_mech
+            M.log = quiet
+
+
+BROWSE_NODE = r"""
+const BLOCK = process.argv[2], FIELDS = JSON.parse(process.argv[3]);
+const els = {}, buttons = [], posts = [], fired = [];
+let replies = [], getReply = {mechanism: 'osascript', none: ''};
+function El(id, tag){ this.id = id; this.tagName = tag; this.value = '';
+  this.disabled = false; this.readOnly = false; this.hidden = false;
+  this.textContent = ''; this.className = ''; this.ls = {}; this.attrs = {}; }
+El.prototype.getAttribute = function(n){ return this.attrs[n] === undefined ? null : this.attrs[n]; };
+El.prototype.addEventListener = function(t, f){ (this.ls[t] = this.ls[t] || []).push(f); };
+El.prototype.dispatchEvent = function(e){ fired.push(this.id + ':' + e.type); (this.ls[e.type] || []).forEach(f => f(e)); };
+El.prototype.focus = function(){ fired.push(this.id + ':focus'); };
+FIELDS.forEach(f => {
+  els[f.id] = new El(f.id, f.tag);
+  els[f.id + '-browsemsg'] = new El(f.id + '-browsemsg', 'span');
+  f.buttons.forEach((b, i) => { const e = new El('', 'button');
+    e.attrs = {'data-browse': b.kind, 'data-for': f.id, 'data-title': b.title};
+    e.textContent = b.text; e.hidden = true; buttons.push(e); });
+});
+global.Event = function(t){ this.type = t; };
+global.document = { getElementById: id => els[id] || null,
+  querySelectorAll: sel => sel === 'button[data-browse]' ? buttons.slice() : [] };
+global.setInterval = () => 0;
+global.fetch = (url, opt) => {
+  if(!opt || !opt.method) return Promise.resolve({json: () => Promise.resolve(getReply)});
+  posts.push(JSON.parse(opt.body));
+  const r = replies.shift();
+  if(r === 'THROW') return Promise.reject(new Error('down'));
+  return Promise.resolve({json: () => Promise.resolve(r)});
+};
+const out = {problems: []};
+const bad = m => out.problems.push(m);
+const tick = () => new Promise(r => setTimeout(r, 0));
+(async () => {
+  eval(BLOCK);
+  await tick(); await tick();
+  if(buttons.some(b => b.hidden)) bad('buttons still hidden with a dialog available');
+  if(browseJoin(' /a ' + BROWSE_NL + BROWSE_NL + '/b', ['/b', '/c']) !== ['/a', '/b', '/c'].join(BROWSE_NL))
+    bad('browseJoin does not append and skip duplicates');
+  for(const btn of buttons){
+    const f = els[btn.getAttribute('data-for')], kind = btn.getAttribute('data-browse');
+    const msg = els[f.id + '-browsemsg'];
+    f.value = kind === 'files' ? ['/old/1.jpg', '/old/2.jpg'].join(BROWSE_NL) : '/old/place';
+    fired.length = 0; posts.length = 0;
+    replies = [{paths: kind === 'files' ? ['/old/2.jpg', '/new/3.jpg'] : ['/picked/A b']}];
+    const label = btn.textContent;
+    const p = browseClick(btn);
+    if(btn.textContent === label || !btn.disabled) bad(f.id + ': the button does not show it is waiting');
+    await p;
+    const want = kind === 'files' ? ['/old/1.jpg', '/old/2.jpg', '/new/3.jpg'].join(BROWSE_NL) : '/picked/A b';
+    if(f.value !== want) bad(f.id + ' (' + kind + '): value ' + JSON.stringify(f.value));
+    if(fired.indexOf(f.id + ':input') < 0 || fired.indexOf(f.id + ':change') < 0)
+      bad(f.id + ': input/change not fired: ' + fired.join(','));
+    if(!posts[0] || posts[0].kind !== kind || posts[0].title !== btn.getAttribute('data-title')
+       || posts[0].start !== (kind === 'files' ? '/old/2.jpg' : '/old/place'))
+      bad(f.id + ': posted ' + JSON.stringify(posts[0]));
+    if(kind === 'files' && msg.textContent !== '1 path added; 1 already listed.')
+      bad(f.id + ': files message ' + JSON.stringify(msg.textContent));
+    if(btn.textContent !== label || btn.disabled) bad(f.id + ': button not restored');
+    const keep = f.value;
+    replies = [{cancelled: true}];
+    await browseClick(btn);
+    if(f.value !== keep || msg.textContent.indexOf('Nothing was chosen') !== 0) bad(f.id + ': cancel changed something');
+    replies = [{error: 'The osascript dialog ended with status 1: x'}];
+    await browseClick(btn);
+    if(f.value !== keep || msg.textContent.indexOf('status 1') < 0 || msg.className.indexOf('dc-bad') < 0)
+      bad(f.id + ': error not shown: ' + msg.textContent + ' / ' + msg.className);
+    replies = ['THROW'];
+    await browseClick(btn);
+    if(msg.className.indexOf('dc-bad') < 0 || btn.disabled) bad(f.id + ': a dead module not reported');
+    f.disabled = true; posts.length = 0;
+    await browseClick(btn); browseSync();
+    if(posts.length || !btn.disabled) bad(f.id + ': a disabled field still opens a dialog');
+    f.disabled = false; browseSync();
+  }
+  getReply = {mechanism: '', none: 'NO DIALOG HERE'};
+  buttons.forEach(b => b.hidden = false);
+  browseState.mechanism = 'x';
+  browseInit(); await tick(); await tick();
+  if(buttons.some(b => !b.hidden)) bad('buttons shown with no dialog');
+  const first = els[buttons[0].getAttribute('data-for') + '-browsemsg'];
+  if(first.textContent !== 'NO DIALOG HERE') bad('no-dialog reason not said: ' + JSON.stringify(first.textContent));
+  console.log(JSON.stringify(out));
+})().catch(e => { console.log(JSON.stringify({problems: ['threw: ' + e.stack]})); });
+"""
+
+
+def check_browse_in_node(node_bin, served, group, problems):
+    """Each page's own DC-BROWSE script, run in node against a stub of its
+    path fields and buttons (from its markup): a choice fills the field and
+    fires input and change, a path list gains files without duplicates, a
+    cancel or an error changes nothing and says so, a disabled field opens
+    nothing, and with no dialog the buttons hide and the reason is said."""
+    import html as _h
+    pages = dict(served)
+    for label in group:
+        html = pages[label]
+        m = BROWSE_JS_RE.search(html)
+        if not m:
+            continue
+        fields = []
+        for fid, (kind, lab) in sorted(browse_fields(html).items()):
+            if not kind:
+                continue
+            tag = re.search(r"<(input|textarea)\b[^>]*\bid=\"%s\"" % fid, html).group(1)
+            bts = [{"kind": _attr(a, "data-browse"), "title": _h.unescape(_attr(a, "data-title") or ""),
+                    "text": _h.unescape(t.strip())}
+                   for a, t in BROWSE_BTN_RE.findall(html) if _attr(a, "data-for") == fid]
+            fields.append({"id": fid, "tag": tag, "buttons": bts})
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False,
+                                         encoding="utf-8") as fh:
+            fh.write(BROWSE_NODE)
+            script = fh.name
+        try:
+            done = subprocess.run([node_bin, script, m.group(0), json.dumps(fields)],
+                                  capture_output=True, timeout=60)
+        finally:
+            os.unlink(script)
+        text = done.stdout.decode("utf-8", "replace").strip()
+        try:
+            res = json.loads(text.splitlines()[-1])
+        except (ValueError, IndexError):
+            problems.append("{}: DC-BROWSE node run said {!r} {!r}".format(
+                label, text[-300:], done.stderr.decode("utf-8", "replace")[-300:]))
+            continue
+        for p in res["problems"]:
+            problems.append("{}: DC-BROWSE in node: {}".format(label, p))
+
+
+
 def main():
     node_bin = shutil.which("node")
     if not node_bin:
@@ -1412,6 +1918,11 @@ def main():
     folders = check_folder_fields(served, problems)
     with contextlib.redirect_stdout(io.StringIO()):
         check_folder_fields_driven(folders, problems)
+    browsers, path_fields = check_browse_markup(served, problems)
+    with contextlib.redirect_stdout(io.StringIO()):
+        check_browse_driven(browsers, problems)
+    check_browse_in_node(node_bin, served, browsers, problems)
+    win_csharp = check_browse_windows_compile(browsers, problems)
 
     print("Served pages — verification")
     print("  pages checked: {}".format(len(PAGE_SOURCES)))
@@ -1437,6 +1948,11 @@ def main():
               .format(len(folders)))
         print("  DC-FOLDER block, and each was driven with a blank folder")
         print("  and named the field the way its page labels it.")
+        print("  {} path field(s) in {} module(s), found by markup, each with"
+              .format(path_fields, len(browsers)))
+        print("  its Browse button(s); the one DC-BROWSE block in each was")
+        print("  driven with the dialog faked, on the server and in node.")
+        print("  The Windows dialog's C#: {}.".format(win_csharp))
         print("  {} module(s) with a log carry the one DC-LOG block; each was".format(len(group)))
         print("  driven: Copy log is the whole run, Clear is refused during")
         print("  a run and keeps what is loaded, and one start of many wins.")

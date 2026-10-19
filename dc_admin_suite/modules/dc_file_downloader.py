@@ -97,12 +97,13 @@ MANIFEST = {
     "id": "file-downloader",
     "name": "Batch File Downloader",
     "description": "Download primary, native, supplemental, hidden, and versioned files for selected structures, with per-structure reports.",
-    "version": "1.35.0",
+    "version": "1.37.0",
     "requires": ["selenium", "beautifulsoup4", "openpyxl"],
 }
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import random
@@ -1501,6 +1502,45 @@ class SaveFailed(Exception):
     RUN, and every re-run stopped at the same row. Now it fails that file,
     names what the operating system said, and the run goes on.
     """
+
+
+def is_downloaded(status):
+    """A row whose file is on disk. 1.0.2: a status may continue past the
+    word ("Downloaded — byte-identical to ..."), so this asks how it
+    BEGINS, as read_failed_rows always has. Every count of successes goes
+    through here; an ast check holds the module to no exact comparison."""
+    return str(status or "").startswith("Downloaded")
+
+
+def settle_saved(saved, ctx, article, job, path):
+    """After place_file(), in BOTH workers: (saved name, status).
+
+    1.0.2. Two identities of one record can hold the same bytes, and only
+    the bytes say so. When they do, the first copy is kept and this one is
+    removed; the row still begins "Downloaded" (a re-run skips it) and
+    names the file that holds its bytes. If the copy cannot be removed,
+    both are kept and the row says so - an optimization that fails costs
+    disk, never data.
+    """
+    name = os.path.basename(path)
+    twin = saved.same_bytes_as(ctx, article, path)
+    if twin:
+        kept = os.path.basename(twin)
+        try:
+            os.remove(path)
+        except OSError as e:
+            saved.kept(ctx, article, path)
+            saved.saved(ctx, article, job, name)
+            return name, ("Downloaded — byte-identical to {}; this second "
+                          "copy could not be removed ({})".format(
+                              kept, describe_error(e)))
+        saved.identical += 1
+        saved.saved(ctx, article, job, kept)
+        return kept, ("Downloaded — byte-identical to {}, so this second "
+                      "copy was not kept".format(kept))
+    saved.kept(ctx, article, path)
+    saved.saved(ctx, article, job, name)
+    return name, "Downloaded"
 
 
 def place_file(got, folder, fname):
@@ -3429,6 +3469,11 @@ def eta_text(done, total, t0):
 
 def _attach_or_fail(session):
     """Shared preamble for all workers. Returns a driver or None (failed)."""
+    # A new run has said nothing yet. Without this the heartbeat measured
+    # from the PREVIOUS run's last line and opened a run started more than
+    # five minutes later with "Still working — Attaching to Chrome…",
+    # before anything had been done.
+    _LAST_LOG[0] = 0.0
     set_progress(0, 0, "Attaching to Chrome…")
     log("Attaching to debug Chrome at {}…".format(
         session["chrome"]["debugger_address"]))
@@ -3475,6 +3520,44 @@ _RATE_LOCK = threading.Lock()
 _NOTE_HOOK = [None]
 
 
+def until_stopped(fn, *args, poll=0.2):
+    """fn(*args), unless Stop is pressed first - then StopRequested.
+
+    For one long request that cannot be interrupted: urllib does not look
+    at Stop, and an x_showall listing is a single read (about 12 s on 391
+    records). The read goes on in a daemon thread and is abandoned; its
+    result is discarded. It is an admin page, which changes nothing on the
+    server. Pause is not honored here; the caller's next check_pause_stop()
+    does that. The abandoned thread is marked, and _note() and the drift
+    check's warning say nothing from a marked thread: a read that finishes
+    after the run has ended must not write into that run's log, or the
+    next one's.
+    """
+    box = {}
+
+    def run():
+        try:
+            box["value"] = fn(*args)
+        except BaseException as e:      # handed to the caller below
+            box["error"] = e
+
+    t = threading.Thread(target=run, daemon=True, name="dc-until-stopped")
+    t.start()
+    while t.is_alive():
+        if STOP_EVENT.is_set():
+            t.dc_abandoned = True
+            raise StopRequested()
+        t.join(poll)
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+def _abandoned() -> bool:
+    """True on a thread until_stopped() has given up waiting for."""
+    return bool(getattr(threading.current_thread(), "dc_abandoned", False))
+
+
 _STOP_HOOK = [None]
 
 
@@ -3516,6 +3599,8 @@ def _sleep(seconds: float) -> bool:
 
 def _note(text: str) -> None:
     fn = _NOTE_HOOK[0]
+    if _abandoned():
+        return                        # a read the run no longer waits for
     if fn is not None:
         try:
             fn(text)
@@ -5677,7 +5762,8 @@ def map_worker(session, out_dir, report_dir=""):
     base_url = session["base_url"].rstrip("/")
     root = root_label(base_url)
     try:
-        set_state(phase="starting", summary="", paused=False)
+        set_state(phase="starting", summary="", paused=False,
+                  inventory=False)
         driver = _attach_or_fail(session)
         if driver is None:
             return
@@ -6139,14 +6225,18 @@ def file_identity(job):
     to its current natives.
 
     A file is (kind, form, version, revision): the stamped default stream
-    and the revisions table's unstamped copy are different bytes and stay
-    two files; any address for the current native is the current native;
+    and the revisions table's unstamped copy are USUALLY different bytes
+    and stay two files; any address for the current native is the current native;
     an earlier revision is that revision, told apart by its date. Rows
     read back from a report carry the same fields, so a re-run asks the
     same question.
 
     What this cannot see at plan time: whether a primary will fall back to
-    its native. That is learned when it is fetched — see SavedFiles.
+    its native. That is learned when it is fetched — see SavedFiles. Nor
+    whether two identities hold the same bytes: a stamped copy can equal
+    its unstamped copy, and an original revision the current one, and both
+    have come down as byte-identical pairs. That too
+    is learned only once both are on disk — see settle_saved().
     """
     kind = str(job.get("kind", ""))
     version = str(job.get("version", ""))
@@ -6203,6 +6293,10 @@ class SavedFiles:
     def __init__(self):
         self._have = {}
         self.skipped = 0
+        # 1.0.2: the files kept on disk, per record, for settle_saved().
+        self._paths = {}
+        self._digest = {}
+        self.identical = 0
 
     @staticmethod
     def _key(ctx, article, job):
@@ -6218,13 +6312,46 @@ class SavedFiles:
     def skip(self):
         self.skipped += 1
 
+    def kept(self, ctx, article, path):
+        self._paths.setdefault((str(ctx), str(article)), []).append(path)
+
+    def _sha256(self, path):
+        if path not in self._digest:
+            h = hashlib.sha256()
+            with open(path, "rb") as fh:
+                for block in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(block)
+            self._digest[path] = h.hexdigest()
+        return self._digest[path]
+
+    def same_bytes_as(self, ctx, article, path):
+        """A file already kept for this record with exactly these bytes,
+        or "". Sizes first; a hash only when two sizes are equal, so a
+        record whose files differ in size costs nothing. Within this run
+        only: a file saved by an earlier session is in another folder."""
+        size = os.path.getsize(path)
+        for other in self._paths.get((str(ctx), str(article)), ()):
+            if (other != path and os.path.exists(other)
+                    and os.path.getsize(other) == size
+                    and self._sha256(other) == self._sha256(path)):
+                return other
+        return ""
+
     def summary(self):
-        """One line for the log, or "" when nothing was skipped."""
-        if not self.skipped:
-            return ""
-        return ("{} planned file(s) were a file already saved for the same "
+        """The log's line(s), or "" when there is nothing to say."""
+        parts = []
+        if self.skipped:
+            parts.append(
+                "{} planned file(s) were a file already saved for the same "
                 "record — a primary with no derivative falls back to its "
                 "native — and were not fetched again.".format(self.skipped))
+        if self.identical:
+            parts.append(
+                "{} downloaded file(s) were byte-identical to a file already "
+                "saved for the same record, so only one copy of each was "
+                "kept; their rows name the file that holds the bytes."
+                .format(self.identical))
+        return " ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -6350,9 +6477,13 @@ def download_worker(session, out_dir, scope_mode, parents_sel, opts,
             log("WARNING: could not write the partial report — {}"
                 .format(describe_error(e)))
             pname = ""
-        done = sum(1 for r in rows if r[COL_STATUS] == "Downloaded")
-        hid = sum(1 for r in rows if r[COL_STATUS] == "Downloaded"
+        done = sum(1 for r in rows if is_downloaded(r[COL_STATUS]))
+        hid = sum(1 for r in rows if is_downloaded(r[COL_STATUS])
                   and r[COL_VISIBILITY] == "hidden")
+        # An inventory row is a file recorded, never one that failed. An
+        # inventory's error line once called every one of its rows, all
+        # reading "Inventoried", failed.
+        inv = sum(1 for r in rows if r[COL_STATUS] == INVENTORIED)
         # Account for every row, not just the ones that became files. The
         # first stopped v1.21 run wrote 110 rows and said "24 file(s)",
         # leaving 86 rows the log never mentioned: 11 files the server said
@@ -6362,8 +6493,11 @@ def download_worker(session, out_dir, scope_mode, parents_sel, opts,
         gone = sum(1 for r in rows
                    if str(r[COL_STATUS]).startswith(ABSENT_PREFIXES))
         never = sum(1 for r in rows if r[COL_STATUS] == NOT_ATTEMPTED)
-        failed = len(rows) - done - gone - never
-        parts = ["{} downloaded".format(done)]
+        failed = len(rows) - done - gone - never - inv
+        parts = (["{} inventoried".format(inv)] if inv and not done
+                 else ["{} downloaded".format(done)])
+        if inv and done:
+            parts.append("{} inventoried".format(inv))
         if failed:
             parts.append("{} failed".format(failed))
         if gone:
@@ -6404,7 +6538,9 @@ def download_worker(session, out_dir, scope_mode, parents_sel, opts,
 
     try:
         set_state(phase="starting", summary="", last_file=None,
-                  run_dir=None, paused=False)
+                  run_dir=None, paused=False,
+                  # 1.0.2: the page words the phase by it
+                  inventory=bool(opts.get("inventory")))
         driver = _attach_or_fail(session)
         if driver is None:
             return
@@ -6430,6 +6566,10 @@ def download_worker(session, out_dir, scope_mode, parents_sel, opts,
         # bottom of this worker — every way out of the run goes through
         # it, which is what module contract 5 requires of anything that
         # repoints the browser's download folder.
+        # 1.0.2: the status line says what the run is doing. It read
+        # "Attaching to Chrome…" from the attach until the first record
+        # finished, through the tab check, the preflight and the listing.
+        set_progress_msg("Checking that the Chrome tab answers…")
         try:
             tab_ready_check(driver, base_url + "/", preflight_checks, log)
         except TabNotAnswering as e:
@@ -6439,6 +6579,7 @@ def download_worker(session, out_dir, scope_mode, parents_sel, opts,
                                stall_limit=float(opts.get(
                                    "stall_limit", BROWSER_STALL_LIMIT)))
         fetcher.open(driver)
+        set_progress_msg("Preflight: test downloads and the destination…")
         try:
             for note in preflight_downloads(fetcher, out_dir,
                                             checks=preflight_checks):
@@ -6495,6 +6636,9 @@ def download_worker(session, out_dir, scope_mode, parents_sel, opts,
             # structure-level bounce is caught by crawl_listing, which
             # raises LoginRequired.
             first_url = base_url + "/"
+            # 1.0.2: said, so the status line does not go on saying
+            # "Preflight…" through the first structure's site check.
+            set_progress_msg("{} · checking the site page…".format(ctx))
             first_html, _bounced = session_still_open(driver, base_url, log)
             if _bounced:
                 master.append((s_idx, ctx, type_label, 0, 0, 0, len(warns),
@@ -6529,14 +6673,18 @@ def download_worker(session, out_dir, scope_mode, parents_sel, opts,
             try:
                 for k, state in enumerate(states):
                     label = STATE_LABELS.get(state, state)
+                    set_progress_msg("{} · reading the '{}' listing…".format(
+                        ctx, label))
                     try:
                         # No first_html: the driver's page is the paged
                         # one, fetched only to prove the session. Handing
                         # it over would silently give up x_showall on the
                         # first state of every structure.
-                        rows, gallery = crawl_listing(
-                            base_url, ctx, gallery, state, cookie,
-                            None, allow_flip=not flavour_known)
+                        # 1.0.2: Stop no longer waits for this read
+                        # (until_stopped), as in the re-run's drift check.
+                        rows, gallery = until_stopped(
+                            crawl_listing, base_url, ctx, gallery, state,
+                            cookie, None, not flavour_known)
                     except (LoginRequired, StopRequested):
                         raise
                     except Exception as e:
@@ -6588,6 +6736,15 @@ def download_worker(session, out_dir, scope_mode, parents_sel, opts,
                 continue
 
             if not items:
+                # 1.0.2: said in the log too. An empty structure was named
+                # only in the master log; on screen the run went from one
+                # structure to the next as if it had never been there.
+                log("{}: no records in the record state(s) asked for ({}) "
+                    "— nothing to {}.".format(
+                        ctx, ", ".join(STATE_LABELS.get(s_, s_)
+                                       for s_ in states),
+                        "inventory" if opts.get("inventory")
+                        else "download"))
                 master.append((s_idx, ctx, type_label, 0, 0, 0, len(warns),
                                "No matching records", timestr, ""))
                 set_progress(s_idx, total, "{} · empty · {}".format(
@@ -6857,7 +7014,8 @@ def download_worker(session, out_dir, scope_mode, parents_sel, opts,
                              "", fetched_via(got, fetcher)))
                         continue
                     n_files += 1
-                    saved.saved(ctx, art, job, os.path.basename(path))
+                    saved_name, saved_status = settle_saved(
+                        saved, ctx, art, job, path)
                     # The server handed over content, so whatever run of
                     # refusals was building, it is over.
                     watch.served()
@@ -6867,8 +7025,8 @@ def download_worker(session, out_dir, scope_mode, parents_sel, opts,
                     report_rows.append(
                         (order, art, item["title"], state_txt, job["kind"],
                          job["visibility"], job["version"],
-                         job["version_date"], orig, os.path.basename(path),
-                         nbytes, "Downloaded", job["url"], pub_url,
+                         job["version_date"], orig, saved_name,
+                         nbytes, saved_status, job["url"], pub_url,
                          adm_url, time.strftime("%H:%M:%S"), got.ctype,
                          job["access"], job["release"], job["embargo"], "",
                          fetched_via(got, fetcher)))
@@ -6912,14 +7070,22 @@ def download_worker(session, out_dir, scope_mode, parents_sel, opts,
                               if r[COL_ACCESS] == ACCESS_RESTRICTED)
                 n_unk = sum(1 for r in report_rows
                             if r[COL_ACCESS] == ACCESS_UNKNOWN)
-                size, basis = suggest_session_size(
-                    int(opts.get("observed_ceiling", 0) or 0))
+                # 1.0.2. This unpacked two of the THREE values the function
+                # returns, and passed an option nobody sets where the file
+                # count belongs, so every inventory with rows ended in
+                # "Unexpected error: too many values to unpack" at the end
+                # of its first structure, before the plan was written,
+                # after every record had been read. The suite read this
+                # worker's source as text and never ran it.
+                size, sessions, basis = suggest_session_size(
+                    len(report_rows), session_limits(chosen={
+                        "max_files": int(opts.get("max_files", 0) or 0),
+                        "max_mb": int(opts.get("max_mb", 0) or 0)}))
                 counts = {
                     "records": len(items), "files": len(report_rows),
                     "restricted": n_restr, "unknown": n_unk,
                     "session_size": size or len(report_rows),
-                    "sessions": (
-                        -(-len(report_rows) // size) if size else 1),
+                    "sessions": sessions,
                     "basis": basis,
                 }
                 report_name = "DC_FileDownload_Plan_{}_{}.xlsx".format(
@@ -6977,10 +7143,10 @@ def download_worker(session, out_dir, scope_mode, parents_sel, opts,
             # the rows rather than from the listing, so it describes the
             # batch in the folder and not the collection it came from.
             n_restricted = sum(1 for r in report_rows
-                               if r[COL_STATUS] == "Downloaded"
+                               if is_downloaded(r[COL_STATUS])
                                and r[COL_ACCESS] == ACCESS_RESTRICTED)
             n_unknown = sum(1 for r in report_rows
-                            if r[COL_STATUS] == "Downloaded"
+                            if is_downloaded(r[COL_STATUS])
                             and r[COL_ACCESS] == ACCESS_UNKNOWN)
             tot_restricted += n_restricted
             tot_unknown += n_unknown
@@ -8305,7 +8471,7 @@ def retry_worker(session, out_dir, report_path, opts, report_dir=""):
 
     try:
         set_state(phase="starting", summary="", last_file=None,
-                  run_dir=None, paused=False)
+                  run_dir=None, paused=False, inventory=False)
         driver = _attach_or_fail(session)
         if driver is None:
             return
@@ -8315,7 +8481,11 @@ def retry_worker(session, out_dir, report_path, opts, report_dir=""):
             os.makedirs(report_run_dir, exist_ok=True)
             log("Reports go to {} — downloads to {}"
                 .format(report_run_dir, run_dir))
-        set_state(run_dir=run_dir, phase="downloading")
+        # Still "starting": the page shows the phase before the message,
+        # and this said "Downloading…" through the tab check and the
+        # preflight. download_worker has always
+        # stayed "starting" until after its preflight; now both do.
+        set_state(run_dir=run_dir)
         n_replan = sum(1 for r in rows if r.get("replan"))
         # Say where this session sits in the whole job, not just what it
         # is about to do. "448 rows" says nothing about whether that is
@@ -8346,6 +8516,10 @@ def retry_worker(session, out_dir, report_path, opts, report_dir=""):
         # worker makes can be made here: this navigation can be
         # challenged too, and neither worker looked at it until the
         # first live run.
+        # 1.0.2: the status line says what the run is doing. It read
+        # "Attaching to Chrome…" from the attach until the first record
+        # finished, through the tab check, the preflight and the listing.
+        set_progress_msg("Checking that the Chrome tab answers…")
         try:
             tab_ready_check(driver, base_url + "/", preflight_checks, log)
         except TabNotAnswering as e:
@@ -8355,12 +8529,14 @@ def retry_worker(session, out_dir, report_path, opts, report_dir=""):
                                stall_limit=float(opts.get(
                                    "stall_limit", BROWSER_STALL_LIMIT)))
         fetcher.open(driver)
+        set_progress_msg("Preflight: test downloads and the destination…")
         try:
             for note in preflight_downloads(fetcher, out_dir,
                                             checks=preflight_checks):
                 log(note)
         except NotConfigured as e:
             return fail("Not started (NotConfigured): {}".format(e))
+        set_progress_msg("Checking the site page…")
         _html, _bounced = session_still_open(driver, base_url, log)
         if _bounced:
             return fail("Digital Commons session expired. Log in inside the "
@@ -8391,6 +8567,7 @@ def retry_worker(session, out_dir, report_path, opts, report_dir=""):
             log("Fetching files over the network layer. This path cannot "
                 "answer a request to verify that you are present — if one "
                 "arrives, the run stops and says so.")
+        set_state(phase="downloading")
         master, tot_files, done = [], 0, 0
         n_rows = 0
         # Counted, not derived by subtraction from a number that moves.
@@ -8440,6 +8617,10 @@ def retry_worker(session, out_dir, report_path, opts, report_dir=""):
             drift = None
             if opts.get("reconcile", True):
                 def _dwarn(msg, _c=ctx, _w=warns):
+                    if _abandoned():
+                        # A listing that fails after Stop abandoned it
+                        # must not warn into a run that has ended.
+                        return
                     _w.append(msg)
                     log("WARNING: '{}' — {}".format(_c, msg))
                 states = []
@@ -8448,10 +8629,14 @@ def retry_worker(session, out_dir, report_path, opts, report_dir=""):
                     if code and code not in states:
                         states.append(code)
                 if states:
+                    set_progress_msg("{} · checking the listing for changes "
+                                     "since the plan…".format(ctx))
                     gallery_guess = ("editor_gallery.cgi"
                                      in (ctx_rows[0].get("adm") or "").lower())
-                    live, unread = live_listing(
-                        base_url, ctx, gallery_guess, states, cookie, _dwarn)
+                    # 1.0.2: Stop no longer waits for this read.
+                    live, unread = until_stopped(
+                        live_listing, base_url, ctx, gallery_guess,
+                        states, cookie, _dwarn)
                     # Only reconcile rows whose state WAS read. A state that
                     # would not load must not make its records look removed.
                     unread_labels = set(unread)
@@ -8758,8 +8943,8 @@ def retry_worker(session, out_dir, report_path, opts, report_dir=""):
                          fetched_via(got, fetcher)))
                     continue
                 n_files += 1
-                saved.saved(ctx, art, dict(row, kind=kind),
-                            os.path.basename(path))
+                saved_name, saved_status = settle_saved(
+                    saved, ctx, art, dict(row, kind=kind), path)
                 # Content changed hands, so the run of refusals is over.
                 watch.served()
                 budget.spend(nbytes)
@@ -8769,7 +8954,7 @@ def retry_worker(session, out_dir, report_path, opts, report_dir=""):
                     (order, art, row.get("title", ""),
                      row.get("record_state", ""), kind, row["visibility"],
                      row["version"], row["version_date"], orig,
-                     os.path.basename(path), nbytes, "Downloaded",
+                     saved_name, nbytes, saved_status,
                      row["url"], row["pub"], row["adm"],
                      time.strftime("%H:%M:%S"), got.ctype,
                      row.get("access", ""), row.get("release", ""),
@@ -9010,6 +9195,14 @@ PAGE = r"""<!DOCTYPE html>
   padding:.5rem .7rem;border-radius:6px;border:1px solid #9aa5ad;background:#eef1f5}
 .logfull{width:100%;margin-top:.4rem;font:12px/1.4 ui-monospace,monospace}
 /* /DC-LOG styles */
+/* DC-BROWSE 1 styles */
+.browse-row{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap}
+.browse-row>input{flex:1 1 16rem;min-width:0}
+.browse-row>button{flex:0 0 auto;white-space:nowrap}
+.browse-files{margin-top:.3rem}
+.browse-msg{display:block;font-size:.9em;margin-top:.2rem}
+.browse-msg:empty{display:none}
+/* /DC-BROWSE styles */
 /* DC-PALETTE 3 — one notification palette for the shell and every module.
    Gray: instructions and neutral state. Green: the state matches what the
    operator intended. Amber (version 3): a run that finished, with problems
@@ -9076,7 +9269,7 @@ PAGE = r"""<!DOCTYPE html>
  <div class="row">
   <div>
    <label for="repdir">Reports folder</label>
-   <input type="text" id="repdir" value="" autocomplete="off" spellcheck="false">
+   <span class="browse-row"><input type="text" id="repdir" data-path="folder" value="" autocomplete="off" spellcheck="false"><button type="button" class="small secondary" data-browse="folder" data-for="repdir" data-title="Reports folder" aria-label="Browse for Reports folder" hidden>Browse…</button></span><span class="browse-msg" id="repdir-browsemsg" role="status" aria-live="polite"></span>
   </div>
   <button type="button" id="scan" class="small secondary">Scan</button>
  </div>
@@ -9323,7 +9516,7 @@ PAGE = r"""<!DOCTYPE html>
 
 <fieldset id="sec4"><legend id="leg4">6 · Destination</legend>
  <label for="dldir">Save downloads to</label>
- <input type="text" id="dldir" value="" autocomplete="off" spellcheck="false">
+ <span class="browse-row"><input type="text" id="dldir" data-path="folder" value="" autocomplete="off" spellcheck="false"><button type="button" class="small secondary" data-browse="folder" data-for="dldir" data-title="Save downloads to" aria-label="Browse for Save downloads to" hidden>Browse…</button></span><span class="browse-msg" id="dldir-browsemsg" role="status" aria-live="polite"></span>
  <p class="hint">Each run creates DC_FileDownloads_&lt;timestamp&gt;/ here,
  with one subfolder per structure. Files are renamed
  &lt;context&gt;_&lt;article&gt;_&lt;kind&gt;_&lt;visibility&gt;_&lt;version&gt;_&lt;original
@@ -9407,8 +9600,8 @@ PAGE = r"""<!DOCTYPE html>
  interval, and you re-run later.</p>
 
  <label for="rptdir">Save reports to <span class="opt">(optional)</span></label>
- <input type="text" id="rptdir" value="" autocomplete="off"
-        spellcheck="false" placeholder="leave blank to keep reports with the files">
+ <span class="browse-row"><input type="text" id="rptdir" data-path="folder" value="" autocomplete="off"
+        spellcheck="false" placeholder="leave blank to keep reports with the files"><button type="button" class="small secondary" data-browse="folder" data-for="rptdir" data-title="Save reports to (optional)" aria-label="Browse for Save reports to (optional)" hidden>Browse…</button></span><span class="browse-msg" id="rptdir-browsemsg" role="status" aria-live="polite"></span>
  <p class="hint">A run pulls hidden, unpublished and access-restricted
  content to disk, while the reports carry only URLs, statuses and counts.
  Point this somewhere shareable and the downloads somewhere controlled, and
@@ -9456,9 +9649,9 @@ PAGE = r"""<!DOCTYPE html>
  </details>
 
  <label for="retryrpt">Report, or the run folder holding several</label>
- <input type="text" id="retryrpt" value="" autocomplete="off"
+ <span class="browse-row"><input type="text" id="retryrpt" data-path="file-or-folder" value="" autocomplete="off"
         spellcheck="false"
-        placeholder="a DC_FileDownload_Report_*.xlsx, or a run folder">
+        placeholder="a DC_FileDownload_Report_*.xlsx, or a run folder"><button type="button" class="small secondary" data-browse="file" data-for="retryrpt" data-title="Report, or the run folder holding several" aria-label="Choose a report file for Report, or the run folder holding several" hidden>Choose file…</button><button type="button" class="small secondary" data-browse="folder" data-for="retryrpt" data-title="Report, or the run folder holding several" aria-label="Choose a run folder for Report, or the run folder holding several" hidden>Choose folder…</button></span><span class="browse-msg" id="retryrpt-browsemsg" role="status" aria-live="polite"></span>
  <p class="hint">Re-attempts every row whose Status did not begin
  &ldquo;Downloaded&rdquo;, and writes a fresh retry report. Rows recorded as
  <strong>Not attempted</strong> are records a stopped run never got to;
@@ -9758,6 +9951,126 @@ function formSeen(s){
   formRetryPending();
 }
 /* /DC-FORM */
+/* DC-BROWSE 1: Browse... beside every path field (1.0.4). A button marked
+   data-browse="folder|file|files" and data-for="<field id>" asks the module
+   to open this computer's own dialog; the choice fills the field (a path
+   list gains the chosen files, skipping any already listed) and fires the
+   field's input and change events, so the page saves and reacts as if the
+   path had been typed. Buttons stay hidden when the computer has no dialog,
+   and the first path field says why. Shared by every module with a path
+   field and duplicated verbatim. */
+var browseState = {mechanism: null, none: '', busy: false};
+var BROWSE_NL = String.fromCharCode(10);
+function browseJoin(existing, picked){
+  var lines = String(existing || '').split(BROWSE_NL)
+    .map(function(s){ return s.trim(); })
+    .filter(function(s){ return s.length > 0; });
+  (picked || []).forEach(function(p){ if(lines.indexOf(p) < 0) lines.push(p); });
+  return lines.join(BROWSE_NL);
+}
+function browseStartFrom(kind, value){
+  if(kind !== 'files') return String(value || '').trim();
+  var lines = browseJoin(value, []).split(BROWSE_NL);
+  return lines[lines.length - 1] || '';
+}
+function browseButtons(){
+  if(typeof document === 'undefined' || !document.querySelectorAll) return [];
+  return Array.prototype.slice.call(document.querySelectorAll('button[data-browse]'));
+}
+function browseField(btn){ return document.getElementById(btn.getAttribute('data-for')); }
+function browseSay(btn, text, tone){
+  var el = document.getElementById(btn.getAttribute('data-for') + '-browsemsg');
+  if(!el) return;
+  el.textContent = text || '';
+  el.className = 'browse-msg' + (tone ? ' dc-' + tone : '');
+}
+function browseSync(){
+  browseButtons().forEach(function(btn){
+    var field = browseField(btn);
+    btn.hidden = !browseState.mechanism;
+    btn.disabled = browseState.busy || !field || !!field.disabled || !!field.readOnly;
+  });
+}
+function browseFire(el, type){
+  if(el.dispatchEvent && typeof Event === 'function') el.dispatchEvent(new Event(type));
+}
+function browseApply(btn, paths){
+  var field = browseField(btn);
+  if(!field || !paths || !paths.length) return 0;
+  var before = field.value;
+  if(btn.getAttribute('data-browse') === 'files'){
+    field.value = browseJoin(field.value, paths);
+  } else {
+    field.value = paths[0];
+  }
+  browseFire(field, 'input');
+  browseFire(field, 'change');
+  if(field.focus) field.focus();
+  return field.value === before ? 0 : 1;
+}
+function browseClick(btn){
+  var field = browseField(btn);
+  if(!field || field.disabled || field.readOnly || browseState.busy
+     || !browseState.mechanism) return Promise.resolve(null);
+  var kind = btn.getAttribute('data-browse');
+  var label = btn.textContent;
+  browseState.busy = true;
+  browseSync();
+  btn.textContent = 'Choosing…';
+  browseSay(btn, 'A dialog is open. If you do not see it, it may be behind this browser window.', 'info');
+  return fetch('/api/browse', {method:'POST', cache:'no-store',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({kind: kind, start: browseStartFrom(kind, field.value),
+                            title: btn.getAttribute('data-title') || ''})})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if(j && j.error){ browseSay(btn, j.error, 'bad'); }
+      else if(!j || j.cancelled || !j.paths || !j.paths.length){
+        browseSay(btn, 'Nothing was chosen; the field is unchanged.', 'info');
+      } else if(kind === 'files'){
+        var had = browseJoin(field.value, []).split(BROWSE_NL).filter(function(s){ return s; }).length;
+        browseApply(btn, j.paths);
+        var now = browseJoin(field.value, []).split(BROWSE_NL).filter(function(s){ return s; }).length;
+        var added = now - had, skipped = j.paths.length - added;
+        browseSay(btn, added + (added === 1 ? ' path added' : ' paths added')
+          + (skipped ? '; ' + skipped + ' already listed' : '') + '.', 'ok');
+      } else {
+        browseApply(btn, j.paths);
+        browseSay(btn, '', '');
+      }
+      return j;
+    })
+    .catch(function(){
+      browseSay(btn, 'The module did not answer the Browse request. Is it still running?', 'bad');
+      return null;
+    })
+    .then(function(j){
+      browseState.busy = false;
+      btn.textContent = label;
+      browseSync();
+      return j;
+    });
+}
+function browseInit(){
+  var buttons = browseButtons();
+  if(!buttons.length) return;
+  buttons.forEach(function(btn){
+    btn.addEventListener('click', function(){ browseClick(btn); });
+  });
+  if(typeof setInterval === 'function') setInterval(browseSync, 500);
+  browseSync();
+  fetch('/api/browse', {cache:'no-store'})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      browseState.mechanism = (j && j.mechanism) || null;
+      browseState.none = (j && j.none) || '';
+      browseSync();
+      if(!browseState.mechanism && browseState.none) browseSay(buttons[0], browseState.none, 'info');
+    })
+    .catch(function(){});
+}
+browseInit();
+/* /DC-BROWSE */
 
 (function(){
   const box = logEl(), btn = document.getElementById('logcopy');
@@ -10047,6 +10360,15 @@ function applyVerifyTitle(holding){
   if(document.title!==want) document.title=want;
 }
 
+/* 1.0.2: an inventory downloads nothing, so neither the button nor the
+   status line may say it does. */
+function goWord(){
+  return kinventory.checked?'Start inventory':'Start downloads';
+}
+function phaseWord(s){
+  return s.inventory&&s.phase==='downloading'?'Inventorying…':cap(s.phase);
+}
+
 /* Says what to do NEXT, in the mode the page is in. v1.34.2: it was
    written once and then kept — the poller repainted it only when the line
    was empty — so it still said "load or map a hierarchy first" after one
@@ -10055,7 +10377,7 @@ function idleStatus(){
   const want=jobResume.checked
     ?'Idle — name the previous report, then Re-run from report.'
     :(hierLoaded
-      ?'Idle — choose the scope and options, then Start downloads.'
+      ?'Idle — choose the scope and options, then '+goWord()+'.'
       :'Idle — load or map a hierarchy first.');
   /* Written only when it changes: #status is a live region, and the
      poller runs every 1.5 s. */
@@ -10108,6 +10430,7 @@ async function poll(){
       s.hier.max_level+' · '+s.hier.source;
   }
   go.disabled=running||!hierLoaded;
+  if(go.textContent!==goWord()) go.textContent=goWord();
   // Deliberately not gated on a hierarchy: the report carries the URLs.
   retrygo.disabled=running||!retryrpt.value.trim();
   mapBtn.disabled=running;
@@ -10149,7 +10472,7 @@ async function poll(){
       'it has.'+counts;
   }else{
     status.className='';
-    status.textContent=(paused?'Paused':cap(s.phase))+counts+msg;
+    status.textContent=(paused?'Paused':phaseWord(s))+counts+msg;
   }
 }
 const esc=t=>t.replace(/&/g,'&amp;').replace(/</g,'&lt;');
@@ -10310,6 +10633,372 @@ def folder_error(label, path, optional=False):
 # ---- /DC-FOLDER ------------------------------------------------------------
 
 
+# ---- DC-BROWSE 1 ----------------------------------------------------------
+# A Browse... button beside every path field (1.0.4). The page asks this
+# module, and the module opens the operating system's own dialog on this
+# computer: osascript on macOS, PowerShell on Windows, tkinter otherwise.
+# On Windows the dialog is the shell's own file dialog (IFileOpenDialog,
+# which also picks folders), owned by an invisible always-on-top window
+# that is shown first: Windows will not bring a background process's
+# window to the front, but a dialog owned by a shown topmost window stays
+# above ordinary windows such as the browser.
+# The text field stays; the button only fills it. The start folder and the
+# title travel as arguments or environment variables, never inside the
+# dialog's script text. One dialog at a time per module. Duplicated
+# verbatim into every module with a path field (modules are standalone);
+# _verify_pages.py checks that the copies agree and drives each one with
+# the dialog faked.
+import base64 as _browse_b64
+import shutil as _browse_shutil
+import subprocess as _browse_subprocess
+
+BROWSE_KINDS = ("folder", "file", "files")
+BROWSE_TIMEOUT = 600          # seconds a dialog may stay open
+BROWSE_CANCELLED = 3          # exit status the PowerShell and tkinter scripts use
+BROWSE_NONE = ("No file dialog is available on this computer (osascript, "
+               "PowerShell and tkinter were each looked for). Type the path "
+               "into the field instead.")
+BROWSE_BUSY = ("A dialog is already open for this module. Choose or cancel "
+               "there first; it may be behind the browser window.")
+_BROWSE = {"mechanism": None}
+_BROWSE_LOCK = threading.Lock()
+_BROWSE_OPEN = threading.Lock()
+
+_BROWSE_OSA = """on run argv
+set startPath to item 1 of argv
+set promptText to item 2 of argv
+set mode to item 3 of argv
+activate
+try
+set loc to (POSIX file startPath) as alias
+on error
+set loc to path to home folder
+end try
+if mode is "folder" then
+return POSIX path of (choose folder with prompt promptText default location loc)
+else if mode is "file" then
+return POSIX path of (choose file with prompt promptText default location loc)
+else
+set picked to choose file with prompt promptText default location loc with multiple selections allowed
+set out to ""
+repeat with f in picked
+set out to out & (POSIX path of f) & linefeed
+end repeat
+return out
+end if
+end run
+"""
+
+_BROWSE_PS = """$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+# COMPILE-START
+Add-Type -Language CSharp -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class DcPicker {
+  [ComImport, Guid("DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7")]
+  class FileOpenDialogRCW {}
+  [ComImport, Guid("d57c7288-d4ad-4768-be02-9d969532d960"),
+   InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  interface IFileOpenDialog {
+    [PreserveSig] int Show(IntPtr owner);
+    void SetFileTypes(uint count, IntPtr types);
+    void SetFileTypeIndex(uint index);
+    void GetFileTypeIndex(out uint index);
+    void Advise(IntPtr events, out uint cookie);
+    void Unadvise(uint cookie);
+    void SetOptions(uint fos);
+    void GetOptions(out uint fos);
+    void SetDefaultFolder(IShellItem item);
+    void SetFolder(IShellItem item);
+    void GetFolder(out IShellItem item);
+    void GetCurrentSelection(out IShellItem item);
+    void SetFileName([MarshalAs(UnmanagedType.LPWStr)] string name);
+    void GetFileName([MarshalAs(UnmanagedType.LPWStr)] out string name);
+    void SetTitle([MarshalAs(UnmanagedType.LPWStr)] string title);
+    void SetOkButtonLabel([MarshalAs(UnmanagedType.LPWStr)] string text);
+    void SetFileNameLabel([MarshalAs(UnmanagedType.LPWStr)] string text);
+    void GetResult(out IShellItem item);
+    void AddPlace(IShellItem item, int place);
+    void SetDefaultExtension([MarshalAs(UnmanagedType.LPWStr)] string ext);
+    void Close(int hr);
+    void SetClientGuid(ref Guid guid);
+    void ClearClientData();
+    void SetFilter(IntPtr filter);
+    void GetResults(out IShellItemArray items);
+    void GetSelectedItems(out IShellItemArray items);
+  }
+  [ComImport, Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE"),
+   InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  interface IShellItem {
+    void BindToHandler(IntPtr pbc, ref Guid bhid, ref Guid riid, out IntPtr ppv);
+    void GetParent(out IShellItem item);
+    void GetDisplayName(uint sigdn, out IntPtr name);
+    void GetAttributes(uint mask, out uint attrs);
+    void Compare(IShellItem item, uint hint, out int order);
+  }
+  [ComImport, Guid("B63EA76D-1F85-456F-A19C-48159EFA858B"),
+   InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  interface IShellItemArray {
+    void BindToHandler(IntPtr pbc, ref Guid bhid, ref Guid riid, out IntPtr ppv);
+    void GetPropertyStore(int flags, ref Guid riid, out IntPtr ppv);
+    void GetPropertyDescriptionList(IntPtr key, ref Guid riid, out IntPtr ppv);
+    void GetAttributes(int flags, uint mask, out uint attrs);
+    void GetCount(out uint count);
+    void GetItemAt(uint index, out IShellItem item);
+    void EnumItems(out IntPtr items);
+  }
+  [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = false)]
+  static extern void SHCreateItemFromParsingName(string path, IntPtr pbc,
+      ref Guid riid, out IShellItem item);
+  const uint SIGDN_FILESYSPATH = 0x80058000;
+  const int CANCELLED = unchecked((int)0x800704C7);
+  static string PathOf(IShellItem item) {
+    IntPtr p;
+    item.GetDisplayName(SIGDN_FILESYSPATH, out p);
+    try { return Marshal.PtrToStringUni(p); } finally { Marshal.FreeCoTaskMem(p); }
+  }
+  public static string[] Pick(IntPtr owner, string kind, string start, string title) {
+    IFileOpenDialog d = (IFileOpenDialog)new FileOpenDialogRCW();
+    uint fos;
+    d.GetOptions(out fos);
+    fos |= 0x40 | 0x800;              /* file system only; the path must exist */
+    if (kind == "folder") fos |= 0x20; /* pick folders */
+    else fos |= 0x1000;                /* the file must exist */
+    if (kind == "files") fos |= 0x200; /* several at once */
+    d.SetOptions(fos);
+    if (!String.IsNullOrEmpty(title)) d.SetTitle(title);
+    if (!String.IsNullOrEmpty(start)) {
+      try {
+        Guid iid = new Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE");
+        IShellItem folder;
+        SHCreateItemFromParsingName(start, IntPtr.Zero, ref iid, out folder);
+        d.SetFolder(folder);
+      } catch (Exception) { }
+    }
+    int hr = d.Show(owner);
+    if (hr == CANCELLED) return null;
+    if (hr != 0) Marshal.ThrowExceptionForHR(hr);
+    if (kind == "files") {
+      IShellItemArray items;
+      d.GetResults(out items);
+      uint n;
+      items.GetCount(out n);
+      string[] paths = new string[n];
+      for (uint i = 0; i < n; i++) {
+        IShellItem item;
+        items.GetItemAt(i, out item);
+        paths[i] = PathOf(item);
+      }
+      return paths;
+    }
+    IShellItem one;
+    d.GetResult(out one);
+    return new string[] { PathOf(one) };
+  }
+}
+'@
+# COMPILE-END
+$owner = New-Object System.Windows.Forms.Form
+$owner.TopMost = $true
+$owner.ShowInTaskbar = $false
+$owner.FormBorderStyle = 'None'
+$owner.Opacity = 0
+$owner.StartPosition = 'CenterScreen'
+$owner.Size = New-Object System.Drawing.Size(1, 1)
+$owner.Show()
+$owner.Activate()
+try {
+  $got = [DcPicker]::Pick($owner.Handle, $env:DC_BROWSE_KIND,
+                          $env:DC_BROWSE_START, $env:DC_BROWSE_TITLE)
+} catch {
+  [Console]::Error.WriteLine($_.Exception.Message)
+  exit 1
+} finally {
+  $owner.Close()
+  $owner.Dispose()
+}
+if ($null -eq $got -or $got.Count -eq 0) { exit 3 }
+[Console]::Out.Write(($got -join [Environment]::NewLine))
+"""
+
+_BROWSE_TK = """import os, sys
+import tkinter
+from tkinter import filedialog
+root = tkinter.Tk()
+root.withdraw()
+root.attributes('-topmost', True)
+kind = os.environ.get('DC_BROWSE_KIND', 'folder')
+opts = dict(parent=root, title=os.environ.get('DC_BROWSE_TITLE', ''),
+            initialdir=os.environ.get('DC_BROWSE_START', ''))
+if kind == 'folder':
+    got = filedialog.askdirectory(mustexist=True, **opts)
+    got = [got] if got else []
+elif kind == 'file':
+    got = filedialog.askopenfilename(**opts)
+    got = [got] if got else []
+else:
+    got = list(filedialog.askopenfilenames(**opts))
+root.destroy()
+if not got:
+    sys.exit(3)
+sys.stdout.buffer.write(chr(10).join(got).encode('utf-8'))
+"""
+
+
+def browse_kind_error(kind):
+    """"" for a kind the dialogs know; otherwise a message (contract 11:
+    the one validator both endpoints use)."""
+    if kind in BROWSE_KINDS:
+        return ""
+    return "Unknown Browse request {!r}: expected one of {}.".format(
+        kind, ", ".join(BROWSE_KINDS))
+
+
+def start_folder(value):
+    """Where a dialog opens: the field's folder if it exists; for a file or
+    a path that does not exist yet, its nearest existing parent; otherwise
+    the home folder. A relative path is not guessed at."""
+    home = os.path.expanduser("~")
+    path = os.path.expanduser((value or "").strip())
+    if not path or not os.path.isabs(path):
+        return home
+    if os.path.isdir(path):
+        return path
+    cur = os.path.dirname(path)
+    while cur and not os.path.isdir(cur):
+        up = os.path.dirname(cur)
+        if up == cur:
+            break
+        cur = up
+    return cur if cur and os.path.isdir(cur) else home
+
+
+def _browse_tk_works():
+    try:
+        done = _browse_subprocess.run(
+            [sys.executable, "-c",
+             "import tkinter; r = tkinter.Tk(); r.withdraw(); r.destroy()"],
+            capture_output=True, timeout=20)
+    except (OSError, _browse_subprocess.SubprocessError):
+        return False
+    return done.returncode == 0
+
+
+def browse_mechanism():
+    """The dialog this computer can show: "osascript", "powershell",
+    "tkinter", or "" for none. Looked for once, on first use."""
+    with _BROWSE_LOCK:
+        if _BROWSE["mechanism"] is None:
+            if sys.platform == "darwin" and _browse_shutil.which("osascript"):
+                found = "osascript"
+            elif os.name == "nt" and (_browse_shutil.which("powershell")
+                                      or _browse_shutil.which("pwsh")):
+                found = "powershell"
+            elif _browse_tk_works():
+                found = "tkinter"
+            else:
+                found = ""
+            _BROWSE["mechanism"] = found
+        return _BROWSE["mechanism"]
+
+
+def browse_command(mechanism, kind, start, title):
+    """(argv, extra environment, stdin bytes) for one dialog. The start
+    folder and title are arguments or environment, never script text."""
+    env = {"DC_BROWSE_KIND": kind, "DC_BROWSE_START": start,
+           "DC_BROWSE_TITLE": title}
+    if mechanism == "osascript":
+        return (["osascript", "-", start, title, kind], {},
+                _BROWSE_OSA.encode("utf-8"))
+    if mechanism == "powershell":
+        exe = _browse_shutil.which("powershell") or _browse_shutil.which(
+            "pwsh") or "powershell"
+        code = _browse_b64.b64encode(_BROWSE_PS.encode("utf-16-le")).decode(
+            "ascii")
+        return ([exe, "-NoProfile", "-NonInteractive", "-STA",
+                 "-EncodedCommand", code], env, None)
+    return ([sys.executable, "-c", _BROWSE_TK], env, None)
+
+
+def _browse_clean(path, mechanism):
+    path = path.strip()
+    if mechanism == "osascript" and len(path) > 1 and path.endswith("/"):
+        path = path.rstrip("/") or "/"
+    return path
+
+
+def pick_paths(mechanism, kind, start, title):
+    """Open one dialog. {"paths": [...]}, {"cancelled": True}, or
+    {"error": message}. Cancel is not an error."""
+    argv, extra, stdin = browse_command(mechanism, kind, start, title)
+    env = dict(os.environ)
+    env.update(extra)
+    try:
+        done = _browse_subprocess.run(argv, input=stdin, capture_output=True,
+                                      timeout=BROWSE_TIMEOUT, env=env)
+    except _browse_subprocess.TimeoutExpired:
+        return {"error": "Nothing was chosen within {} minutes, so the "
+                         "dialog was closed. The field is unchanged."
+                         .format(BROWSE_TIMEOUT // 60)}
+    except OSError as e:
+        return {"error": "The {} dialog could not be started: {}"
+                         .format(mechanism, e)}
+    said = done.stderr.decode("utf-8", "replace").strip()
+    if done.returncode == BROWSE_CANCELLED or (
+            mechanism == "osascript" and "-128" in said):
+        return {"cancelled": True}
+    if done.returncode != 0:
+        last = said.splitlines()[-1] if said else "no message"
+        return {"error": "The {} dialog ended with status {}: {}".format(
+            mechanism, done.returncode, last[:300])}
+    out = done.stdout.decode("utf-8", "replace")
+    paths = [_browse_clean(p, mechanism) for p in out.splitlines()]
+    paths = [p for p in paths if p]
+    if not paths:
+        return {"cancelled": True}
+    if kind != "files":
+        paths = paths[:1]
+    return {"paths": paths}
+
+
+def browse_status():
+    """GET /api/browse: which dialog this computer offers ("" = none)."""
+    mech = browse_mechanism()
+    return {"mechanism": mech, "none": "" if mech else BROWSE_NONE}
+
+
+def browse_request(handler):
+    """POST /api/browse {kind, start, title}. Returns (payload, code)."""
+    try:
+        length = int(handler.headers.get("Content-Length", 0) or 0)
+        if length > 65536:
+            raise ValueError("request too large")
+        body = json.loads(handler.rfile.read(length).decode("utf-8") or "{}")
+        if not isinstance(body, dict):
+            raise ValueError("expected a JSON object")
+    except ValueError as e:
+        return {"error": "Unreadable Browse request: {}".format(e)}, 400
+    kind = body.get("kind")
+    why = browse_kind_error(kind)
+    if why:
+        return {"error": why}, 400
+    mech = browse_mechanism()
+    if not mech:
+        return {"error": BROWSE_NONE}, 409
+    if not _BROWSE_OPEN.acquire(blocking=False):
+        return {"error": BROWSE_BUSY}, 409
+    try:
+        title = str(body.get("title") or "Choose")[:200]
+        start = start_folder(str(body.get("start") or ""))
+        return pick_paths(mech, kind, start, title), 200
+    finally:
+        _BROWSE_OPEN.release()
+# ---- /DC-BROWSE ------------------------------------------------------------
+
+
 def request_allowed(handler) -> bool:
     """Reject requests that did not originate locally (DNS rebinding /
     cross-site form/fetch guard — see the module template)."""
@@ -10419,6 +11108,8 @@ def make_handler(session: dict, page: bytes):
         def do_GET(self):
             if not request_allowed(self):
                 return self._json({"error": "Forbidden (non-local request)."}, 403)
+            if self.path == "/api/browse":
+                return self._json(browse_status())
             if self.path == "/api/state":
                 form_for_page()
                 with LOCK:
@@ -10456,6 +11147,9 @@ def make_handler(session: dict, page: bytes):
         def do_POST(self):
             if not request_allowed(self):
                 return self._json({"error": "Forbidden (non-local request)."}, 403)
+            if self.path == "/api/browse":
+                payload, code = browse_request(self)
+                return self._json(payload, code)
             if self.path == "/api/reports/scan":
                 try:
                     folder = os.path.expanduser(

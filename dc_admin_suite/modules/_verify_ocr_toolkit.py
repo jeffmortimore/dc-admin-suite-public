@@ -867,8 +867,9 @@ class ReportShape(unittest.TestCase):
         book = openpyxl.load_workbook(path)
         sheet = book["Files"]
         self.assertEqual([c.value for c in sheet[1]], M.REPORT_HEADERS)
-        self.assertEqual(sheet.cell(row=2, column=len(M.REPORT_HEADERS)).value,
-                         "SHORT PAGE p3")
+        self.assertEqual(sheet.cell(
+            row=2, column=M.REPORT_HEADERS.index("Flags") + 1).value,
+            "SHORT PAGE p3")
         summary = "\n".join(
             str(r[0].value) for r in book["Summary"].iter_rows())
         self.assertIn("Out Tok includes Think Tok", summary)
@@ -879,8 +880,8 @@ class ReportShape(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class ClientDrift(unittest.TestCase):
 
-    def test_this_release_did_not_touch_the_client(self):
-        self.assertEqual(M.AI_CLIENT_VERSION, "1.5")
+    def test_the_client_is_1_6_the_served_model(self):
+        self.assertEqual(M.AI_CLIENT_VERSION, "1.6")
 
     def test_both_modules_judge_a_reply_limit_the_same_way(self):
         for raw in (None, "", " ", "x", "63", 64, "8000", 32000, "32001",
@@ -927,6 +928,72 @@ class ClientDrift(unittest.TestCase):
         for mod in (M, IMG):
             self.assertFalse(hasattr(mod, "endpoint_cost"))
             self.assertFalse(hasattr(mod, "CACHE_READ_RATE"))
+
+
+# ---------------------------------------------------------------------------
+# 1.11.0 / client 1.6 — the served model through an OCR run
+# ---------------------------------------------------------------------------
+class ServedModelInTheRun(unittest.TestCase):
+    """process_worker with the REAL process_one, image path, ai_ocr_page and
+    client; only the image bytes and the workbook write are stubbed. The
+    request names gemini-3.7-flash; the stream says gemini-3.8-flash."""
+
+    def test_the_redirect_reaches_the_row_and_the_summary(self):
+        tmp = tempfile.mkdtemp()
+        img = os.path.join(tmp, "a.jpg")
+        Path(img).write_bytes(b"x")
+        entry = {"path": img, "rel": "a.jpg", "format": "image", "ctx": "",
+                 "article": "", "title": "", "state": "", "admin_url": ""}
+        body = {"candidates": [{"content": {"parts": [
+            {"text": "Some text\nUncertain: None."}]},
+            "finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": 5,
+                              "candidatesTokenCount": 3},
+            "modelVersion": "gemini-3.8-flash"}
+        written = {}
+
+        def capture(path, rows, pairs, rgb, extra_note=()):
+            written["rows"], written["pairs"] = rows, dict(pairs)
+        said = []
+        real = (M._image_send_bytes, M.write_report, M.log)
+        M._image_send_bytes = lambda p: (b"img", "image/png")
+        M.write_report = capture
+        M.log = lambda m, *a: said.append(str(m))
+        try:
+            cfg = {"entries": [entry], "out_dir": tmp, "source": "test",
+                   "mode": "auto", "save": "copy", "engine": "ai",
+                   "ai_alt": False, "ai_retries": 0, "suffix": "_ocr",
+                   "max_tokens": 8000}
+            with StreamPatch(["data: " + json.dumps(body)]):
+                M.process_worker({"branding": {}}, cfg,
+                                 ep("gemini", model="gemini-3.7-flash"))
+        finally:
+            M._image_send_bytes, M.write_report, M.log = real
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+        self.assertIn("rows", written, "\n".join(said[-8:]))
+        row = written["rows"][0]
+        self.assertEqual(row[M.REPORT_HEADERS.index("Served Model")],
+                         "gemini-3.8-flash", "\n".join(said[-8:]))
+        note = ("Requested gemini-3.7-flash, but the provider says "
+                "gemini-3.8-flash answered.")
+        self.assertEqual(written["pairs"]["Model requested"],
+                         "gemini-3.7-flash")
+        self.assertEqual(written["pairs"]["Model served"], note)
+        self.assertIn("Model: " + note, said)
+
+    def test_add_usage_merges_the_model_and_sums_the_counts(self):
+        sink = {}
+        M.add_usage(sink, {"in": 1, "out": 2, "model": "a"})
+        M.add_usage(sink, {"in": 1, "out": 2, "model": "b"})
+        M.add_usage(sink, {"in": 1, "out": 2})
+        self.assertEqual(sink["usage"], {"in": 3, "out": 6, "think": 0,
+                                         "cache_read": 0, "model": "a, b"})
+
+    def test_a_run_with_no_billed_request_says_so(self):
+        self.assertEqual(M.run_served_note([{"in_tok": 0, "out_tok": 0}],
+                                           {"model": "m"}),
+                         "No AI request was billed in this run.")
 
 
 if __name__ == "__main__":

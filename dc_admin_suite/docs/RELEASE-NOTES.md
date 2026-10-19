@@ -1,5 +1,148 @@
 # Release notes
 
+## 1.0.4 — 2026-10-19
+
+Every field that asks for a folder or a file now has a **Browse…** button
+beside it, which opens your computer's own folder or file dialog. You can
+still type or paste a path. Upgrading changes none of your settings.
+
+1.0.2 and 1.0.3 were not published separately: if you are upgrading from
+1.0.1, this release also carries everything in their notes below.
+
+### What is in it
+
+| Module | Version |
+|---|---|
+| Structure URL Generator | 1.5.0 |
+| Hierarchy Mapping Tool | 1.5.0 |
+| Structure Regenerator | 1.5.0 |
+| Configuration Manager | 1.5.0 |
+| DOI & XML Generator | 1.10.0 |
+| Structure HTML Drafting Tool | 1.6.3 |
+| Batch Revise Manager | 1.5.0 |
+| Batch File Downloader | 1.37.0 |
+| OCR & Accessibility Toolkit | 1.12.0 |
+| Image Description Generator | 1.10.0 |
+| Shell (start page, settings, Main Menu) | 1.13.0 |
+
+### Browse… beside every path field
+
+- **Folder fields** have **Browse…**. The dialog opens at the folder
+  already in the field, or the nearest folder above it that exists, or
+  your home folder.
+- **The image and file path lists** (Image Description Generator, OCR &
+  Accessibility Toolkit) have **Browse…** too. You can choose several
+  files at once; they are added to the list, and any already listed are
+  skipped.
+- **The Batch File Downloader's re-run** takes a report or a run folder,
+  so it has **Choose file…** and **Choose folder…**.
+- A chosen path is treated exactly as if you had typed it: the page
+  remembers it and reacts to it.
+- The dialog can take a second or two to appear, and on some computers it
+  may open behind the browser window. While it is open, the button reads
+  "Choosing…".
+- On macOS the dialog comes from `osascript`; on Windows it is the
+  standard Windows file dialog, opened through PowerShell, which can
+  also choose folders and has an address bar you can paste a path into;
+  elsewhere it comes from Python's `tkinter`. If none of these works on your
+  computer, the buttons are not shown and the page says why; type the path
+  instead.
+
+## 1.0.3 — 2026-10-14
+
+The two AI modules now say which model answered each request. An AI
+provider can retire a model and send requests that name it to a newer
+model without any error or warning; until this release, the sidecars and
+reports would still have named the model you asked for. Upgrading
+changes none of your settings.
+
+### What is in it
+
+| Module | Version |
+|---|---|
+| Structure URL Generator | 1.4.0 |
+| Hierarchy Mapping Tool | 1.4.0 |
+| Structure Regenerator | 1.4.0 |
+| Configuration Manager | 1.4.0 |
+| DOI & XML Generator | 1.9.0 |
+| Structure HTML Drafting Tool | 1.6.3 |
+| Batch Revise Manager | 1.4.0 |
+| Batch File Downloader | 1.36.0 |
+| OCR & Accessibility Toolkit | 1.11.0 |
+| Image Description Generator | 1.9.0 |
+| Shell (start page, settings, Main Menu) | 1.13.0 |
+
+### Image Description Generator and OCR & Accessibility Toolkit
+
+- **Every sidecar names the model that answered.** Below the `Model:` line
+  (the model you asked for), a `Served by:` line gives the model the
+  provider says answered. When the provider does not say, the line says
+  so. (Image Description Generator.)
+- **The report has a Served Model column**, and the Summary sheet has a
+  **Model served** line. When the provider answered with a different
+  model from the one requested, the line says so in words: "Requested A,
+  but the provider says B answered." A dated version of the same model
+  (for example, `-001` or `-20261001` added to the end of the name)
+  counts as the same model. The same line is written to the log at the
+  end of a run.
+- **The endpoint Test says which model answered**, on the Settings page
+  and in each AI module's endpoint list.
+
+### If you use Gemini
+
+`gemini-3.7-flash` has been retired, and requests that name it are now
+answered by `gemini-3.8-flash`. Update the model in **Settings → AI
+endpoints**; the Test button will confirm which model answers.
+
+## 1.0.2 — 2026-10-12
+
+Fixes to the Batch File Downloader, found on real collections. Only that
+module changes; every other version is as in 1.0.1.
+
+### What is in it
+
+| Module | Version |
+|---|---|
+| Structure URL Generator | 1.4.0 |
+| Hierarchy Mapping Tool | 1.4.0 |
+| Structure Regenerator | 1.4.0 |
+| Configuration Manager | 1.4.0 |
+| DOI & XML Generator | 1.9.0 |
+| Structure HTML Drafting Tool | 1.6.3 |
+| Batch Revise Manager | 1.4.0 |
+| Batch File Downloader | 1.36.0 |
+| OCR & Accessibility Toolkit | 1.10.0 |
+| Image Description Generator | 1.8.0 |
+| Shell (start page, settings, Main Menu) | 1.12.2 |
+
+### Batch File Downloader
+
+- **Inventory only works again.** In 1.0.1 an inventory stopped with
+  "Unexpected error" at the end of the first structure that had records,
+  before its plan was written. The rows it had gathered were still saved in
+  a `_PARTIAL` report, and that report re-runs normally. An inventory now
+  writes its plan for every structure, and the page says **Start
+  inventory** and **Inventorying…** instead of speaking of downloads.
+- **A file is kept once, even when the server holds it twice.** Two
+  versions of one record can be the same bytes: a stamped PDF identical
+  to its unstamped copy, or an earlier revision identical to the current
+  one. After both are saved, the second copy is removed; its row still
+  begins "Downloaded" and names the file that holds its bytes. Files that
+  only share a size are both kept. If a copy cannot be removed, both stay
+  and the row says so.
+- **Stop works during a listing read.** A large listing can be a single
+  request of a minute or more, and Stop used to wait for it.
+- **The status line says what the run is doing** — checking the tab, the
+  preflight, checking the site page, reading a listing — instead of
+  "Attaching to Chrome…" until the first record finished. A re-run reads
+  "Starting…" until its preflight is done, as a new run always has.
+- **A structure with no records is named in the log**, and a run started
+  long after the previous one no longer opens with "Still working".
+- **The verification suite checks more and says more.** Checks that cannot
+  run without an institution profile are listed under SKIPPED instead of
+  counted as passes, and four checks that recorded nothing when the code
+  under test returned early now fail.
+
 ## 1.0.1 — 2026-10-08
 
 Fixes from the first weeks of use, and the run history taken out of the

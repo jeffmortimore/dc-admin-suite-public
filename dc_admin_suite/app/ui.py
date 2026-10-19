@@ -521,7 +521,7 @@ APP_HTML = r"""<!DOCTYPE html>
 
 </main>
 <footer>
-  <p>DC Admin Suite · shell v1.12.2 · runs locally on your computer; nothing is
+  <p>DC Admin Suite · shell v1.13.0 · runs locally on your computer; nothing is
      sent anywhere except to your Digital Commons instance through your own
      Chrome session.</p>
 </footer>
@@ -1118,7 +1118,7 @@ function wireAiEndpoints() {
       if (r.ok)
         setStatus($("aiStatus"), "good",
           "Test OK — <code>" + esc(name) + "</code> replied: " +
-          esc(r.reply));
+          esc(r.reply) + (r.note ? " · " + esc(r.note) : ""));
       else
         setStatus($("aiStatus"), "bad", esc(r.error));
     }));

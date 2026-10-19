@@ -63,7 +63,7 @@ MANIFEST = {
     "id": "config-manager",
     "name": "Configuration Manager",
     "description": "Scrape, preview, and update most structure configurations using a spreadsheet.",
-    "version": "1.4.0",
+    "version": "1.5.0",
     "requires": ["selenium", "beautifulsoup4", "openpyxl"],
 }
 
@@ -1656,6 +1656,14 @@ PAGE = """<!DOCTYPE html>
   padding:.5rem .7rem;border-radius:6px;border:1px solid #9aa5ad;background:#eef1f5}
 .logfull{width:100%;margin-top:.4rem;font:12px/1.4 ui-monospace,monospace}
 /* /DC-LOG styles */
+/* DC-BROWSE 1 styles */
+.browse-row{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap}
+.browse-row>input{flex:1 1 16rem;min-width:0}
+.browse-row>button{flex:0 0 auto;white-space:nowrap}
+.browse-files{margin-top:.3rem}
+.browse-msg{display:block;font-size:.9em;margin-top:.2rem}
+.browse-msg:empty{display:none}
+/* /DC-BROWSE styles */
 /* DC-PALETTE 3 — one notification palette for the shell and every module.
    Gray: instructions and neutral state. Green: the state matches what the
    operator intended. Amber (version 3): a run that finished, with problems
@@ -1717,7 +1725,7 @@ PAGE = """<!DOCTYPE html>
  <div class="row">
   <div>
    <label for="invdir">Workbooks folder</label>
-   <input type="text" id="invdir" value="" autocomplete="off" spellcheck="false">
+   <span class="browse-row"><input type="text" id="invdir" data-path="folder" value="" autocomplete="off" spellcheck="false"><button type="button" class="small secondary" data-browse="folder" data-for="invdir" data-title="Workbooks folder" aria-label="Browse for Workbooks folder" hidden>Browse…</button></span><span class="browse-msg" id="invdir-browsemsg" role="status" aria-live="polite"></span>
   </div>
   <button type="button" id="invscan" class="small secondary">Scan</button>
  </div>
@@ -1746,7 +1754,7 @@ PAGE = """<!DOCTYPE html>
  <div class="row">
   <div>
    <label for="repdir">Workbooks folder</label>
-   <input type="text" id="repdir" value="" autocomplete="off" spellcheck="false">
+   <span class="browse-row"><input type="text" id="repdir" data-path="folder" value="" autocomplete="off" spellcheck="false"><button type="button" class="small secondary" data-browse="folder" data-for="repdir" data-title="Workbooks folder" aria-label="Browse for Workbooks folder" hidden>Browse…</button></span><span class="browse-msg" id="repdir-browsemsg" role="status" aria-live="polite"></span>
   </div>
   <button type="button" id="repscan" class="small secondary">Scan</button>
  </div>
@@ -1776,7 +1784,7 @@ PAGE = """<!DOCTYPE html>
 
 <fieldset><legend>3 · Output</legend>
  <label for="outdir">Output folder (reports · dry-run previews · update logs)</label>
- <input type="text" id="outdir" value="" autocomplete="off" spellcheck="false">
+ <span class="browse-row"><input type="text" id="outdir" data-path="folder" value="" autocomplete="off" spellcheck="false"><button type="button" class="small secondary" data-browse="folder" data-for="outdir" data-title="Output folder (reports · dry-run previews · update logs)" aria-label="Browse for Output folder (reports · dry-run previews · update logs)" hidden>Browse…</button></span><span class="browse-msg" id="outdir-browsemsg" role="status" aria-live="polite"></span>
 </fieldset>
 
 <div class="controls">
@@ -2068,6 +2076,126 @@ function formSeen(s){
   formRetryPending();
 }
 /* /DC-FORM */
+/* DC-BROWSE 1: Browse... beside every path field (1.0.4). A button marked
+   data-browse="folder|file|files" and data-for="<field id>" asks the module
+   to open this computer's own dialog; the choice fills the field (a path
+   list gains the chosen files, skipping any already listed) and fires the
+   field's input and change events, so the page saves and reacts as if the
+   path had been typed. Buttons stay hidden when the computer has no dialog,
+   and the first path field says why. Shared by every module with a path
+   field and duplicated verbatim. */
+var browseState = {mechanism: null, none: '', busy: false};
+var BROWSE_NL = String.fromCharCode(10);
+function browseJoin(existing, picked){
+  var lines = String(existing || '').split(BROWSE_NL)
+    .map(function(s){ return s.trim(); })
+    .filter(function(s){ return s.length > 0; });
+  (picked || []).forEach(function(p){ if(lines.indexOf(p) < 0) lines.push(p); });
+  return lines.join(BROWSE_NL);
+}
+function browseStartFrom(kind, value){
+  if(kind !== 'files') return String(value || '').trim();
+  var lines = browseJoin(value, []).split(BROWSE_NL);
+  return lines[lines.length - 1] || '';
+}
+function browseButtons(){
+  if(typeof document === 'undefined' || !document.querySelectorAll) return [];
+  return Array.prototype.slice.call(document.querySelectorAll('button[data-browse]'));
+}
+function browseField(btn){ return document.getElementById(btn.getAttribute('data-for')); }
+function browseSay(btn, text, tone){
+  var el = document.getElementById(btn.getAttribute('data-for') + '-browsemsg');
+  if(!el) return;
+  el.textContent = text || '';
+  el.className = 'browse-msg' + (tone ? ' dc-' + tone : '');
+}
+function browseSync(){
+  browseButtons().forEach(function(btn){
+    var field = browseField(btn);
+    btn.hidden = !browseState.mechanism;
+    btn.disabled = browseState.busy || !field || !!field.disabled || !!field.readOnly;
+  });
+}
+function browseFire(el, type){
+  if(el.dispatchEvent && typeof Event === 'function') el.dispatchEvent(new Event(type));
+}
+function browseApply(btn, paths){
+  var field = browseField(btn);
+  if(!field || !paths || !paths.length) return 0;
+  var before = field.value;
+  if(btn.getAttribute('data-browse') === 'files'){
+    field.value = browseJoin(field.value, paths);
+  } else {
+    field.value = paths[0];
+  }
+  browseFire(field, 'input');
+  browseFire(field, 'change');
+  if(field.focus) field.focus();
+  return field.value === before ? 0 : 1;
+}
+function browseClick(btn){
+  var field = browseField(btn);
+  if(!field || field.disabled || field.readOnly || browseState.busy
+     || !browseState.mechanism) return Promise.resolve(null);
+  var kind = btn.getAttribute('data-browse');
+  var label = btn.textContent;
+  browseState.busy = true;
+  browseSync();
+  btn.textContent = 'Choosing…';
+  browseSay(btn, 'A dialog is open. If you do not see it, it may be behind this browser window.', 'info');
+  return fetch('/api/browse', {method:'POST', cache:'no-store',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({kind: kind, start: browseStartFrom(kind, field.value),
+                            title: btn.getAttribute('data-title') || ''})})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if(j && j.error){ browseSay(btn, j.error, 'bad'); }
+      else if(!j || j.cancelled || !j.paths || !j.paths.length){
+        browseSay(btn, 'Nothing was chosen; the field is unchanged.', 'info');
+      } else if(kind === 'files'){
+        var had = browseJoin(field.value, []).split(BROWSE_NL).filter(function(s){ return s; }).length;
+        browseApply(btn, j.paths);
+        var now = browseJoin(field.value, []).split(BROWSE_NL).filter(function(s){ return s; }).length;
+        var added = now - had, skipped = j.paths.length - added;
+        browseSay(btn, added + (added === 1 ? ' path added' : ' paths added')
+          + (skipped ? '; ' + skipped + ' already listed' : '') + '.', 'ok');
+      } else {
+        browseApply(btn, j.paths);
+        browseSay(btn, '', '');
+      }
+      return j;
+    })
+    .catch(function(){
+      browseSay(btn, 'The module did not answer the Browse request. Is it still running?', 'bad');
+      return null;
+    })
+    .then(function(j){
+      browseState.busy = false;
+      btn.textContent = label;
+      browseSync();
+      return j;
+    });
+}
+function browseInit(){
+  var buttons = browseButtons();
+  if(!buttons.length) return;
+  buttons.forEach(function(btn){
+    btn.addEventListener('click', function(){ browseClick(btn); });
+  });
+  if(typeof setInterval === 'function') setInterval(browseSync, 500);
+  browseSync();
+  fetch('/api/browse', {cache:'no-store'})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      browseState.mechanism = (j && j.mechanism) || null;
+      browseState.none = (j && j.none) || '';
+      browseSync();
+      if(!browseState.mechanism && browseState.none) browseSay(buttons[0], browseState.none, 'info');
+    })
+    .catch(function(){});
+}
+browseInit();
+/* /DC-BROWSE */
 
 (function(){
   const box = logEl(), btn = document.getElementById('logcopy');
@@ -2399,6 +2527,372 @@ def folder_error(label, path, optional=False):
 # ---- /DC-FOLDER ------------------------------------------------------------
 
 
+# ---- DC-BROWSE 1 ----------------------------------------------------------
+# A Browse... button beside every path field (1.0.4). The page asks this
+# module, and the module opens the operating system's own dialog on this
+# computer: osascript on macOS, PowerShell on Windows, tkinter otherwise.
+# On Windows the dialog is the shell's own file dialog (IFileOpenDialog,
+# which also picks folders), owned by an invisible always-on-top window
+# that is shown first: Windows will not bring a background process's
+# window to the front, but a dialog owned by a shown topmost window stays
+# above ordinary windows such as the browser.
+# The text field stays; the button only fills it. The start folder and the
+# title travel as arguments or environment variables, never inside the
+# dialog's script text. One dialog at a time per module. Duplicated
+# verbatim into every module with a path field (modules are standalone);
+# _verify_pages.py checks that the copies agree and drives each one with
+# the dialog faked.
+import base64 as _browse_b64
+import shutil as _browse_shutil
+import subprocess as _browse_subprocess
+
+BROWSE_KINDS = ("folder", "file", "files")
+BROWSE_TIMEOUT = 600          # seconds a dialog may stay open
+BROWSE_CANCELLED = 3          # exit status the PowerShell and tkinter scripts use
+BROWSE_NONE = ("No file dialog is available on this computer (osascript, "
+               "PowerShell and tkinter were each looked for). Type the path "
+               "into the field instead.")
+BROWSE_BUSY = ("A dialog is already open for this module. Choose or cancel "
+               "there first; it may be behind the browser window.")
+_BROWSE = {"mechanism": None}
+_BROWSE_LOCK = threading.Lock()
+_BROWSE_OPEN = threading.Lock()
+
+_BROWSE_OSA = """on run argv
+set startPath to item 1 of argv
+set promptText to item 2 of argv
+set mode to item 3 of argv
+activate
+try
+set loc to (POSIX file startPath) as alias
+on error
+set loc to path to home folder
+end try
+if mode is "folder" then
+return POSIX path of (choose folder with prompt promptText default location loc)
+else if mode is "file" then
+return POSIX path of (choose file with prompt promptText default location loc)
+else
+set picked to choose file with prompt promptText default location loc with multiple selections allowed
+set out to ""
+repeat with f in picked
+set out to out & (POSIX path of f) & linefeed
+end repeat
+return out
+end if
+end run
+"""
+
+_BROWSE_PS = """$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+# COMPILE-START
+Add-Type -Language CSharp -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class DcPicker {
+  [ComImport, Guid("DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7")]
+  class FileOpenDialogRCW {}
+  [ComImport, Guid("d57c7288-d4ad-4768-be02-9d969532d960"),
+   InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  interface IFileOpenDialog {
+    [PreserveSig] int Show(IntPtr owner);
+    void SetFileTypes(uint count, IntPtr types);
+    void SetFileTypeIndex(uint index);
+    void GetFileTypeIndex(out uint index);
+    void Advise(IntPtr events, out uint cookie);
+    void Unadvise(uint cookie);
+    void SetOptions(uint fos);
+    void GetOptions(out uint fos);
+    void SetDefaultFolder(IShellItem item);
+    void SetFolder(IShellItem item);
+    void GetFolder(out IShellItem item);
+    void GetCurrentSelection(out IShellItem item);
+    void SetFileName([MarshalAs(UnmanagedType.LPWStr)] string name);
+    void GetFileName([MarshalAs(UnmanagedType.LPWStr)] out string name);
+    void SetTitle([MarshalAs(UnmanagedType.LPWStr)] string title);
+    void SetOkButtonLabel([MarshalAs(UnmanagedType.LPWStr)] string text);
+    void SetFileNameLabel([MarshalAs(UnmanagedType.LPWStr)] string text);
+    void GetResult(out IShellItem item);
+    void AddPlace(IShellItem item, int place);
+    void SetDefaultExtension([MarshalAs(UnmanagedType.LPWStr)] string ext);
+    void Close(int hr);
+    void SetClientGuid(ref Guid guid);
+    void ClearClientData();
+    void SetFilter(IntPtr filter);
+    void GetResults(out IShellItemArray items);
+    void GetSelectedItems(out IShellItemArray items);
+  }
+  [ComImport, Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE"),
+   InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  interface IShellItem {
+    void BindToHandler(IntPtr pbc, ref Guid bhid, ref Guid riid, out IntPtr ppv);
+    void GetParent(out IShellItem item);
+    void GetDisplayName(uint sigdn, out IntPtr name);
+    void GetAttributes(uint mask, out uint attrs);
+    void Compare(IShellItem item, uint hint, out int order);
+  }
+  [ComImport, Guid("B63EA76D-1F85-456F-A19C-48159EFA858B"),
+   InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  interface IShellItemArray {
+    void BindToHandler(IntPtr pbc, ref Guid bhid, ref Guid riid, out IntPtr ppv);
+    void GetPropertyStore(int flags, ref Guid riid, out IntPtr ppv);
+    void GetPropertyDescriptionList(IntPtr key, ref Guid riid, out IntPtr ppv);
+    void GetAttributes(int flags, uint mask, out uint attrs);
+    void GetCount(out uint count);
+    void GetItemAt(uint index, out IShellItem item);
+    void EnumItems(out IntPtr items);
+  }
+  [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = false)]
+  static extern void SHCreateItemFromParsingName(string path, IntPtr pbc,
+      ref Guid riid, out IShellItem item);
+  const uint SIGDN_FILESYSPATH = 0x80058000;
+  const int CANCELLED = unchecked((int)0x800704C7);
+  static string PathOf(IShellItem item) {
+    IntPtr p;
+    item.GetDisplayName(SIGDN_FILESYSPATH, out p);
+    try { return Marshal.PtrToStringUni(p); } finally { Marshal.FreeCoTaskMem(p); }
+  }
+  public static string[] Pick(IntPtr owner, string kind, string start, string title) {
+    IFileOpenDialog d = (IFileOpenDialog)new FileOpenDialogRCW();
+    uint fos;
+    d.GetOptions(out fos);
+    fos |= 0x40 | 0x800;              /* file system only; the path must exist */
+    if (kind == "folder") fos |= 0x20; /* pick folders */
+    else fos |= 0x1000;                /* the file must exist */
+    if (kind == "files") fos |= 0x200; /* several at once */
+    d.SetOptions(fos);
+    if (!String.IsNullOrEmpty(title)) d.SetTitle(title);
+    if (!String.IsNullOrEmpty(start)) {
+      try {
+        Guid iid = new Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE");
+        IShellItem folder;
+        SHCreateItemFromParsingName(start, IntPtr.Zero, ref iid, out folder);
+        d.SetFolder(folder);
+      } catch (Exception) { }
+    }
+    int hr = d.Show(owner);
+    if (hr == CANCELLED) return null;
+    if (hr != 0) Marshal.ThrowExceptionForHR(hr);
+    if (kind == "files") {
+      IShellItemArray items;
+      d.GetResults(out items);
+      uint n;
+      items.GetCount(out n);
+      string[] paths = new string[n];
+      for (uint i = 0; i < n; i++) {
+        IShellItem item;
+        items.GetItemAt(i, out item);
+        paths[i] = PathOf(item);
+      }
+      return paths;
+    }
+    IShellItem one;
+    d.GetResult(out one);
+    return new string[] { PathOf(one) };
+  }
+}
+'@
+# COMPILE-END
+$owner = New-Object System.Windows.Forms.Form
+$owner.TopMost = $true
+$owner.ShowInTaskbar = $false
+$owner.FormBorderStyle = 'None'
+$owner.Opacity = 0
+$owner.StartPosition = 'CenterScreen'
+$owner.Size = New-Object System.Drawing.Size(1, 1)
+$owner.Show()
+$owner.Activate()
+try {
+  $got = [DcPicker]::Pick($owner.Handle, $env:DC_BROWSE_KIND,
+                          $env:DC_BROWSE_START, $env:DC_BROWSE_TITLE)
+} catch {
+  [Console]::Error.WriteLine($_.Exception.Message)
+  exit 1
+} finally {
+  $owner.Close()
+  $owner.Dispose()
+}
+if ($null -eq $got -or $got.Count -eq 0) { exit 3 }
+[Console]::Out.Write(($got -join [Environment]::NewLine))
+"""
+
+_BROWSE_TK = """import os, sys
+import tkinter
+from tkinter import filedialog
+root = tkinter.Tk()
+root.withdraw()
+root.attributes('-topmost', True)
+kind = os.environ.get('DC_BROWSE_KIND', 'folder')
+opts = dict(parent=root, title=os.environ.get('DC_BROWSE_TITLE', ''),
+            initialdir=os.environ.get('DC_BROWSE_START', ''))
+if kind == 'folder':
+    got = filedialog.askdirectory(mustexist=True, **opts)
+    got = [got] if got else []
+elif kind == 'file':
+    got = filedialog.askopenfilename(**opts)
+    got = [got] if got else []
+else:
+    got = list(filedialog.askopenfilenames(**opts))
+root.destroy()
+if not got:
+    sys.exit(3)
+sys.stdout.buffer.write(chr(10).join(got).encode('utf-8'))
+"""
+
+
+def browse_kind_error(kind):
+    """"" for a kind the dialogs know; otherwise a message (contract 11:
+    the one validator both endpoints use)."""
+    if kind in BROWSE_KINDS:
+        return ""
+    return "Unknown Browse request {!r}: expected one of {}.".format(
+        kind, ", ".join(BROWSE_KINDS))
+
+
+def start_folder(value):
+    """Where a dialog opens: the field's folder if it exists; for a file or
+    a path that does not exist yet, its nearest existing parent; otherwise
+    the home folder. A relative path is not guessed at."""
+    home = os.path.expanduser("~")
+    path = os.path.expanduser((value or "").strip())
+    if not path or not os.path.isabs(path):
+        return home
+    if os.path.isdir(path):
+        return path
+    cur = os.path.dirname(path)
+    while cur and not os.path.isdir(cur):
+        up = os.path.dirname(cur)
+        if up == cur:
+            break
+        cur = up
+    return cur if cur and os.path.isdir(cur) else home
+
+
+def _browse_tk_works():
+    try:
+        done = _browse_subprocess.run(
+            [sys.executable, "-c",
+             "import tkinter; r = tkinter.Tk(); r.withdraw(); r.destroy()"],
+            capture_output=True, timeout=20)
+    except (OSError, _browse_subprocess.SubprocessError):
+        return False
+    return done.returncode == 0
+
+
+def browse_mechanism():
+    """The dialog this computer can show: "osascript", "powershell",
+    "tkinter", or "" for none. Looked for once, on first use."""
+    with _BROWSE_LOCK:
+        if _BROWSE["mechanism"] is None:
+            if sys.platform == "darwin" and _browse_shutil.which("osascript"):
+                found = "osascript"
+            elif os.name == "nt" and (_browse_shutil.which("powershell")
+                                      or _browse_shutil.which("pwsh")):
+                found = "powershell"
+            elif _browse_tk_works():
+                found = "tkinter"
+            else:
+                found = ""
+            _BROWSE["mechanism"] = found
+        return _BROWSE["mechanism"]
+
+
+def browse_command(mechanism, kind, start, title):
+    """(argv, extra environment, stdin bytes) for one dialog. The start
+    folder and title are arguments or environment, never script text."""
+    env = {"DC_BROWSE_KIND": kind, "DC_BROWSE_START": start,
+           "DC_BROWSE_TITLE": title}
+    if mechanism == "osascript":
+        return (["osascript", "-", start, title, kind], {},
+                _BROWSE_OSA.encode("utf-8"))
+    if mechanism == "powershell":
+        exe = _browse_shutil.which("powershell") or _browse_shutil.which(
+            "pwsh") or "powershell"
+        code = _browse_b64.b64encode(_BROWSE_PS.encode("utf-16-le")).decode(
+            "ascii")
+        return ([exe, "-NoProfile", "-NonInteractive", "-STA",
+                 "-EncodedCommand", code], env, None)
+    return ([sys.executable, "-c", _BROWSE_TK], env, None)
+
+
+def _browse_clean(path, mechanism):
+    path = path.strip()
+    if mechanism == "osascript" and len(path) > 1 and path.endswith("/"):
+        path = path.rstrip("/") or "/"
+    return path
+
+
+def pick_paths(mechanism, kind, start, title):
+    """Open one dialog. {"paths": [...]}, {"cancelled": True}, or
+    {"error": message}. Cancel is not an error."""
+    argv, extra, stdin = browse_command(mechanism, kind, start, title)
+    env = dict(os.environ)
+    env.update(extra)
+    try:
+        done = _browse_subprocess.run(argv, input=stdin, capture_output=True,
+                                      timeout=BROWSE_TIMEOUT, env=env)
+    except _browse_subprocess.TimeoutExpired:
+        return {"error": "Nothing was chosen within {} minutes, so the "
+                         "dialog was closed. The field is unchanged."
+                         .format(BROWSE_TIMEOUT // 60)}
+    except OSError as e:
+        return {"error": "The {} dialog could not be started: {}"
+                         .format(mechanism, e)}
+    said = done.stderr.decode("utf-8", "replace").strip()
+    if done.returncode == BROWSE_CANCELLED or (
+            mechanism == "osascript" and "-128" in said):
+        return {"cancelled": True}
+    if done.returncode != 0:
+        last = said.splitlines()[-1] if said else "no message"
+        return {"error": "The {} dialog ended with status {}: {}".format(
+            mechanism, done.returncode, last[:300])}
+    out = done.stdout.decode("utf-8", "replace")
+    paths = [_browse_clean(p, mechanism) for p in out.splitlines()]
+    paths = [p for p in paths if p]
+    if not paths:
+        return {"cancelled": True}
+    if kind != "files":
+        paths = paths[:1]
+    return {"paths": paths}
+
+
+def browse_status():
+    """GET /api/browse: which dialog this computer offers ("" = none)."""
+    mech = browse_mechanism()
+    return {"mechanism": mech, "none": "" if mech else BROWSE_NONE}
+
+
+def browse_request(handler):
+    """POST /api/browse {kind, start, title}. Returns (payload, code)."""
+    try:
+        length = int(handler.headers.get("Content-Length", 0) or 0)
+        if length > 65536:
+            raise ValueError("request too large")
+        body = json.loads(handler.rfile.read(length).decode("utf-8") or "{}")
+        if not isinstance(body, dict):
+            raise ValueError("expected a JSON object")
+    except ValueError as e:
+        return {"error": "Unreadable Browse request: {}".format(e)}, 400
+    kind = body.get("kind")
+    why = browse_kind_error(kind)
+    if why:
+        return {"error": why}, 400
+    mech = browse_mechanism()
+    if not mech:
+        return {"error": BROWSE_NONE}, 409
+    if not _BROWSE_OPEN.acquire(blocking=False):
+        return {"error": BROWSE_BUSY}, 409
+    try:
+        title = str(body.get("title") or "Choose")[:200]
+        start = start_folder(str(body.get("start") or ""))
+        return pick_paths(mech, kind, start, title), 200
+    finally:
+        _BROWSE_OPEN.release()
+# ---- /DC-BROWSE ------------------------------------------------------------
+
+
 def request_allowed(handler) -> bool:
     """Reject requests that did not originate locally. The server binds to
     127.0.0.1, but a malicious web page could still POST here via DNS
@@ -2451,6 +2945,8 @@ def make_handler(session: dict, page: bytes):
         def do_GET(self):
             if not request_allowed(self):
                 return self._json({"error": "Forbidden (non-local request)."}, 403)
+            if self.path == "/api/browse":
+                return self._json(browse_status())
             if self.path == "/api/log":
                 return send_run_log(self)
             if self.path == "/api/state":
@@ -2488,6 +2984,9 @@ def make_handler(session: dict, page: bytes):
         def do_POST(self):
             if not request_allowed(self):
                 return self._json({"error": "Forbidden (non-local request)."}, 403)
+            if self.path == "/api/browse":
+                payload, code = browse_request(self)
+                return self._json(payload, code)
             if self.path == "/api/form":
                 payload, code = remember_form_request(self)
                 return self._json(payload, code)

@@ -83,6 +83,9 @@ Modules that download files or write reports ask for a folder. Since
 one, and the message names the field. Each page remembers what you chose,
 even after the suite restarts.
 
+- **Use Browse… to choose a folder**, or type its full path. Since 1.0.4
+  every folder field has a Browse… button that opens your computer's own
+  dialog; the dialog can take a second or two to appear.
 - **Create the folders first**, then enter their full paths, for example
   `C:\DC\downloads` and `C:\DC\reports` on Windows, or
   `/Users/you/DC/downloads` on macOS.
