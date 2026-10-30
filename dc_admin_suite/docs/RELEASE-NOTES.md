@@ -1,5 +1,178 @@
 # Release notes
 
+## 1.0.6 — 2026-10-30
+
+The OCR & Accessibility Toolkit's report now measures what it says. A
+PDF's **Tagged** column comes from a walk of its structure tree (Yes,
+Incomplete with the reason, Empty tree, or No), and **Alt Missing** counts
+the figures without alt text. If veraPDF is installed, each PDF is also
+checked against PDF/UA-1 and the failed rules are listed. Processing a
+scanned PDF no longer turns each page into a figure without alt text: the
+scan is marked as decoration and its OCR text is tagged. A PDF that is
+already tagged is never OCR'd, so its tags are kept. Both AI modules send a
+file to the AI endpoint only when the downloader's report marks it public,
+unless you turn on the override. Upgrading changes none of your settings.
+
+1.0.5 was not published separately: if you are upgrading from 1.0.4, this
+release also carries everything in its notes below.
+
+### What is in it
+
+| Module | Version |
+|---|---|
+| Structure URL Generator | 1.5.0 |
+| Hierarchy Mapping Tool | 1.5.0 |
+| Structure Regenerator | 1.6.0 |
+| Configuration Manager | 1.5.0 |
+| DOI & XML Generator | 1.10.0 |
+| Structure HTML Drafting Tool | 1.6.3 |
+| Batch Revise Manager | 1.6.0 |
+| Batch File Downloader | 1.40.0 |
+| OCR & Accessibility Toolkit | 1.13.0 |
+| Image Description Generator | 1.11.0 |
+| Shell (start page, settings, Main Menu) | 1.13.0 |
+
+### OCR & Accessibility Toolkit
+
+- **Tagged** reads Yes, Incomplete (untagged content, vector drawings
+  outside the tags, tags pointing at missing content, MarkInfo not set),
+  Empty tree, or No. Before, it only checked that a structure tree
+  existed.
+- **Auto-tag marks lines, rules, borders and fills as artifacts**
+  (decoration), and Next Steps says how many: a chart or diagram drawn in
+  lines needs a Figure with alt text instead.
+- **Alt Missing** counts figures without alt text in a tagged PDF, images
+  in an untagged one, and pictures in Word and PowerPoint files. A picture
+  marked decorative in Word or PowerPoint is not counted. A page scan is
+  not counted: it needs OCR, and the new **Page Scans** column counts it.
+- **Placeholder alt text counts as missing.** A label an auto-tagger or
+  exporter fills in ("image 18", "Figure 3", "Picture 3"), a file name, or
+  text with no letters says nothing to a screen-reader user. Alt Missing
+  counts it, Next Steps quotes one, and an AI draft replaces it in Word,
+  PowerPoint and tagged PDFs (the review step says how many). A PDF/UA
+  validator accepts it, because the rule asks only that alt text be there.
+- **Files other tools tagged** are read as a validator reads them: a tag
+  that opens inside a text object, and content marked inside a form, are
+  tagged.
+- **Alt text for PDFs that are already tagged.** With an AI endpoint and
+  AI alt text on, Process drafts alt text into the figures of a tagged PDF
+  that have none or only a placeholder; real alt text is never replaced.
+  Each figure is drawn from the page as a reader sees it. A figure the AI
+  judges decorative, and one that is only a line, is made an artifact
+  (decoration). A page drawn as a stack of thin slices is not sent; Next
+  Steps names it for a person. A figure showing the same image as another
+  shares its draft. The file is saved only if the tags check no worse
+  afterward; if not, nothing is saved and Next Steps says why.
+- **Alt-text drafts per file** is a field (default 25). When a file needs
+  more, the row says how many were not asked about; processing the output
+  again drafts the next ones.
+- **Tables without header cells** are named in Next Steps.
+- **Headings and tables are checked for what a validator cannot see.**
+  For every tagged PDF, a set of detectors names: no headings, few
+  headings for the length, a first heading below H1, a skipped level,
+  paragraphs styled as headings, a heading on a page of its own (check its
+  level and its parent heading), a first-page title tagged as ordinary
+  text, tables with no header cells or no data cells, one-row tables, one
+  table on the page tagged as several, and images drawn inside text. A
+  **Detector Findings** column counts them and a **Detectors** sheet lists
+  each with its page and element. They read the structure only and change
+  nothing: each finding is a question for a person.
+- **veraPDF** (optional, needs Java): each PDF is checked against
+  PDF/UA-1. **Checked By** says what checked the file and **Rule Failures**
+  lists the failed rules; the Summary explains each one.
+- **Tagging:** a page scan is marked as decoration and its OCR text is
+  tagged; an image the AI judges decorative is marked as decoration (in
+  Word and PowerPoint, the way Office marks it). The Auto-tag box now
+  decides whether a file is tagged.
+- **AI:** AI Pages Sent and AI Pages Transcribed are counted apart, and a
+  request that failed is no longer described as a model that stopped.
+  Stopping part-way through a file still reports that file.
+- **Images outside the tags** of a tagged file — a document behind a
+  tagged cover page — are counted in Alt Missing and named in Next Steps.
+- **Doc Title** reads Present, Placeholder (a title a tool filled in, such
+  as "Microsoft Word - …", or the file's own name) or Missing, and Set a
+  document title replaces a placeholder as well as a blank.
+- **The AI gate:** only files the downloader's report marks public (and
+  open, or with no access option) go to the AI endpoint, unless you check
+  **Also send hidden and restricted files**. A file the downloader named
+  but no report describes is held back. If the downloader saved its
+  reports to a folder of their own, choose it in **Reports folder, if saved
+  elsewhere**; the first session's report and each re-run session's are
+  both read. Other files from a plain folder are sent and marked
+  "visibility not known". The **AI Gate** column says what the gate decided
+  for each file the run could send, and the Summary counts the files whose
+  transcription or alt text it held back. Evaluate only sends nothing; its
+  Summary says how many files a processing run could not send.
+
+### Batch File Downloader
+
+- A downloaded file that another program holds open for a moment (on
+  Windows, often a virus scanner reading the new file) is waited for, for
+  up to about 15 seconds. If it is still held, that one file is recorded
+  as failed, so the next session asks for it again, and the run goes on.
+  Before, it ended the run.
+- A record whose only file is its native (it has no PDF of its own) now
+  gets a row for each planned file: the primary row says the native was
+  saved, and the native row names that same file. Before, both planned
+  rows came back in every later session and the native was downloaded
+  again each time.
+- A session of rows nobody has tried yet (a plan's sessions) says it is
+  downloading them and how many it downloaded; only a re-run of rows that
+  did not download says it recovered them. When more sessions remain, the
+  closing line says to copy the session's report into the job folder
+  first.
+- When several files in a row come over the network layer because Chrome
+  delivered nothing for them, the note says how many files Chrome has
+  delivered in the run. It suggests that downloads may be blocked in the
+  Chrome profile only when Chrome has delivered none.
+- The explanation of the gap before a file download says what was
+  measured: lockouts at a 0.3 second gap, and long sessions at 1 and
+  0.5 seconds with none. The default stays 5 seconds.
+- The Session limits section no longer says the repository caps downloads
+  per day. It does not: a long run is broken into sessions because each
+  one is watched, and the repository can ask whether a person is present.
+
+### Image Description Generator
+
+- The same AI gate, the same **Reports folder, if saved elsewhere** field,
+  an **AI Gate** column, and a count of the images held back. Preview
+  refuses an image the gate holds back.
+
+## 1.0.5 — not published separately
+
+The three modules that scope a run by parent structure — Structure
+Regenerator, Batch Revise Manager and Batch File Downloader — now list the
+parents you have checked, by name, under the count. Each has a
+**Remove** button, and **Clear all** unchecks every one. A page that
+reopens with parents already checked shows which ones, without a search for
+each. Upgrading changes none of your settings.
+
+### What is in it
+
+| Module | Version |
+|---|---|
+| Structure URL Generator | 1.5.0 |
+| Hierarchy Mapping Tool | 1.5.0 |
+| Structure Regenerator | 1.6.0 |
+| Configuration Manager | 1.5.0 |
+| DOI & XML Generator | 1.10.0 |
+| Structure HTML Drafting Tool | 1.6.3 |
+| Batch Revise Manager | 1.6.0 |
+| Batch File Downloader | 1.38.0 |
+| OCR & Accessibility Toolkit | 1.12.0 |
+| Image Description Generator | 1.10.0 |
+| Shell (start page, settings, Main Menu) | 1.13.0 |
+
+### Checked parents, by name
+
+- Under the count, each checked parent is listed by name with its own
+  **Remove** button. Removing one moves the keyboard focus to the next.
+- **Clear all** unchecks every parent and returns the focus to the filter.
+  It is unavailable when nothing is checked.
+- The count is announced to screen readers when it changes.
+- In the Batch File Downloader, which keeps its settings across a restart,
+  a cleared list is kept too.
+
 ## 1.0.4 — 2026-10-19
 
 Every field that asks for a folder or a file now has a **Browse…** button

@@ -641,10 +641,17 @@ def private_terms(repo=None):
 
 
 def private_term_hits(text: str, terms) -> list:
-    """The (pattern, why) pairs of `terms` found in text."""
+    """The (pattern, why) pairs of `terms` found in text.
+
+    A term is matched where no letter or digit touches it. `\\b` was used
+    until 1.0.6, and `\\b` counts the underscore as part of a word, so a
+    term inside a file name or identifier written with underscores
+    (`a_term_12_x`) passed the scan: a pattern written to allow `[_ ]`
+    between its words still failed at the underscore after its last one.
+    """
     flat = _normalized(_HTTP_HEADER.sub(" ", text))
     return [(pat, why) for pat, why in terms
-            if re.search(r"\b" + pat + r"\b", flat)]
+            if re.search(r"(?<![^\W_])(?:" + pat + r")(?![^\W_])", flat)]
 
 
 def _private_problems(folder: Path) -> list:

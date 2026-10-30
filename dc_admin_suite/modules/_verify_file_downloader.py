@@ -2064,13 +2064,14 @@ def _fake_report(folder, name, rows):
 
 def _row(order, article, kind, vis, version, status, url, adm,
          orig="", saved="", size="", ctype="", access="", release="",
-         embargo="", plan="", via=""):
+         embargo="", plan="", via="", vdate=""):
     # Built from REPORT_HEADERS rather than as a hand-counted literal. The
     # literal version silently became the wrong width the moment a column
     # was appended, and appending is documented as the safe change.
     row = {"Order": order, "Article ID": article, "Title": "A title",
            "Record State": "Posted", "File Kind": kind, "Visibility": vis,
-           "Version": version, "Version Date": "", "Original Filename": orig,
+           "Version": version, "Version Date": vdate,
+           "Original Filename": orig,
            "Saved Filename": saved, "Size": size, "Status": status,
            "File URL": url, "Public Record URL": "http://pub/" + article,
            "Admin Record URL": adm, "Time": "12:00:00",
@@ -4464,7 +4465,7 @@ def test_a_full_session_is_not_reported_as_an_interruption():
     that went wrong. Driven end to end through retry_worker.
 
     The distinction is the operator's next move: 'session complete' means
-    start the next one when the allowance refreshes; 'stopped early' means
+    start the next one when someone can watch it; 'stopped early' means
     find out what happened first.
     """
     import tempfile
@@ -4548,7 +4549,8 @@ def test_a_full_session_is_not_reported_as_an_interruption():
     check_true("session-full . never as 'stopped early'",
                "Stopped early" not in summary, summary)
     check_true("session-full . the log says what to do next",
-               any("allowance refreshes" in l for l in logs),
+               any("job folder" in l and "whenever you can watch" in l
+                   for l in logs),
                "\n".join(logs[-4:]))
     check_true("session-full . and it does not read as a server refusal",
                not any("refusing" in l for l in logs), "\n".join(logs[-4:]))
@@ -7509,6 +7511,15 @@ def test_the_modules_wording_names_no_vendor_and_no_agreement():
         # 1.0.2: a skip, not a pass, as the identity check above.
         skip("wording . private terms",
              "no profile declares any - NOTHING WAS CHECKED")
+    # 1.0.6: the scan's own boundary, driven. A term written inside a
+    # name with underscores must be found; one inside a longer word must
+    # not. The first escaped every public build until a reading caught it.
+    probe = [("alpha[_ ]beta", "probe")]
+    check("wording . a term inside an underscored name is found",
+          [bool(build.private_term_hits(t, probe)) for t in (
+              "x alpha_beta_12_y.mp4", "alpha beta", "(alpha_beta)",
+              "zalpha_beta", "alpha_betaz", "alpha_beta2")],
+          [True, True, True, False, False, False])
     check_true("wording . the source never says 'bepress'",
                re.search(r"\bbepress\b", lowered) is None, "")
     check_true("wording . and it does say what actually happens",
@@ -9965,14 +9976,273 @@ def test_one_file_that_cannot_be_saved_does_not_end_the_run():
                 if isinstance(n, ast.FunctionDef) and n.name ==
                 "download_worker")
     calls = [n for n in ast.walk(node) if isinstance(n, ast.Call)
-             and getattr(n.func, "id", "") == "place_file"]
+             and getattr(n.func, "id", "") == "save_fetched"]
     handlers = [h for h in ast.walk(node) if isinstance(h, ast.ExceptHandler)
                 and getattr(h.type, "id", "") == "SaveFailed"]
     check_true("save-failed . download_worker saves through the same "
-               "function and catches the same failure (structural: the "
-               "suite cannot drive that worker)",
+               "function and catches the same failure (structural; the "
+               "worker itself is driven in the held-open test)",
                len(calls) == 1 and len(handlers) == 1,
                "{} call(s), {} handler(s)".format(len(calls), len(handlers)))
+
+
+def test_a_file_held_open_waits_and_then_fails_alone():
+    """1.0.6. On Windows a new download can be held open for a moment by
+    another program (typically a virus scanner), and opening it then fails
+    with "Permission denied". The read that picks the extension sat
+    outside every per-file handler in BOTH workers, so one held file ended
+    the run. Now every touch of an arrived file waits and tries again, and
+    a file still refused fails alone."""
+    import ast
+    import tempfile
+    # 1. patiently(): retries a held file, nothing else.
+    slept = []
+    tries = {"n": 0}
+
+    def held_twice():
+        tries["n"] += 1
+        if tries["n"] <= 2:
+            raise PermissionError(13, "Permission denied")
+        return "read"
+    try:
+        third = M.patiently(held_twice, waits=(0.5, 1.0, 2.0),
+                            sleep=slept.append)
+    except PermissionError as e:
+        third = "raised " + repr(e)
+    check("held-open . a file held twice is read on the third try",
+          third, "read")
+    check("held-open . after two pauses, in order", slept, [0.5, 1.0])
+
+    slept = []
+
+    def disk_full():
+        raise OSError(28, "No space left on device")
+    try:
+        M.patiently(disk_full, waits=(0.5, 1.0), sleep=slept.append)
+        check_true("held-open . another error is not waited out", False,
+                   "returned")
+    except OSError as e:
+        check("held-open . another error is raised at once, unchanged",
+              (e.errno, slept), (28, []))
+
+    slept = []
+
+    def always_held():
+        raise PermissionError(13, "Permission denied")
+    try:
+        M.patiently(always_held, waits=(0.5, 1.0), sleep=slept.append)
+        check_true("held-open . a file never freed is not reported read",
+                   False, "returned")
+    except PermissionError:
+        check("held-open . a file never freed is raised after every "
+              "pause", slept, [0.5, 1.0])
+
+    # errno 0, so Python does not class it PermissionError on its own:
+    # only the winerror can say it is held.
+    sharing = OSError(0, "The process cannot access the file")
+    sharing.winerror = 32
+    check_true("held-open . Windows' sharing violation counts as held",
+               M.held_open(sharing), repr(sharing))
+    check_true("held-open . a missing file does not",
+               not M.held_open(FileNotFoundError(2, "gone")), "")
+
+    # 2. save_fetched(): a file on disk whose bytes cannot be read.
+    real_waits = M.LOCK_WAITS
+    real_head = M.Fetched.head
+    M.LOCK_WAITS = (0, 0)
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            inc = os.path.join(d, "_incoming")
+            os.makedirs(inc)
+            arrived = os.path.join(inc, "thesis.pdf")
+            with open(arrived, "wb") as fh:
+                fh.write(b"%PDF-1.7 held")
+            got = M.Fetched(path=arrived, name="thesis.pdf",
+                            ctype="application/pdf")
+
+            def held(self, n=4096):
+                raise PermissionError(13, "Permission denied: "
+                                      + str(self.path))
+            M.Fetched.head = held
+            try:
+                M.save_fetched(got, d, "etd", "1", "primary", "public",
+                               "current", "thesis.pdf")
+                check_true("held-open . save_fetched does not pretend a "
+                           "held file was saved", False, "returned")
+            except M.SaveFailed as e:
+                check_true("held-open . a held file is SaveFailed, saying "
+                           "what was refused",
+                           "could not be read where it arrived" in str(e)
+                           and "Permission denied" in str(e), str(e))
+            except OSError as e:
+                check_true("held-open . a held file is SaveFailed, not "
+                           "an error that ends the run", False, repr(e))
+            M.Fetched.head = real_head
+            real_save = M.Fetched.save_as
+            moves = []
+
+            def held_once(self, dest):
+                moves.append(dest)
+                if len(moves) == 1:
+                    raise PermissionError(13, "Permission denied")
+                return real_save(self, dest)
+            M.Fetched.save_as = held_once
+            path, nbytes = "", -1
+            try:
+                path, nbytes = M.save_fetched(got, d, "etd", "1", "primary",
+                                              "public", "current",
+                                              "thesis.pdf")
+            except M.SaveFailed as e:
+                moves.append("SaveFailed: {}".format(e))
+            finally:
+                M.Fetched.save_as = real_save
+            check("held-open . a move refused once is tried again, and "
+                  "succeeds", [str(m)[:11] for m in moves],
+                  [str(moves[0])[:11]] * 2)
+            check("held-open . once free, it is saved by name and size",
+                  (os.path.basename(path), nbytes),
+                  ("etd_1_primary_public_current_thesis.pdf", 13))
+    finally:
+        M.Fetched.head = real_head
+        M.LOCK_WAITS = real_waits
+
+    # 3. settle_saved(): the byte comparison is an optimization.
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "a.pdf")
+        with open(p, "wb") as fh:
+            fh.write(b"%PDF")
+        sv = M.SavedFiles()
+
+        def held_compare(*a, **k):
+            raise PermissionError(13, "Permission denied")
+        sv.same_bytes_as = held_compare
+        M.LOCK_WAITS = (0,)
+        try:
+            name, status = M.settle_saved(
+                sv, "etd", "1", {"kind": "primary", "version": "current",
+                                 "version_date": "", "visibility": "public"},
+                p)
+        except OSError as e:
+            name, status = "", "raised " + repr(e)
+        finally:
+            M.LOCK_WAITS = real_waits
+        check("held-open . a held file cannot be compared, and is kept",
+              (name, status, os.path.exists(p)), ("a.pdf", "Downloaded", True))
+
+    # 4. Through the real retry_worker: file 2 is held for good; it fails,
+    #    and the run goes on to file 3.
+    base = "https://dc.example.edu"
+    adm = base + "/cgi/editor.cgi?display=submission&article={}&context=etd"
+    rows = [_row(i, str(i), "primary", "public", "current", "Not attempted",
+                 base + "/cgi/viewcontent.cgi?article={}&context=etd".format(i),
+                 adm.format(i), access=M.ACCESS_OPEN) for i in (1, 2, 3)]
+
+    class _FakeDriver:
+        page_source = "<html><body>admin</body></html>"
+        current_url = base + "/"
+        title = "Digital Commons"
+
+        def get(self, url):
+            pass
+
+    keep = {k: getattr(M, k) for k in
+            ("_attach_or_fail", "cookie_header", "fetch_record_file",
+             "LISTING_SETTLE", "log", "LOCK_WAITS")}
+
+    def held_for_article_2(self, n=4096):
+        if self.data is not None and b"article=2&" in self.data:
+            raise PermissionError(13, "Permission denied")
+        return real_head(self, n)
+
+    with tempfile.TemporaryDirectory() as d:
+        path = _fake_report(d, "DC_FileDownload_Report_etd_S.xlsx", rows)
+        out = os.path.join(d, "out")
+        os.makedirs(out, exist_ok=True)
+        try:
+            M._attach_or_fail = lambda session: _FakeDriver()
+            M.cookie_header = lambda driver: "c=1"
+            M.LISTING_SETTLE = 0
+            M.LOCK_WAITS = (0, 0)
+            M.fetch_record_file = (
+                lambda url, cookie, native_url=None, **kw:
+                (b"%PDF-1.7 " + url.encode(), "f.pdf", "application/pdf",
+                 False))
+            M.Fetched.head = held_for_article_2
+            M.log = lambda msg: None
+            M.STOP_EVENT.clear()
+            M.retry_worker({"base_url": base, "settings": {}}, out, path,
+                           {"delay": 0, "page_delay": 0, "cooldowns": 0,
+                            "fetch_path": M.FETCH_NETWORK,
+                            "max_files": 0, "max_mb": 0,
+                            "reconcile": False}, report_dir=out)
+        finally:
+            for k, v in keep.items():
+                setattr(M, k, v)
+            M.Fetched.head = real_head
+        got = _rows_by_article(out)
+    check_true("held-open re-run . the held file is one failed row",
+               str(got.get("2", ("",))[0]).startswith(
+                   "Failed: could not be read where it arrived"),
+               repr(got.get("2")))
+    check("held-open re-run . the files either side were saved",
+          [str(got.get(a, ("",))[0]).startswith("Downloaded")
+           for a in ("1", "3")], [True, True])
+    with M.LOCK:
+        phase = M.STATE.get("phase")
+    check("held-open re-run . and the run finished", phase, "done")
+
+    # 5. Through the real download_worker (a fresh Start): the first file
+    #    is held for good, the rest of the record still comes down.
+    first = []
+
+    def answer(url, native_url):
+        f = M.Fetched(data=b"%PDF-1.7 " + url.encode(), name="t.pdf",
+                      ctype="application/pdf")
+        if not first:
+            first.append(f)
+        return f
+
+    def held_first(self, n=4096):
+        if first and self is first[0]:
+            raise PermissionError(13, "Permission denied")
+        return real_head(self, n)
+
+    M.Fetched.head = held_first
+    M.LOCK_WAITS = (0, 0)
+    try:
+        calls, start_rows, files, _l, _g = _start_one_record(
+            "<html></html>", answer, _ALL_NATIVES)
+    finally:
+        M.Fetched.head = real_head
+        M.LOCK_WAITS = keep["LOCK_WAITS"]
+    with M.LOCK:
+        phase = M.STATE.get("phase")
+    statuses = [str(r["Status"]) for r in start_rows]
+    check_true("held-open start . more than one file was asked for, so "
+               "'the run went on' can be seen", len(calls) >= 2, repr(calls))
+    check("held-open start . the held file is one failed row",
+          sum(1 for x in statuses
+              if x.startswith("Failed: could not be read where it arrived")),
+          1)
+    check("held-open start . every other file was saved",
+          sum(1 for x in statuses if x.startswith("Downloaded")),
+          len(calls) - 1)
+    check("held-open start . and the run finished", phase, "done")
+
+    # 6. Structure: neither worker touches the arrived file itself.
+    tree = ast.parse(inspect.getsource(M))
+    for wname in ("download_worker", "retry_worker"):
+        node = next(n for n in ast.walk(tree)
+                    if isinstance(n, ast.FunctionDef) and n.name == wname)
+        names = [getattr(n.func, "id", "") or getattr(n.func, "attr", "")
+                 for n in ast.walk(node) if isinstance(n, ast.Call)]
+        loads = [n.attr for n in ast.walk(node)
+                 if isinstance(n, ast.Attribute)
+                 and isinstance(n.ctx, ast.Load) and n.attr == "nbytes"]
+        check("held-open structure . {} saves only through save_fetched"
+              .format(wname),
+              (names.count("save_fetched"), names.count("place_file"),
+               names.count("head"), len(loads)), (1, 0, 0, 0))
 
 
 def test_the_preflight_downloads_a_file_twice_before_the_run():
@@ -10112,6 +10382,10 @@ def test_files_that_only_the_network_delivers_are_noticed():
             urllib.request.urlopen = real
             M.reset_rate_state()
         check("network-delivered . counted", f.network_deliveries, 4)
+        check_true("network-delivered . with nothing from Chrome yet, the "
+                   "blocked profile is offered",
+                   said and "may be blocked in this Chrome profile" in said[0]
+                   and "no file in this run" in said[0], str(said[:1]))
         check("network-delivered . said once, at three in a row",
               sum("in a row came over the network layer" in x
                   for x in said), 1)
@@ -10120,6 +10394,42 @@ def test_files_that_only_the_network_delivers_are_noticed():
         check_true("network-delivered . the total is reported at close",
                    any("4 file(s) came over the network layer" in n
                        for n in f.close()))
+
+
+def test_a_record_that_stalls_is_not_called_a_blocked_profile():
+    """1.0.6, from a long job: one record's revisions stalled in Chrome
+    and came over the network layer three in a row, in a run where Chrome
+    had delivered thousands of other files. The note said downloads may be
+    blocked in this Chrome profile — a diagnosis the run itself
+    contradicted. Driven: Chrome delivers one file, then three stall."""
+    import tempfile
+    url = "https://dc.example.edu/cgi/viewcontent.cgi?article=1&context=etd"
+    real = urllib.request.urlopen
+    with tempfile.TemporaryDirectory() as d:
+        f, _drv = _browser_fetcher(
+            os.path.join(d, "_i"),
+            [_Tab(drop=("a.pdf", b"%PDF-1.7 a")), _Tab(stall=True),
+             _Tab(stall=True), _Tab(stall=True)])
+        f.use_cookie("c=1")
+        said = []
+        f.say = said.append
+        try:
+            urllib.request.urlopen = _asking(_NetResp(
+                b"%PDF-1.7 net", {"Content-Type": "application/pdf"},
+                landed=url))
+            for _ in range(4):
+                M.reset_rate_state()
+                f.fetch(url)
+        finally:
+            urllib.request.urlopen = real
+            M.reset_rate_state()
+    check("stall-note . said once", len(said), 1)
+    check_true("stall-note . it says what was observed",
+               said and "3 files in a row" in said[0]
+               and "Chrome delivered 1 other file(s)" in said[0],
+               str(said))
+    check_true("stall-note . and does not call it a blocked profile",
+               said and "blocked" not in said[0], str(said))
 
 
 def test_a_refused_start_names_the_field_and_is_logged():
@@ -10947,7 +11257,8 @@ def _report_rows(run_dir):
     return rows
 
 
-def _rerun_one_record(pickvers_html, answer, plan_opts, ctx="ev", rows=None):
+def _rerun_one_record(pickvers_html, answer, plan_opts, ctx="ev", rows=None,
+                      outstanding=None):
     """Re-run one Not-attempted RECORD row through retry_worker.
 
     That is exactly what re-running the symposium _PARTIAL does:
@@ -10955,6 +11266,9 @@ def _rerun_one_record(pickvers_html, answer, plan_opts, ctx="ev", rows=None):
     files are fetched. `answer(url, native_url)` plays the server and
     returns a Fetched or raises; every call is recorded.
     Returns (calls, rows, saved filenames).
+    `outstanding` (1.0.6), a list: the session's report is put beside the
+    input, as an operator copies it into the job folder, and the list is
+    given what read_failed_rows() then says is still outstanding.
     """
     base = "https://dc.example.edu"
     adm = base + "/cgi/editor.cgi?window=abstract&article=1000&context=" + ctx
@@ -11004,6 +11318,12 @@ def _rerun_one_record(pickvers_html, answer, plan_opts, ctx="ev", rows=None):
                        and not n.startswith("DC_FileDownload_Log_"))
         logs = sorted(n for _r, _d, fs in os.walk(out) for n in fs
                       if n.startswith("DC_FileDownload_Log_"))
+        if outstanding is not None:
+            for r_, _d, fs in os.walk(out):
+                for n in fs:
+                    if n.startswith("DC_FileDownload_Retry_"):
+                        _shutil.copy(os.path.join(r_, n), os.path.join(d, n))
+            outstanding.extend(M.read_failed_rows(d)[0])
     return calls, got, files, logs
 
 
@@ -11144,6 +11464,16 @@ def _start_one_record(pickvers_html, answer, opts, ctx="ev",
     return calls, got, files, lines, logs
 
 
+def _cls(status):
+    """What a row's status says, in one word (1.0.6)."""
+    status = str(status or "")
+    if M.FALLBACK_NOTE in status:
+        return "fallback"
+    if status.startswith("Downloaded — already saved for this record"):
+        return "same-file"
+    return status
+
+
 _ALL_NATIVES = {"primary": True, "supp": False, "native": True,
                 "public": True, "hidden": True, "versions": "all",
                 "published": True, "unpublished": False}
@@ -11198,9 +11528,12 @@ def test_a_video_is_fetched_once_in_all_versions_mode():
         got = drive(html, answer, _ALL_NATIVES)
         calls, rows, files = got[0], got[1], got[2]
         done = [r for r in rows if r["Status"] == "Downloaded"]
-        current = [r for r in done if r["Version"] == "current"]
-        check("dup-video {} . one current copy in the report".format(who),
-              len(current), 1)
+        fb = [r for r in rows if _cls(r["Status"]) == "fallback"]
+        same = [r for r in rows if _cls(r["Status"]) == "same-file"]
+        check("dup-video {} . one current copy fetched: the primary's, "
+              "answered by the native".format(who),
+              [(r["File Kind"], r["Version"]) for r in fb],
+              [("primary", "current")])
         check("dup-video {} . one original copy in the report".format(who),
               len([r for r in done if r["Version"] == "original"]), 1)
         check("dup-video {} . two files on disk, not four".format(who),
@@ -11210,12 +11543,18 @@ def test_a_video_is_fetched_once_in_all_versions_mode():
                    ", ".join(files))
         check("dup-video {} . two requests: the primary and the "
               "original".format(who), len(calls), 2)
-        check_true("dup-video {} . the saved current copy is labelled "
-                   "native".format(who),
-                   current and current[0]["File Kind"] == "native",
-                   str(current[0]["File Kind"] if current else None))
+        check_true("dup-video {} . its file is named as the native it "
+                   "is".format(who),
+                   fb and "_native_" in fb[0]["Saved Filename"],
+                   str(fb[0]["Saved Filename"] if fb else None))
+        check("dup-video {} . the planned native has its own row, naming "
+              "that file, not fetched again".format(who),
+              [(r["File Kind"], r["Version"], r["Saved Filename"])
+               for r in same],
+              [("native", "current",
+                fb[0]["Saved Filename"] if fb else None)])
         check("dup-video {} . nothing else in the report".format(who),
-              len(rows), 2)
+              len(rows), 3)
         # And the run's whole log lands beside its reports, from BOTH
         # workers — the pair rule, for save_run_log.
         check("dup-video {} . the run's log is saved as a .txt".format(who),
@@ -11387,7 +11726,7 @@ def test_byte_identical_copies_are_kept_once():
             raise M.NoFileAvailable("no native")
         return M.Fetched(data=PDF, name="Program.pdf")
 
-    cases = (("video", video, video_answer, "ev", 2, 1),
+    cases = (("video", video, video_answer, "ev", 3, 1),
              ("pdf", pdf, pdf_answer, "jj", 2, 1))
     for who, drive in (("start", _start_one_record),
                        ("re-run", _rerun_one_record)):
@@ -11397,7 +11736,7 @@ def test_byte_identical_copies_are_kept_once():
             done = [r for r in rows
                     if str(r["Status"]).startswith("Downloaded")]
             tag = "identical {} {} . ".format(who, shape)
-            check(tag + "both identities keep a Downloaded row", len(done),
+            check(tag + "every identity keeps a Downloaded row", len(done),
                   n_rows)
             check(tag + "one copy on disk", len(files), n_files)
             twins = [r for r in done if "byte-identical to" in r["Status"]]
@@ -11495,16 +11834,84 @@ def test_a_rerun_stopped_mid_record_keeps_the_rest_of_the_record():
                                                       _ALL_NATIVES)
     finally:
         M.STOP_EVENT.clear()
-    got = sorted((r["File Kind"], r["Version"], r["Status"]) for r in rows)
+    got = sorted((r["File Kind"], r["Version"], _cls(r["Status"]))
+                 for r in rows)
     check("rerun-stop . the rest of the record is recorded, and only that",
-          got, sorted([("native", "current", "Downloaded"),
+          got, sorted([("primary", "current", "fallback"),
+                       ("native", "current", "same-file"),
                        ("native", "original", M.NOT_ATTEMPTED)]))
-    saved_row = [r for r in rows if r["Status"] == "Downloaded"]
-    check_true("rerun-stop . the fallback row points at the native it got",
-               saved_row and "type/native" in saved_row[0]["File URL"],
-               str(saved_row and saved_row[0]["File URL"]))
+    saved_row = [r for r in rows if _cls(r["Status"]) == "fallback"]
+    check_true("rerun-stop . the fallback row names the native file it got",
+               saved_row and "_native_" in saved_row[0]["Saved Filename"],
+               str(saved_row and saved_row[0]["Saved Filename"]))
     check("rerun-stop . no record row left beside the file rows",
           [r for r in rows if r["File Kind"] == M.RECORD_KIND], [])
+
+
+def test_a_fallback_record_leaves_nothing_outstanding_in_the_job():
+    """1.0.6, from a six-session job: a record with no derivative was
+    planned as a current primary and a current native (with the native's
+    revision date). Each session the primary fell back to the native, its
+    row was relabelled native with the primary's empty date, and the native
+    job was skipped with no row — so the merge matched neither planned
+    row, both came back every session, and the native was fetched again
+    every time. Driven: a plan session over those two rows, then the job
+    folder merged the way the next session would merge it."""
+    base = "https://dc.example.edu"
+    adm = base + "/cgi/editor.cgi?window=abstract&article=1000&context=etd"
+    prim = base + "/cgi/viewcontent.cgi?article=1000&context=etd&preview_mode=1"
+    nat = (base + "/context/etd/article/1000/type/native/viewcontent"
+           "?preview_mode=1")
+    plan = [
+        _row(1, "1000", "primary", "public", "current", M.INVENTORIED,
+             prim, adm),
+        _row(2, "1000", "native", "public", "current", M.INVENTORIED, nat,
+             adm, vdate="Tue Jul 30 15:28:00 2013"),
+    ]
+
+    def answer(url, native_url):
+        if native_url:
+            return M.Fetched(data=b"PK\x03\x04 a docx", name="t.docx",
+                             used_native=True)
+        if "type/native" in url:
+            return M.Fetched(data=b"PK\x03\x04 a docx", name="t.docx")
+        raise M.NoFileAvailable("No PDF has been provided")
+
+    left = []
+    calls, rows, files, _l = _rerun_one_record(
+        "", answer, _ALL_NATIVES, ctx="etd", rows=plan, outstanding=left)
+    check("fallback-job . one request: the primary, answered by the native",
+          len(calls), 1)
+    check("fallback-job . one file on disk", len(files), 1)
+    check("fallback-job . both planned rows have a row of their own",
+          sorted((r["File Kind"], _cls(r["Status"])) for r in rows),
+          [("native", "same-file"), ("primary", "fallback")])
+    check("fallback-job . and the job has nothing outstanding",
+          [(r["kind"], r["version"]) for r in left], [])
+    summary = str(M.STATE.get("summary", ""))
+    check_true("plan-words . a session of planned rows says it downloaded "
+               "them, not that it recovered them",
+               summary.startswith("downloaded 1 of 1 row(s)"), summary)
+
+
+def test_the_page_claims_no_download_quota():
+    """1.0.6: the Session limits section said Digital Commons caps how
+    much it hands over in a day. Measured, it does not: what stopped long
+    runs was a verification prompt, which a person in the browser answers.
+    The served page must not say otherwise, anywhere."""
+    page = M.build_page(M.load_session(Path("/nonexistent/session.json")))
+    page = page.decode("utf-8") if isinstance(page, bytes) else page
+    for claim in ("caps how much", "allowance refreshes", "day's allowance",
+                  "download cap", "capped allowance",
+                  "not what the server rations"):
+        check("no-quota . the page does not say '{}'".format(claim),
+              claim in page, False)
+    check_true("no-quota . the Session limits section says so plainly",
+               "There is no download quota." in page, "")
+    check("no-quota . nor does it state a download rate it cannot support",
+          "one every nine seconds" in page, False)
+    check_true("no-quota . the gap's explanation says what was measured",
+               "What was measured" in page and "0.5 second gap" in page, "")
 
 
 def test_a_stop_after_the_fallback_leaves_no_duplicate_row():
@@ -11532,7 +11939,8 @@ def test_a_stop_after_the_fallback_leaves_no_duplicate_row():
         return M.Fetched(data=b"\x00\x00\x00\x18ftypmp42-o",
                          name="talk.mp4")
 
-    want = sorted([("native", "current", "Downloaded"),
+    want = sorted([("primary", "current", "fallback"),
+                   ("native", "current", "same-file"),
                    ("native", "original", M.NOT_ATTEMPTED)])
     # Two ways to stop, and they leave different jobs unreached. (a) the
     # Stop arrives as the original is asked for: the natives job was
@@ -11542,9 +11950,10 @@ def test_a_stop_after_the_fallback_leaves_no_duplicate_row():
     # filter; (a) alone left a planted removal of it green.
     calls, rows, files, _lines, _logs = _start_one_record(
         html, answer, _ALL_NATIVES, stop_after=2)
-    check("stop-dup start (a) . rows: the saved native and the unreached "
-          "original", sorted((r["File Kind"], r["Version"], r["Status"])
-                             for r in rows), want)
+    check("stop-dup start (a) . rows: the primary answered by the native, "
+          "the planned native naming it, and the unreached original",
+          sorted((r["File Kind"], r["Version"], _cls(r["Status"]))
+                 for r in rows), want)
     check("stop-dup start (a) . one file on disk", len(files), 1)
 
     def answer_then_stop(url, native_url):
@@ -11555,10 +11964,10 @@ def test_a_stop_after_the_fallback_leaves_no_duplicate_row():
         html, answer_then_stop, _ALL_NATIVES)
     M.STOP_EVENT.clear()
     check("stop-dup start (b) . one request before the stop", len(calls), 1)
-    check("stop-dup start (b) . rows: the saved native and the unreached "
-          "original — not the natives job",
-          sorted((r["File Kind"], r["Version"], r["Status"]) for r in rows),
-          want)
+    check("stop-dup start (b) . the same rows when the stop comes while the "
+          "primary arrives — the natives job named, not left to fetch",
+          sorted((r["File Kind"], r["Version"], _cls(r["Status"]))
+                 for r in rows), want)
 
 
 def test_a_stop_between_fallback_and_native_leaves_no_duplicate_to_rerun():
@@ -11585,10 +11994,12 @@ def test_a_stop_between_fallback_and_native_leaves_no_duplicate_to_rerun():
     rows = M.unreached_job_rows(
         jobs, 0, 5, item, "Posted", "pub", "adm",
         already=lambda job: saved.already("ev", "1000", job))
-    check("stop-dup . only the file not yet saved is left to re-run",
-          [r[4] for r in rows], ["supp1"])
-    check("stop-dup . its order follows on without a gap",
-          [r[0] for r in rows], [6])
+    check("stop-dup . only the file not yet saved is left to re-run; the "
+          "saved one has a row naming it",
+          [(r[4], _cls(r[11]), r[9]) for r in rows],
+          [("native", "same-file", "X.mp4"), ("supp1", M.NOT_ATTEMPTED, "")])
+    check("stop-dup . their order follows on without a gap",
+          [r[0] for r in rows], [6, 7])
     check("stop-dup . the summary says what was skipped, once asked",
           M.SavedFiles().summary(), "")
 
@@ -12574,6 +12985,8 @@ def main():
                test_an_inventory_run_is_driven_to_its_plan,
                test_every_success_count_asks_how_the_status_begins,
                test_a_stop_between_fallback_and_native_leaves_no_duplicate_to_rerun,
+               test_a_fallback_record_leaves_nothing_outstanding_in_the_job,
+               test_the_page_claims_no_download_quota,
                test_a_stop_after_the_fallback_leaves_no_duplicate_row,
                test_a_rerun_stopped_mid_record_keeps_the_rest_of_the_record,
                test_a_rerun_takes_a_records_primary_before_its_native,
@@ -12622,8 +13035,10 @@ def main():
                test_a_large_download_is_waited_for_by_its_progress,
                test_a_body_the_network_fetches_is_streamed_to_disk,
                test_one_file_that_cannot_be_saved_does_not_end_the_run,
+               test_a_file_held_open_waits_and_then_fails_alone,
                test_the_preflight_downloads_a_file_twice_before_the_run,
                test_files_that_only_the_network_delivers_are_noticed,
+               test_a_record_that_stalls_is_not_called_a_blocked_profile,
                test_a_refused_start_names_the_field_and_is_logged,
                test_the_download_statement_comes_from_the_profile,
                test_the_worker_gives_the_browser_fetcher_its_cookie,

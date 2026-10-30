@@ -97,7 +97,7 @@ MANIFEST = {
     "id": "file-downloader",
     "name": "Batch File Downloader",
     "description": "Download primary, native, supplemental, hidden, and versioned files for selected structures, with per-structure reports.",
-    "version": "1.37.0",
+    "version": "1.40.0",
     "requires": ["selenium", "beautifulsoup4", "openpyxl"],
 }
 
@@ -138,13 +138,18 @@ LISTING_SETTLE = 1.5
 # after 26-36 records on four separate attempts against the same structure;
 # at 5.0s it fetched all 40 rows with no pushback at all, 78 downloads in
 # 687 seconds - one every 8.8s, which sits inside the 8.3-11.5s ceiling
-# independently inferred from the four failures. The lockout is a rate
-# limit, so the burst was the cause and not the volume.
+# inferred at the time from the four failures.
 #
-# 5.0s is therefore the shipped default: an eleven-minute run that finishes
-# beats a two-minute run that stalls for ten, and a staff member should
-# never meet a lockout they have no way to understand. Anyone in a hurry
-# lowers the field on the page for that run.
+# 1.0.6: that ceiling did not hold later. Through Chrome, with someone
+# watching, sessions at a 1.0s gap (~5,000 file requests) and at 0.5s
+# (~7,800, over two sessions) met no lockout and no verification prompt.
+# What the server counts is not known, so the page says what was measured
+# and nothing more.
+#
+# 5.0s stays the shipped default: a staff member should never meet a
+# lockout they have no way to understand. Anyone watching a run may lower
+# the field on the page for that run, and sets it back to 5 at the first
+# lockout or prompt.
 REQUEST_DELAY = 5.0                # default; the run may set its own
 # Admin pages are paced separately from downloads, because Digital Commons
 # counts downloads and does not appear to count admin pages.
@@ -1504,6 +1509,63 @@ class SaveFailed(Exception):
     """
 
 
+# 1.0.6. A file that has just arrived can be held open for a moment by
+# another program - on Windows, typically a virus scanner reading a new
+# download - and opening, measuring or moving it then fails with
+# "Permission denied". That is a wait, not a file that cannot be written.
+# So every touch of a just-arrived file is tried again after a short
+# pause, and only a file still refused after the last pause fails - as
+# ONE file (SaveFailed). Before this, the read that picks a file's
+# extension sat outside every per-file handler, and one held file ended
+# the whole run.
+LOCK_WAITS = (0.5, 1.0, 2.0, 4.0, 8.0)   # seconds between tries; ~15 s
+
+
+def held_open(exc):
+    """True when `exc` says another program has the file open."""
+    if isinstance(exc, PermissionError):
+        return True
+    # Windows' sharing and lock violations, however Python classed them.
+    return getattr(exc, "winerror", None) in (32, 33)
+
+
+def patiently(action, waits=None, sleep=None):
+    """Run `action()`; while it is refused because the file is held open,
+    pause and try again. Any other error, or the last refusal, is raised
+    as it was."""
+    waits = LOCK_WAITS if waits is None else waits
+    sleep = sleep or time.sleep
+    for pause in tuple(waits) + (None,):
+        try:
+            return action()
+        except OSError as e:
+            if pause is None or not held_open(e):
+                raise
+            sleep(pause)
+
+
+def save_fetched(got, folder, ctx, article, kind, visibility, version,
+                 orig):
+    """Name a fetched file and put it in place. Returns (path, bytes).
+
+    1.0.6: ONE function both workers call, so a rule about the arrived
+    file cannot reach one worker and not the other. Every touch of the
+    arrived file - its size, its leading bytes, the move - waits out a
+    file held open; whatever still fails is SaveFailed, which each worker
+    records as one failed file before going on to the next.
+    """
+    try:
+        nbytes = patiently(lambda: got.nbytes)
+        head = patiently(got.head)
+    except OSError as e:
+        raise SaveFailed("could not be read where it arrived ({}): {}"
+                         .format(getattr(got, "path", "") or "in memory",
+                                 describe_error(e)))
+    fname = build_filename(ctx, article, kind, visibility, version, orig,
+                           got.ctype, head)
+    return place_file(got, folder, fname), nbytes
+
+
 def is_downloaded(status):
     """A row whose file is on disk. 1.0.2: a status may continue past the
     word ("Downloaded — byte-identical to ..."), so this asks how it
@@ -1523,7 +1585,12 @@ def settle_saved(saved, ctx, article, job, path):
     disk, never data.
     """
     name = os.path.basename(path)
-    twin = saved.same_bytes_as(ctx, article, path)
+    try:
+        twin = patiently(lambda: saved.same_bytes_as(ctx, article, path))
+    except OSError:
+        # 1.0.6. The comparison is an optimization: a file that cannot be
+        # read for it is kept, and so is the other copy.
+        twin = ""
     if twin:
         kept = os.path.basename(twin)
         try:
@@ -1553,7 +1620,7 @@ def place_file(got, folder, fname):
     """
     path = unique_path(folder, fname)
     try:
-        return got.save_as(path)
+        return patiently(lambda: got.save_as(path))
     except OSError as e:
         leftover = getattr(got, "path", "")
         if leftover and os.path.exists(leftover):
@@ -2669,8 +2736,8 @@ def suggest_session_size(n_files, limits=None, avg_mb=0.0):
     SessionBudget enforces it during the run either way.
 
     Returns (size, sessions, basis). size 0 means no limit binds: one
-    session takes everything, which is what a structure smaller than an
-    allowance wants.
+    session takes everything, which is what a job done in one sitting
+    wants.
     """
     vals = limit_values(limits or session_limits())
     max_files = vals.get("max_files") or 0
@@ -2980,8 +3047,8 @@ class SessionFull(StopRequested):
     as one that was interrupted.
 
     The distinction from ServerRefusing matters to whoever reads the log:
-    this one means the plan worked and the next session can start when the
-    allowance refreshes. ServerRefusing means the plan was too big.
+    this one means the plan worked and the next session can start whenever
+    someone can watch it. ServerRefusing means the server is refusing.
     """
 
 
@@ -4337,6 +4404,7 @@ class BrowserFetcher:
         self.status_asks = 0
         self.network_deliveries = 0
         self._network_in_a_row = 0
+        self.chrome_deliveries = 0
         self._asked_first = ""
         self._asked_first_challenged = False
         self.restore_page_timeout = BROWSER_PAGE_TIMEOUT_DEFAULT
@@ -4687,23 +4755,26 @@ class BrowserFetcher:
 
         v1.34, item D. Since v1.33.9 a file Chrome never delivered can
         still arrive, over the network layer's second opinion. That is
-        correct, and it is also the only sign that downloads from this
-        site are blocked in this Chrome profile — per-site permissions
-        are something the localhost preflight cannot see. Without a
-        count the run would quietly become a network-layer run at about
-        25 seconds a file, and nothing would say so.
+        correct, and when Chrome has delivered nothing at all it is the
+        only sign that downloads from this site are blocked in this
+        Chrome profile — per-site permissions are something the localhost
+        preflight cannot see. Without a count the run would quietly become
+        a network-layer run, and nothing would say so.
+
+        1.0.6: the note says what was observed, and offers the blocked
+        profile only when it fits — when Chrome has delivered no file in
+        this run. Stalls that belong to one record's files, in a run where
+        Chrome delivered thousands, are not a blocked profile.
         """
         if getattr(got, "via_network", False):
             self.network_deliveries += 1
             self._network_in_a_row += 1
             if self._network_in_a_row == NETWORK_IN_A_ROW_NOTE and self.say:
-                self.say(
-                    "{} files in a row came over the network layer after "
-                    "Chrome delivered nothing. Downloads from this site may "
-                    "be blocked in this Chrome profile; the run goes on, "
-                    "more slowly.".format(NETWORK_IN_A_ROW_NOTE))
+                self.say(network_run_note(NETWORK_IN_A_ROW_NOTE,
+                                          self.chrome_deliveries))
         else:
             self._network_in_a_row = 0
+            self.chrome_deliveries += 1
         return got
 
     def _await(self, url, rendered=False, prompt=None, before=None,
@@ -5093,6 +5164,21 @@ def _is_page_load_timeout(exc) -> bool:
 # request, no verification prompt, nothing for anyone to approve.
 # ---------------------------------------------------------------------------
 NETWORK_IN_A_ROW_NOTE = 3      # item D: say so after this many in a row
+
+
+def network_run_note(in_a_row, chrome_delivered):
+    """What a run of network-layer deliveries is, in the observed counts.
+    A blocked Chrome profile is offered only when Chrome has delivered no
+    file in this run, the one case that observation supports (1.0.6)."""
+    if chrome_delivered:
+        return ("{} files in a row came over the network layer after Chrome "
+                "delivered nothing for them; Chrome delivered {} other "
+                "file(s) in this run. The run goes on.".format(
+                    in_a_row, chrome_delivered))
+    return ("{} files in a row came over the network layer after Chrome "
+            "delivered nothing, and Chrome has delivered no file in this "
+            "run: downloads from this site may be blocked in this Chrome "
+            "profile. The run goes on, more slowly.".format(in_a_row))
 PREFLIGHT_PATH = "/__dc_preflight__/"
 PREFLIGHT_BYTES = b"DC Admin Suite download check. Safe to delete.\n"
 PREFLIGHT_START_WITHIN = 10.0
@@ -6250,6 +6336,44 @@ def file_identity(job):
             "" if current else str(job.get("version_date", "")))
 
 
+# 1.0.6. A primary whose record has no derivative is answered by the native,
+# and the planner had already planned that native as a job of its own. Both
+# are planned files, and a merge settles a planned file only by a row with
+# its own identity. So the fallback keeps the PRIMARY's row (the file is
+# still named for what it is, a native), and the native job, found already
+# saved, gets a row of its own that names the file - instead of no row,
+# which left both planned rows outstanding for every later session.
+FALLBACK_NOTE = "the record has no derivative; its native file was saved"
+SAME_FILE_STATUS = ("Downloaded — already saved for this record as {}, so "
+                    "not fetched again")
+
+
+def fallback_status(saved_status):
+    """The status of a primary row answered by its native."""
+    if is_downloaded(saved_status) and "—" not in saved_status:
+        return "Downloaded — " + FALLBACK_NOTE
+    return saved_status
+
+
+def native_of(job):
+    """The native identity a fallen-back primary job also saved."""
+    return dict(job, kind="native", url=job.get("native_url")
+                or job.get("url", ""))
+
+
+def same_file_row(order, article, title, state, job, name, pub, adm,
+                  when=None):
+    """The row for a planned file this run had already saved for the
+    record, under another planned identity. Its status begins "Downloaded",
+    so every merge settles it; nothing was requested for it."""
+    return (order, article, title, state, job.get("kind", ""),
+            job.get("visibility", ""), job.get("version", ""),
+            job.get("version_date", ""), job.get("orig_hint", ""), name, "",
+            SAME_FILE_STATUS.format(name), job.get("url", ""), pub, adm,
+            when or time.strftime("%H:%M:%S"), "", job.get("access", ""),
+            job.get("release", ""), job.get("embargo", ""), "", "")
+
+
 def dedupe_jobs(jobs):
     """Drop jobs that would fetch the same FILE twice within one record.
 
@@ -6398,8 +6522,8 @@ def download_worker(session, out_dir, scope_mode, parents_sel, opts,
     tot_unconfirmed = 0
     tot_403 = 0
     tot_inventory = 0
-    # The session's allowance, spent across every structure in the run —
-    # the server rations the account, not the structure. Plan-time sizing
+    # The session's limits, spent across every structure in the run - a
+    # sitting is one sitting, whatever it covers. Plan-time sizing
     # is an estimate because no row knows its size before it is fetched;
     # this counts what actually arrives.
     budget = SessionBudget(int(opts.get("max_files", 0) or 0),
@@ -6866,19 +6990,24 @@ def download_worker(session, out_dir, scope_mode, parents_sel, opts,
                     # the plan said as one that was cut short.
                     if budget.exhausted():
                         raise SessionFull(budget.reason())
-                    if saved.already(ctx, art, job):
+                    _have = saved.already(ctx, art, job)
+                    if _have:
                         # The same file is already on disk for this
-                        # record, saved by an earlier job. No request, no
-                        # second copy, no row: the row that saved it is
-                        # the record. See SavedFiles.
+                        # record, saved by an earlier job. No request and
+                        # no second copy - but a row of its own, so a merge
+                        # settles this planned file too (1.0.6).
                         saved.skip()
+                        order += 1
+                        report_rows.append(same_file_row(
+                            order, art, item["title"], state_txt, job,
+                            _have, pub_url, adm_url))
                         continue
                     order += 1
                     if opts.get("inventory"):
                         # No request at all — not even a throttled one.
                         # Everything in this row came from admin pages the
-                        # planner already fetched, and admin pages are not
-                        # what the server is rationing.
+                        # planner already fetched; nothing is asked of
+                        # the file host.
                         n_inventory += 1
                         report_rows.append(
                             (order, art, item["title"], state_txt,
@@ -6982,11 +7111,12 @@ def download_worker(session, out_dir, scope_mode, parents_sel, opts,
                         continue
 
                     # The derivative was absent and the native answered
-                    # instead — relabel so the report names what was saved,
-                    # and point the File URL link at what was actually got.
-                    if got.used_native and job["kind"] == "primary":
-                        job["kind"] = "native"
-                        job["url"] = job["native_url"]
+                    # instead. The row stays the PRIMARY's, so the planned
+                    # primary is settled by it; the file is named as the
+                    # native it is, and the status says so (1.0.6).
+                    fell_back = bool(got.used_native
+                                     and job["kind"] == "primary")
+                    save_kind = "native" if fell_back else job["kind"]
 
                     # No extension on the fallback name — build_filename
                     # derives one from the bytes, then the Content-Type
@@ -6995,12 +7125,10 @@ def download_worker(session, out_dir, scope_mode, parents_sel, opts,
                     # is already on disk and may be a 200 MB thesis.
                     orig = got.name or job["orig_hint"] \
                         or "article-{}".format(art)
-                    nbytes = got.nbytes
-                    fname = build_filename(ctx, art, job["kind"],
-                                           job["visibility"], job["version"],
-                                           orig, got.ctype, got.head())
                     try:
-                        path = place_file(got, ctx_dir, fname)
+                        path, nbytes = save_fetched(
+                            got, ctx_dir, ctx, art, save_kind,
+                            job["visibility"], job["version"], orig)
                     except SaveFailed as e:
                         # One file, not the run. See SaveFailed.
                         warn("item {} {}: {}".format(art, job["kind"], e))
@@ -7016,6 +7144,9 @@ def download_worker(session, out_dir, scope_mode, parents_sel, opts,
                     n_files += 1
                     saved_name, saved_status = settle_saved(
                         saved, ctx, art, job, path)
+                    if fell_back:
+                        saved.saved(ctx, art, native_of(job), saved_name)
+                        saved_status = fallback_status(saved_status)
                     # The server handed over content, so whatever run of
                     # refusals was building, it is over.
                     watch.served()
@@ -7311,7 +7442,8 @@ def download_worker(session, out_dir, scope_mode, parents_sel, opts,
             # a run in which nothing went wrong.
             log("Session complete — {}. The remaining records are recorded "
                 "and resumable; start the next session from this run's "
-                "folder when the allowance refreshes.".format(_stop))
+                "folder whenever you can watch the Chrome window."
+                .format(_stop))
         else:
             log("Stop requested — {}.".format(
                 structures_done_text(master, total)))
@@ -7581,8 +7713,8 @@ class BlockWatch:
 # fetched. Distinct from a failure (nothing went wrong), from an absence
 # (the file is there), and from "not attempted" (the record was reached and
 # fully planned). It re-runs like any other unfetched row, which is the
-# point: inventory the whole collection cheaply, then spend each day's
-# download budget on the rows you choose.
+# point: inventory the whole collection cheaply, then download the rows
+# you choose, a session at a time.
 INVENTORIED = "Inventoried"
 
 ABSENT_OTHER = "No file"
@@ -7681,14 +7813,20 @@ def unreached_job_rows(jobs, start, order_from, item, state_txt,
     without Chrome.
 
     `already(job)` (v1.34.2) names a job whose file this run has already
-    saved for the record — SavedFiles.already — and such a job gets no
-    row: written as not attempted, a re-run would fetch the duplicate the
-    run itself declined to.
+    saved for the record — SavedFiles.already. Written as not attempted, a
+    re-run would fetch the duplicate the run itself declined to; with no
+    row at all (before 1.0.6), the planned file stayed outstanding in every
+    merge. It gets a row that names the saved file.
     """
     stamp = when or time.strftime("%H:%M:%S")
     rows = []
     for job in jobs[start:]:
-        if already is not None and already(job):
+        have = already(job) if already is not None else ""
+        if have:
+            rows.append(same_file_row(
+                order_from + len(rows) + 1, item["article"],
+                item.get("title", ""), state_txt, job, have, pub_url,
+                adm_url, stamp))
             continue
         rows.append((
             order_from + len(rows) + 1, item["article"], item.get("title", ""),
@@ -7714,15 +7852,14 @@ def unreached_job_rows(jobs, start, order_from, item, state_txt,
 # ---------------------------------------------------------------------------
 # Merging several sessions' reports.
 #
-# A long job is worked in sessions because Digital Commons caps how many
-# files it will hand over per day. Each session writes its own report, so
-# after four nights a run folder holds four of them and the question "what
-# is still outstanding?" is answered by all four together, not by any one.
+# A long job is worked in sessions, each one watched while it runs. Each
+# session writes its own report, so after four sittings a job folder holds
+# four of them and the question "what is still outstanding?" is answered by
+# all four together, not by any one.
 #
-# Without this, session 4 re-requests what session 3 downloaded — and on a
-# capped allowance that is not merely wasteful, it is the whole day's
-# budget spent on files already on disk. It is also invisible: every one of
-# those requests succeeds.
+# Without this, session 4 re-requests what session 3 downloaded - hours of
+# a watched sitting spent on files already on disk. It is also invisible:
+# every one of those requests succeeds.
 #
 # Two kinds of row, and they supersede each other differently:
 #
@@ -7802,8 +7939,8 @@ def session_slice(rows, cap, max_mb=0, avg_mb=0.0):
     `cap` is the file limit; `max_mb` with `avg_mb` is the volume limit,
     and the two are applied together with the smaller winning. Either at
     or below 0 means "do not limit on this", and both off takes everything,
-    which is what a structure smaller than an allowance wants and what
-    every run did before sessions existed.
+    which is what a job done in one sitting wants and what every run did
+    before sessions existed.
 
     The volume limit here is an ESTIMATE — no row knows its size until it
     is fetched. SessionBudget is what enforces it against real bytes.
@@ -7833,8 +7970,8 @@ def session_slice(rows, cap, max_mb=0, avg_mb=0.0):
 #
 # One x_showall request per structure at session start answers all of it at
 # once: every removal, every state change and every release-option change.
-# That is an ADMIN page, which is not what the server rations, so it costs
-# about a second and nothing from the download allowance.
+# That is an ADMIN page, never met with a prompt or a lockout, so it costs
+# about a second.
 #
 # Records ADDED since the plan are counted and reported, and that is all.
 # The operator was explicit that a snapshot missing new records is the correct
@@ -8343,7 +8480,12 @@ def inflight_retry_rows(inflight, written, order_from, already=None,
         art = str(job.get("article", ""))
         if (art, str(job.get("kind", "")), str(job.get("url", ""))) in done:
             continue
-        if already is not None and already(job):
+        have = already(job) if already is not None else ""
+        if have:
+            out.append(same_file_row(
+                order_from + len(out) + 1, job.get("article", ""),
+                job.get("title", ""), job.get("record_state", ""), job,
+                have, job.get("pub", ""), job.get("adm", ""), stamp))
             continue
         out.append((
             order_from + len(out) + 1, job.get("article", ""),
@@ -8443,7 +8585,7 @@ def retry_worker(session, out_dir, report_path, opts, report_dir=""):
     # The file cap only. The megabyte cap is enforced against real bytes
     # by SessionBudget during the run, which is exact; estimating it here
     # too could only make this slice too SMALL, and a slice that is too
-    # small wastes an allowance. Taking too many rows costs nothing — the
+    # small wastes a sitting. Taking too many rows costs nothing — the
     # budget ends the session and the rest stay outstanding.
     rows, remaining = session_slice(rows, int(opts.get("max_files", 0) or 0))
 
@@ -8452,6 +8594,12 @@ def retry_worker(session, out_dir, report_path, opts, report_dir=""):
     run_dir, report_run_dir, split_reports = report_destinations(
         out_dir, report_dir, stamp)
     total = len(rows)
+    # 1.0.6: a session whose rows nobody has attempted yet - a plan's
+    # sessions - downloads; only a session of rows that were tried and did
+    # not download re-runs and recovers. The words follow the rows.
+    untried = bool(rows) and all(
+        r.get("was") in (INVENTORIED, NOT_ATTEMPTED) for r in rows)
+    got_word = "downloaded" if untried else "recovered"
     # A cell, because expand() grows it as records become files.
     nonlocal_total = [total]
     by_ctx = {}
@@ -8497,8 +8645,9 @@ def retry_worker(session, out_dir, report_path, opts, report_dir=""):
         else:
             log("Session of {} row(s) — all that is outstanding in this "
                 "plan.".format(len(rows)))
-        log("Re-running {} row(s) across {} structure(s) from {}"
-            .format(total, len(by_ctx), report_path))
+        log("{} {} row(s) across {} structure(s) from {}"
+            .format("Downloading planned" if untried else "Re-running",
+                    total, len(by_ctx), report_path))
         if n_replan:
             log("{} of those are records the interrupted run never reached; "
                 "their files will be planned again from the record.".format(
@@ -8546,9 +8695,9 @@ def retry_worker(session, out_dir, report_path, opts, report_dir=""):
         cookie = cookie_header(driver)
         fetcher.use_cookie(cookie)
 
-        # The session's allowance, spent across every structure in the
-        # re-run. Same object download_worker holds: the server rations the
-        # account, so a limit that lived in one worker would be no limit.
+        # The session's limits, spent across every structure in the
+        # re-run. Same object download_worker holds, so the two workers end
+        # a sitting by one rule.
         budget = SessionBudget(int(opts.get("max_files", 0) or 0),
                                int(opts.get("max_mb", 0) or 0))
         # The same fetch path and the same verification state the download
@@ -8613,7 +8762,7 @@ def retry_worker(session, out_dir, report_path, opts, report_dir=""):
             # listing once, before fetching anything, so a record that has
             # been restricted since the plan was taken is not downloaded and
             # then labelled with the plan's old Access value. One admin page
-            # per record state, which the server does not ration.
+            # per record state; admin pages are not met with prompts.
             drift = None
             if opts.get("reconcile", True):
                 def _dwarn(msg, _c=ctx, _w=warns):
@@ -8678,8 +8827,14 @@ def retry_worker(session, out_dir, report_path, opts, report_dir=""):
                         # well as the fetch. Re-planning costs two admin
                         # pages per record to build a file list for a
                         # record the listing says is not there.
-                        if saved.already(ctx, row.get("article"), row):
+                        _have = saved.already(ctx, row.get("article"), row)
+                        if _have:
                             saved.skip()     # see SavedFiles
+                            out_rows.append(same_file_row(
+                                "", row.get("article", ""),
+                                row.get("title", ""),
+                                row.get("record_state", ""), row, _have,
+                                row.get("pub", ""), row.get("adm", "")))
                             continue
                         yield row
                         continue
@@ -8766,9 +8921,14 @@ def retry_worker(session, out_dir, report_path, opts, report_dir=""):
                         # fetches, so the primary before this job has
                         # already been fetched — and may have fallen back
                         # to the very native this job names.
-                        if saved.already(ctx, row["article"], job):
+                        _have = saved.already(ctx, row["article"], job)
+                        if _have:
                             saved.skip()
                             nonlocal_total[0] -= 1
+                            out_rows.append(same_file_row(
+                                "", row["article"], job.get("title", ""),
+                                job.get("record_state", ""), job, _have,
+                                job.get("pub", ""), job.get("adm", "")))
                             continue
                         yield job
                     pending["inflight"] = None
@@ -8796,9 +8956,9 @@ def retry_worker(session, out_dir, report_path, opts, report_dir=""):
                     continue
                 if row.get("drift") == "gone":
                     # Recorded as what it is. Requesting it would spend a
-                    # download from a capped allowance to be told 404 by a
-                    # server that has already told us, for free, that the
-                    # record is not there.
+                    # file request to be told 404 by a server that has
+                    # already told us, for free, that the record is not
+                    # there.
                     done += 1
                     n_rows = order
                     out_rows.append(
@@ -8908,23 +9068,18 @@ def retry_worker(session, out_dir, report_path, opts, report_dir=""):
                         raise ServerRefusing(stop_after_row)
                     continue
 
-                if got.used_native and kind == "primary":
-                    kind = "native"
-                    # And point File URL at what was got, as
-                    # download_worker always has: a row saying "native"
-                    # beside the derivative's address was this worker's
-                    # half of that rule, missing (v1.34.2).
-                    row = dict(row, url=(row.get("native_url")
-                                         or retry_native_url(base_url, row)
-                                         or row["url"]))
+                # The derivative was absent and the native answered. The
+                # row stays the planned PRIMARY's, so a merge settles it; the
+                # file is named as the native it is (1.0.6, as in
+                # download_worker).
+                fell_back = bool(got.used_native and kind == "primary")
+                save_kind = "native" if fell_back else kind
                 orig = got.name or row["orig_hint"] \
                     or "article-{}".format(art)
-                nbytes = got.nbytes
-                fname = build_filename(ctx, art, kind, row["visibility"],
-                                       row["version"], orig, got.ctype,
-                                       got.head())
                 try:
-                    path = place_file(got, ctx_dir, fname)
+                    path, nbytes = save_fetched(
+                        got, ctx_dir, ctx, art, save_kind, row["visibility"],
+                        row["version"], orig)
                 except SaveFailed as e:
                     # One file, not the run — the same rule as
                     # download_worker, through the same function.
@@ -8945,6 +9100,12 @@ def retry_worker(session, out_dir, report_path, opts, report_dir=""):
                 n_files += 1
                 saved_name, saved_status = settle_saved(
                     saved, ctx, art, dict(row, kind=kind), path)
+                if fell_back:
+                    saved.saved(ctx, art, native_of(dict(
+                        row, native_url=(row.get("native_url")
+                                         or retry_native_url(base_url, row)
+                                         or row["url"]))), saved_name)
+                    saved_status = fallback_status(saved_status)
                 # Content changed hands, so the run of refusals is over.
                 watch.served()
                 budget.spend(nbytes)
@@ -8981,7 +9142,8 @@ def retry_worker(session, out_dir, report_path, opts, report_dir=""):
                         ", {} of them on records marked 'open access'"
                         .format(watch.open_access)
                         if watch.open_access else ""))
-            status = "Recovered {} of {} row(s)".format(n_files, n_rows)
+            status = "{} {} of {} row(s)".format(
+                got_word.capitalize(), n_files, n_rows)
             if watch.total:
                 status += "; {} refused (403)".format(watch.total)
             if n_absent:
@@ -8991,8 +9153,8 @@ def retry_worker(session, out_dir, report_path, opts, report_dir=""):
                     n_unconfirmed)
             master.append((c_idx, ctx, "retry", n_rows, n_files,
                            n_hidden, len(warns), status, timestr, rname))
-            log("{}: recovered {} of {} row(s){}".format(
-                ctx, n_files, n_rows,
+            log("{}: {} {} of {} row(s){}".format(
+                ctx, got_word, n_files, n_rows,
                 "; {} the server says are not there".format(n_absent)
                 if n_absent else ""))
 
@@ -9008,11 +9170,12 @@ def retry_worker(session, out_dir, report_path, opts, report_dir=""):
         # "failed row(s)" was also wrong: since v1.20 a re-run collects
         # records that were never attempted, and a record nobody tried is
         # not a failure.
-        summary = "recovered {} of {} row(s) → {}".format(
-            tot_files, tot_rows, run_dir)
+        summary = "{} {} of {} row(s) → {}".format(
+            got_word, tot_files, tot_rows, run_dir)
         if remaining:
-            summary += (" · {} row(s) still outstanding in this plan — run "
-                        "the next session".format(remaining))
+            summary += (" · {} row(s) still outstanding in this plan — copy "
+                        "this session's report into the job folder, then "
+                        "run the next session from it".format(remaining))
         if tot_absent:
             summary += (" · {} the server says are not there"
                         .format(tot_absent))
@@ -9067,19 +9230,20 @@ def retry_worker(session, out_dir, report_path, opts, report_dir=""):
         elif full:
             # Not an interruption. The plan said this much and this much
             # was done, so it must not read like something went wrong.
-            log("Session complete — {}. Start the next session from this "
-                "run's folder when the allowance refreshes."
+            log("Session complete — {}. Copy this session's report into "
+                "the job folder, then start the next session from that "
+                "folder whenever you can watch the Chrome window."
                 .format(str(_stop)))
         else:
             log("Stop requested — {} of {} row(s) attempted.".format(
                 done, nonlocal_total[0]))
-        summary = "{} ({} of {} row(s), {} recovered).".format(
+        summary = "{} ({} of {} row(s), {} {}).".format(
             "Stopped: the server is refusing file requests" if blocked
             else "Session complete" if full
             else "Stopped: nobody confirmed a person was present"
             if unverified
             else "Stopped early",
-            done, nonlocal_total[0], budget.files)
+            done, nonlocal_total[0], budget.files, got_word)
         summary += " " + verify.summary()
         summary += (" Partial report: " + pname) if pname else \
                    " No rows had been attempted, so no report was written."
@@ -9203,6 +9367,13 @@ PAGE = r"""<!DOCTYPE html>
 .browse-msg{display:block;font-size:.9em;margin-top:.2rem}
 .browse-msg:empty{display:none}
 /* /DC-BROWSE styles */
+/* DC-PICK 1 styles */
+#pickbar{display:flex;flex-wrap:wrap;gap:.6rem;align-items:center;margin-top:.4rem}
+#pickbar .hint{margin:0}
+#picked{margin:.4rem 0 0;padding-left:1.2rem}
+#picked li{margin:.2rem 0}
+#picked li button{margin-left:.6rem}
+/* /DC-PICK styles */
 /* DC-PALETTE 3 — one notification palette for the shell and every module.
    Gray: instructions and neutral state. Green: the state matches what the
    operator intended. Amber (version 3): a run that finished, with problems
@@ -9304,7 +9475,13 @@ PAGE = r"""<!DOCTYPE html>
   <label for="filter" style="margin-top:.4rem">Filter structures</label>
   <input type="text" id="filter" placeholder="type to filter…" autocomplete="off">
   <div id="list" role="group" aria-label="Parent structures"></div>
-  <p class="hint" id="selcount">0 parents checked.</p>
+<!-- DC-PICK 1: the parents checked, by name, each with Remove, and Clear all. -->
+  <div id="pickbar">
+   <p class="hint" id="selcount" aria-live="polite">0 parent(s) checked.</p>
+   <button type="button" id="pickclear" class="secondary small" disabled>Clear all</button>
+  </div>
+  <ul id="picked" aria-label="Checked parents" hidden></ul>
+<!-- /DC-PICK -->
  </div>
  <p class="hint">Community structures hold no uploads — they are excluded
  automatically, even when checked as scope parents.</p>
@@ -9345,14 +9522,13 @@ PAGE = r"""<!DOCTYPE html>
     <p class="hint">A full report &mdash; every file URL, kind, visibility,
     version and version date, plus access state, release option and embargo
     date &mdash; without asking the server for a single file.</p>
-    <p class="hint">Admin pages are not what the server rations, so an
-    inventory is never cut short by the download cap. A complete inventory
-    is always possible even when a complete download is not, and that is
-    what the whole plan-then-sessions workflow is built on.</p>
+    <p class="hint">Admin pages have never been met with a verification
+    prompt or a lockout, so an inventory runs to the end without anyone
+    having to answer for it. A complete inventory is always possible, and
+    that is what the whole plan-then-sessions workflow is built on.</p>
     <p class="hint">Point <strong>Re-run from report</strong> at the result
     to download from it, a session at a time, in whatever order you choose
-    &mdash; which is what makes a capped allowance spendable deliberately
-    rather than alphabetically.</p>
+    &mdash; each session as long as someone can watch it.</p>
    </details>
   </div>
   <div>
@@ -9477,9 +9653,10 @@ PAGE = r"""<!DOCTYPE html>
 </fieldset>
 
 <fieldset id="seclimits"><legend id="leglimits">5 · Session limits</legend>
- <p class="hint">Digital Commons caps how much it will hand over to an
- account in a day, so a large job is several sittings. These two numbers are
- what ends a sitting. <strong>Whichever is reached first stops the
+ <p class="hint">There is no download quota. A large job is several
+ sittings because each run is watched while it runs: the repository can ask
+ whether a person is present, and someone has to answer. These two numbers
+ end a sitting. <strong>Whichever is reached first stops the
  session</strong> &mdash; and the rest of the job is written out as
  outstanding, so the next session picks it up from this run's report.</p>
 
@@ -9492,8 +9669,7 @@ PAGE = r"""<!DOCTYPE html>
         step="25" inputmode="numeric">
 
  <p class="hint">0 in either box means do not limit on that one; 0 in both
- takes everything outstanding, which is what a structure smaller than a
- day's allowance wants.</p>
+ takes everything outstanding in one sitting.</p>
  <details>
   <summary>Why both are 0 by default, and why there are two</summary>
   <p class="hint">Both default to <strong>__LIMFILES__ files</strong> and
@@ -9525,15 +9701,20 @@ PAGE = r"""<!DOCTYPE html>
  <label for="reqdelay">Gap before a file download, in seconds</label>
  <input type="number" id="reqdelay" value="5.0" min="0" max="60" step="0.1"
         inputmode="decimal">
- <p class="hint">Leave this at 5 unless you are fetching a handful of files
- and would rather not wait. On anything substantial a run that finishes beats
- a run that stalls.</p>
- <details><summary>Why 5 seconds</summary>
-  <p class="hint">It is the figure that was measured, not a guess. Digital
-  Commons rate-limits downloads to roughly one every nine seconds and answers
-  a faster run with a ten-minute lockout. At a 0.3s gap a 38-record structure
-  met one after 26 to 36 records every time it was tried; at 5s it fetched
-  everything with no pushback at all.</p>
+ <p class="hint">5 seconds is the default, and the cautious choice. Shorter
+ gaps have run long sessions without trouble while someone watched; if a
+ lockout or a verification prompt appears, set this back to 5.</p>
+ <details><summary>What was measured</summary>
+  <p class="hint">At a 0.3 second gap, a structure of 38 records met a
+  ten-minute lockout (the server answering 429 or 503, with Retry-After)
+  after 26 to 36 records, every time it was tried. At 5 seconds the same
+  structure downloaded completely, with no pushback.</p>
+  <p class="hint">Later, through Chrome and with someone watching, sessions
+  at a 1 second gap (about 5,000 file requests) and at a 0.5 second gap
+  (about 7,800 file requests, over two sessions) met no lockout and no
+  verification prompt.</p>
+  <p class="hint">What the server counts, and over what time, is not known,
+  so the default stays at 5.</p>
  </details>
 
  <div class="inline">
@@ -9637,9 +9818,8 @@ PAGE = r"""<!DOCTYPE html>
  labelled with the plan's old Access value &mdash; and records that have
  been removed are recorded as removed rather than requested.</p>
  <details><summary>What it costs, and what it will not do</summary>
-  <p class="hint">One admin page per record state, which is not what the
-  server rations &mdash; about a second, and nothing from the download
-  allowance.</p>
+  <p class="hint">One admin page per record state &mdash; about a second.
+  Admin pages are not met with verification prompts or lockouts.</p>
   <p class="hint">It does not pick up records <em>added</em> since the plan.
   It counts them and says so, and that is deliberate: a plan is a snapshot,
   which is what makes it stable and re-runnable across many sittings.</p>
@@ -10071,6 +10251,39 @@ function browseInit(){
 }
 browseInit();
 /* /DC-BROWSE */
+/* DC-PICK 1: the parents checked, shown by name under the count, each
+   with its own Remove, and Clear all. A page can reopen with parents
+   already checked, so the list says what a run will use without a
+   search. The page supplies checked (a Set) and renderList(), and its
+   updateCount() calls renderPicked(). */
+function renderPicked(){
+  const ul=document.getElementById("picked"), clr=document.getElementById("pickclear");
+  ul.innerHTML='';
+  [...checked].sort().forEach(ctx=>{
+    const li=document.createElement('li');
+    const name=document.createElement('span'); name.textContent=ctx;
+    const b=document.createElement('button');
+    b.type='button'; b.className='secondary small'; b.textContent='Remove';
+    b.setAttribute('aria-label','Remove '+ctx);
+    b.addEventListener('click',()=>pickRemove(ctx));
+    li.append(name,b); ul.append(li);
+  });
+  ul.hidden=!checked.size;
+  clr.disabled=!checked.size;
+}
+function pickRemove(ctx){
+  const at=[...checked].sort().indexOf(ctx);
+  checked.delete(ctx); renderList();
+  const left=document.getElementById("picked").querySelectorAll('button');
+  if(left.length) left[Math.min(at,left.length-1)].focus();
+  else document.getElementById("filter").focus();
+}
+function pickClear(){
+  checked.clear(); renderList();
+  document.getElementById("filter").focus();
+}
+document.getElementById("pickclear").addEventListener('click',pickClear);
+/* /DC-PICK */
 
 (function(){
   const box = logEl(), btn = document.getElementById('logcopy');
@@ -10264,6 +10477,7 @@ function renderList(){
 }
 function updateCount(){
   selcount.textContent=checked.size+' parent(s) checked.';
+  renderPicked();
   if(typeof saveForm==='function') saveForm();
 }
 
@@ -11317,8 +11531,8 @@ def make_handler(session: dict, page: bytes):
                         "delay": read_number(req, "delay", REQUEST_DELAY),
                         "page_delay": read_number(req, "page_delay",
                                                   PAGE_DELAY),
-                        # Both units, because which one the server rations
-                        # is not known — see SESSION_LIMITS.
+                        # Both units, so a sitting can be sized either
+                        # way - see SESSION_LIMITS.
                         "max_files": read_number(req, "max_files", 0,
                                                  whole=True),
                         "max_mb": read_number(req, "max_mb", 0, whole=True),

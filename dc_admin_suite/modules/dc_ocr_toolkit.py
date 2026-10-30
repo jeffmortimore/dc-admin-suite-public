@@ -1,5 +1,33 @@
 #!/usr/bin/env python3
-"""OCR & Accessibility Toolkit v1.9 — DC Admin Suite module.
+"""OCR & Accessibility Toolkit — DC Admin Suite module (version: MANIFEST).
+
+v1.13.0 measures what it reports. Tagged was a presence check: a
+StructTreeRoot with no children, a tree whose tags pointed at content a
+forced OCR had rasterized away, and a tagged file with an untagged cover
+page in front all read "Yes", and a tagged file was never checked for
+figure alt text. A structure walk (pdf_structure) now counts elements,
+Figures with and without alt text, Tables with and without header cells,
+headings, untagged content and orphaned marked-content ids, and veraPDF
+(PDF/UA-1) is the verdict where it is installed. Alt Missing is counted,
+not read back out of the Next Steps text, and a page scan needs OCR, not
+alt text. The heuristic tagger marks a page scan as an artifact and tags
+the OCR text layer it used to leave outside the tags, so processing a scan
+no longer leaves a screen reader one empty figure per page; an image the AI
+judges decorative becomes an artifact, and in Word and PowerPoint is marked
+decorative the way Office marks it. A tagged PDF is never OCR'd, and the
+Auto-tag box is honored. AI pages sent and transcribed are counted apart, a
+failed request is no longer described as a model that stopped, and a Stop
+part-way through a file still reports that file. An AI gate sends a file to
+the endpoint only when the downloader's report marks it public, unless the
+run's override is on. Placeholder alt text — a label such as "image 18", a
+file name — counts as none, in every format, and the walk judges text where
+it is shown, so a tag opened inside a text object is a tag. In a PDF that is
+already tagged, Process drafts alt text into the Figures that have none or
+only a placeholder, never over real alt text; a Figure the AI judges
+decorative, or one that is only a line, becomes an artifact; a page drawn
+in slices is named for a person, not sent; and the file is saved only if a
+second walk finds the tags no worse. Alt-text drafts per file is a field on
+the form.
 
 v1.9 (2026-09-05) makes the AI path measurable and its failures visible.
 The streaming client was ported from dc_image_describer at v1.2-v1.7 and is
@@ -81,7 +109,8 @@ SOURCES (three ways to queue files):
     supported file in the per-structure subfolders is queued, and each
     file's Context ID / Article ID / Record Title / Record State / Admin
     Record URL are read from the subfolder's
-    DC_FileDownload_Report_*.xlsx (columns located by header name) so the
+    DC_FileDownload_Report_*.xlsx and each re-run session's
+    DC_FileDownload_Retry_*.xlsx (columns located by header name) so the
     OCR report links processing results back to the repository records.
   · Any folder of files (optionally recursive).
   · Individually listed file paths (one absolute path per line).
@@ -148,7 +177,7 @@ MANIFEST = {
     "id": "ocr-toolkit",
     "name": "OCR & Accessibility Toolkit",
     "description": "OCR, evaluate, and remediate PDFs, images, Word, and PowerPoint files toward WCAG 2.1 AA, with filterable accessibility reports.",
-    "version": "1.12.0",
+    "version": "1.13.0",
     "requires": ["pymupdf", "pikepdf", "ocrmypdf", "python-docx",
                  "python-pptx", "openpyxl"],
 }
@@ -156,8 +185,10 @@ MANIFEST = {
 import argparse
 import base64
 import glob
+import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import shutil
@@ -184,7 +215,8 @@ XLSX_MIME = ("application/vnd.openxmlformats-officedocument"
 
 # Downloader artifacts recognized during run-folder ingest.
 DL_RUN_PREFIX = "DC_FileDownloads_"
-DL_REPORT_GLOB = "DC_FileDownload_Report_*.xlsx"
+DL_REPORT_GLOBS = ("DC_FileDownload_Report_*.xlsx",
+                   "DC_FileDownload_Retry_*.xlsx")
 
 # Caps and pacing. Watch-items: bump AI_TIMEOUT if institutional endpoints
 # are slow; the per-file AI caps bound cost on image-heavy files.
@@ -197,7 +229,8 @@ AI_TIMEOUT = 180           # max seconds between chunks
 AI_MAX_RETRIES = 4         # retries on rate limit / dropped connection
 BACKOFF_START = 10.0       # first backoff wait, doubling per retry
 BACKOFF_CAP = 120.0        # never wait longer than this between retries
-AI_MAX_ALT_PER_FILE = 25   # max alt-text drafts per file
+AI_MAX_ALT_PER_FILE = 25   # default alt-text drafts per file (the form's field)
+MAX_ALT_PER_FILE = 500     # the most the field accepts
 AI_MAX_OCR_PAGES = 50      # max pages sent to an AI OCR pass per file
 AI_OCR_DPI = 150           # raster resolution for AI OCR page images
 OCR_TIMEOUT = 1800         # seconds per ocrmypdf subprocess (30 min/file)
@@ -254,6 +287,26 @@ def parse_reply_limit(raw):
     if not MIN_MAX_TOKENS <= limit <= MAX_MAX_TOKENS:
         return None, ("{} must be between {} and {:,}.".format(
             field, MIN_MAX_TOKENS, MAX_MAX_TOKENS))
+    return limit, ""
+
+
+def parse_alt_limit(raw):
+    """(limit, error) for the job form's Alt-text drafts per file. Absent
+    means the default; blank or out of range names the field."""
+    if raw is None:
+        return AI_MAX_ALT_PER_FILE, ""
+    field = "Alt-text drafts per file"
+    if str(raw).strip() == "":
+        return None, ("{} is empty - enter a number from 1 to {} ({} is "
+                      "the default).".format(field, MAX_ALT_PER_FILE,
+                                             AI_MAX_ALT_PER_FILE))
+    try:
+        limit = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None, "{} must be a whole number.".format(field)
+    if not 1 <= limit <= MAX_ALT_PER_FILE:
+        return None, "{} must be between 1 and {}.".format(
+            field, MAX_ALT_PER_FILE)
     return limit, ""
 
 # Alt-text length is REPORTED, never enforced — the describer's rule. Cutting
@@ -405,6 +458,8 @@ def tool_status() -> dict:
         "tesseract": shutil.which("tesseract") is not None,
         "ghostscript": bool(shutil.which("gs") or shutil.which("gswin64c")
                             or shutil.which("gswin32c")),
+        # Optional: the launcher's path when found (a string), else "".
+        "verapdf": find_verapdf(),
     }
 
 
@@ -1286,7 +1341,7 @@ def is_suite_artifact(name: str) -> bool:
 
 
 def _entry(path, rel, meta=None):
-    meta = meta or {}
+    meta = _with_name_meta(path, meta)
     try:
         size = os.path.getsize(path)
     except OSError:
@@ -1296,7 +1351,133 @@ def _entry(path, rel, meta=None):
             "size": size,
             "ctx": meta.get("ctx", ""), "article": meta.get("article", ""),
             "title": meta.get("title", ""), "state": meta.get("state", ""),
-            "admin_url": meta.get("admin_url", "")}
+            "admin_url": meta.get("admin_url", ""),
+            "record": bool(meta.get("record")),
+            "reported": bool(meta.get("reported")),
+            "visibility": meta.get("visibility", ""),
+            "access": meta.get("access", "")}
+
+
+# ---- Downloader names and reports -------------------------------------------
+# The Batch File Downloader names each file <context>_<article>_<kind>_
+# <visibility>_..., so a file carries its visibility even where its report
+# is not at hand: a copy in a plain folder, or a run whose reports were
+# saved to a folder of their own. Its access (an embargo) is in the report
+# only, so such a file reads "access not recorded" and the AI gate holds it
+# back unless the run's override is on. Duplicated verbatim in both AI
+# modules and held to agreement by ast.
+# <kind> is primary, native, coverletter or supp<N>: a supplemental file's
+# kind carries its number, so digits are allowed after the first letter.
+_DL_NAME_RE = re.compile(
+    r"^(?P<ctx>.+?)_(?P<article>\d+)_(?P<kind>[a-z][a-z0-9-]*)_"
+    r"(?P<visibility>public|hidden)_")
+
+
+def downloader_name_meta(path):
+    """{"article", "visibility"} from a downloader's filename, or {}."""
+    m = _DL_NAME_RE.match(os.path.basename(path or ""))
+    if not m:
+        return {}
+    return {"article": m.group("article"),
+            "visibility": m.group("visibility")}
+
+
+def _with_name_meta(path, meta):
+    """A file's metadata, completed from its name where the name is a
+    downloader's: it is then a record, whatever its report said or did
+    not."""
+    meta = dict(meta or {})
+    named = downloader_name_meta(path)
+    if named:
+        meta["record"] = True
+        if not meta.get("visibility"):
+            meta["visibility"] = named["visibility"]
+        if not meta.get("article"):
+            meta["article"] = named["article"]
+    return meta
+
+
+def downloader_reports(folder):
+    """Every per-structure download report in `folder` — a structure's
+    first session writes a Report, each re-run session a Retry report with
+    the same columns — oldest first by the stamp in its name, the order the
+    downloader reads them in, so a later session's row for a file replaces
+    an earlier one's."""
+    found = []
+    for pattern in DL_REPORT_GLOBS:
+        found += glob.glob(os.path.join(folder, pattern))
+
+    def stamp(path):
+        m = re.search(r"(\d{8}_\d{6})", os.path.basename(path))
+        return (m.group(1) if m else "", os.path.basename(path))
+    return sorted(found, key=stamp)
+
+
+def external_reports(reports, run):
+    """Saved Filename → record metadata from the reports a downloader saved
+    to a folder of their own. `reports` is that run's report folder or the
+    folder that holds it. Raises ValueError, naming where it looked, when
+    there is no report there."""
+    if not reports:
+        return {}
+    name = os.path.basename(os.path.normpath(run))
+    inner = os.path.join(reports, name)
+    where = inner if os.path.isdir(inner) else reports
+    found = downloader_reports(where)
+    if not found:
+        raise ValueError(
+            "No downloader report ({}) in {} — choose the folder the "
+            "downloader saved this run's reports to, or the folder that "
+            "holds it.".format(" or ".join(DL_REPORT_GLOBS), where))
+    meta = {}
+    for rep in found:
+        try:
+            meta.update(load_downloader_meta(rep))
+        except Exception:
+            pass    # a damaged report never blocks the queue
+    return meta
+
+
+def reported_note(entries):
+    """The log line saying how many queued files a downloader report
+    describes, and what the AI gate does with the rest."""
+    n = sum(1 for e in entries if e.get("reported"))
+    rest = len(entries) - n
+    if not rest:
+        return "Downloader reports describe all {} file(s).".format(n)
+    return ("Downloader reports describe {} of {} file(s); the other {} "
+            "carry no access record, so the AI gate holds them back unless "
+            "the override is on.".format(n, len(entries), rest))
+
+
+# ---- AI gate ----------------------------------------------------------------
+# A file goes to an AI endpoint only when the Batch File Downloader's report
+# says it is public (Visibility public, Access open or n/a), unless the run's
+# override is on. A file with no downloader record carries no visibility; it
+# is sent, and its row says so. The report's AI Gate column says what this
+# decided for each file. Duplicated verbatim in both AI modules and held to
+# agreement by ast.
+AI_GATE_PUBLIC = "public"
+AI_GATE_UNKNOWN = "visibility not known"
+_AI_GATE_OPEN = ("open", "n/a")
+
+
+def ai_gate(entry, override=False):
+    """(allowed, label) for one queued file; the label is its AI Gate."""
+    if not entry.get("record"):
+        return True, AI_GATE_UNKNOWN
+    vis = str(entry.get("visibility") or "").strip().lower()
+    acc = str(entry.get("access") or "").strip().lower()
+    if vis == "public" and acc in _AI_GATE_OPEN:
+        return True, AI_GATE_PUBLIC
+    why = []
+    if vis != "public":
+        why.append(vis or "visibility not recorded")
+    if acc not in _AI_GATE_OPEN:
+        why.append("access " + acc if acc else "access not recorded")
+    if override:
+        return True, "sent under override ({})".format(", ".join(why))
+    return False, "{} — not sent".format(", ".join(why))
 
 
 def scan_folder(folder: str, recursive: bool) -> list:
@@ -1373,13 +1554,15 @@ def load_downloader_meta(report_path: str) -> dict:
                 meta[saved] = {"article": val("Article ID"),
                                "title": val("Title"),
                                "state": val("Record State"),
-                               "admin_url": val("Admin Record URL")}
+                               "admin_url": val("Admin Record URL"),
+                               "visibility": val("Visibility"),
+                               "access": val("Access")}
         return meta
     finally:
         wb.close()
 
 
-def scan_run_folder(folder: str):
+def scan_run_folder(folder: str, reports: str = ""):
     """Queue a downloader run. `folder` is either a DC_FileDownloads_* run
     folder or a folder containing one or more of them (newest run picked).
     Returns (entries, run_folder) — raises ValueError with a user-facing
@@ -1397,13 +1580,14 @@ def scan_run_folder(folder: str):
                 "File Downloader run (or its parent folder).".format(
                     DL_RUN_PREFIX, folder))
         run = runs[0]
+    external = external_reports(reports, run)
     entries = []
     for sub in sorted(os.listdir(run)):
         sub_path = os.path.join(run, sub)
         if not os.path.isdir(sub_path):
             continue
         meta_by_name = {}
-        for rep in glob.glob(os.path.join(sub_path, DL_REPORT_GLOB)):
+        for rep in downloader_reports(sub_path):
             try:
                 meta_by_name.update(load_downloader_meta(rep))
             except Exception:
@@ -1413,7 +1597,13 @@ def scan_run_folder(folder: str):
             if (fname.startswith(".") or is_suite_artifact(fname)
                     or not os.path.isfile(path)):
                 continue
-            meta = dict(meta_by_name.get(fname, {}))
+            meta = dict(meta_by_name.get(fname)
+                        or external.get(fname) or {})
+            meta["reported"] = fname in meta_by_name or fname in external
+            # A file in a downloader run comes from a record even when its
+            # report is elsewhere or missing: the gate holds it back until
+            # a report says it is public.
+            meta["record"] = True
             meta["ctx"] = sub
             entries.append(_entry(path, os.path.join(sub, fname), meta))
             if len(entries) >= SCAN_MAX_FILES:
@@ -1427,28 +1617,55 @@ def scan_run_folder(folder: str):
 # evaluators are unit-testable against fixture files.
 # ---------------------------------------------------------------------------
 def eval_pdf(path: str) -> dict:
+    """One PDF, measured (1.13.0). `tagged` means the structure tree holds
+    elements; `verdict` is what the Tagged column says and `problems` why it
+    is not plain "Yes"; `figure_images` are the images that are not page
+    scans; `structure` is pdf_structure()'s count."""
     import fitz
     import pikepdf
-    info = {"pages": 0, "text_pages": 0, "images": 0, "tagged": False,
-            "title": "", "lang": "", "encrypted": False}
+    info = {"pages": 0, "text_pages": 0, "images": 0, "scan_pages": 0,
+            "figure_images": 0, "loose_figure_images": 0,
+            "title_placeholder": False, "tagged": False, "verdict": "No",
+            "problems": [], "structure": {}, "title": "", "lang": "",
+            "encrypted": False, "findings": [], "findings_error": ""}
+    scans = set()
     doc = fitz.open(path)
     try:
         if doc.needs_pass:
             info["encrypted"] = True
             return info
         info["pages"] = doc.page_count
-        seen = set()
+        images = set()
         for page in doc:
             if page.get_text("text").strip():
                 info["text_pages"] += 1
             for img in page.get_images(full=True):
-                seen.add(img[0])
-        info["images"] = len(seen)
+                images.add(img[0])
+            found = _page_scan_xrefs(page)
+            if found:
+                scans.update(found)
+                info["scan_pages"] += 1
+        info["images"] = len(images)
+        info["figure_images"] = len(images - scans)
     finally:
         doc.close()
     with pikepdf.open(path) as pdf:
         root = pdf.Root
-        info["tagged"] = "/StructTreeRoot" in root
+        structure = pdf_structure(pdf)
+        info["structure"] = structure
+        info["tagged"] = bool(structure["tree"] and structure["elements"])
+        # Images drawn outside every tag in a tagged file — a word-processor
+        # thesis behind a tagged cover page — need tags and alt text too.
+        info["loose_figure_images"] = len(structure["loose_images"] - scans)
+        info["verdict"], info["problems"] = tag_verdict(structure)
+        if info["tagged"]:
+            # The detectors are a second reading; one that fails costs the
+            # findings, never the row.
+            try:
+                info["findings"] = structure_findings(pdf)
+            except Exception as e:
+                info["findings_error"] = "{}: {}".format(
+                    e.__class__.__name__, e)
         try:
             info["lang"] = str(root.Lang) if "/Lang" in root else ""
         except Exception:
@@ -1464,19 +1681,902 @@ def eval_pdf(path: str) -> dict:
                     info["title"] = str(meta.get("dc:title", "") or "")
             except Exception:
                 pass
+    info["title_placeholder"] = title_is_placeholder(info["title"], path)
     return info
+
+
+# ---------------------------------------------------------------------------
+# The structure walk (1.13.0). Before it, "Tagged" meant only that the
+# catalog named a StructTreeRoot: an empty tree, a tree whose tags point at
+# content a forced OCR had rasterized away, and a tagged file with an
+# untagged cover page in front all read "Yes", and a tagged file was never
+# checked for figure alt text at all. This counts what the tree holds and
+# what each page's own content stream marks. It is not a validator — veraPDF
+# is, when installed — and it says what it counted:
+#   · elements, resolving the tree's RoleMap to standard types;
+#   · Figures with and without /Alt (or /ActualText) — placeholder alt
+#     ("image 18", "Figure", a file name) counts as none, and is counted
+#     apart so the row can name it (alt_is_missing); Tables with and
+#     without a TH cell, headings;
+#   · pages whose content (text-showing operators, XObject draws, inline
+#     images) sits outside every tagged or /Artifact marked-content
+#     sequence. Text is judged where it is shown, not where its text object
+#     begins: a tag may open inside a text object, which is valid, and the
+#     walk as first built called every such page untagged. A form XObject
+#     drawn outside them is not counted when its own content is all marked
+#     (an auto-tagger may mark inside the form) — _form_marked_inside;
+#   · pages whose vector drawings (path painting, shadings) sit outside
+#     them, counted apart so the verdict names them. veraPDF counts them
+#     under rule 7.1-3; the walk as first built did not count them at all,
+#     and called such a file "Yes";
+#   · orphans: marked-content ids the tree assigns to a page that the
+#     page's content stream does not contain (content in Form XObjects,
+#     reached through /Stm, is not followed).
+# ---------------------------------------------------------------------------
+SCAN_COVERAGE = 0.85     # an image drawn over this share of its page is the page
+_HEADING_RE = re.compile(r"^/H[1-6]?$")
+_CONTENT_OPS = ("Tj", "TJ", "'", '"', "Do")
+# Path painting and shading. "n" ends a path without painting it (a
+# clipping path), so it is not a drawing.
+_VECTOR_OPS = ("S", "s", "f", "F", "f*", "B", "B*", "b", "b*", "sh")
+_PATH_BUILD_OPS = ("m", "l", "c", "v", "y", "h", "re", "W", "W*")
+_PATH_END_OPS = _VECTOR_OPS[:-1] + ("n",)
+
+
+def _form_marked_inside(obj, depth=0, seen=None):
+    """True for a Form XObject whose own content is all inside tags or
+    artifacts — an auto-tagger may mark inside a form — so drawing it
+    outside the page's marked content leaves nothing untagged. Nested forms
+    are followed two levels; a form that draws nothing, or cannot be read,
+    is not called marked. `seen` caches the answer, by object and depth,
+    for one walk of one file."""
+    import pikepdf
+    try:
+        if obj is None or obj.Subtype != pikepdf.Name.Form or depth > 2:
+            return False
+    except (AttributeError, KeyError):
+        return False
+    key = (obj.objgen, depth) if obj.is_indirect else None
+    if seen is not None and key is not None and key in seen:
+        return seen[key]
+    answer = _form_marked_walk(obj, depth, seen)
+    if seen is not None and key is not None:
+        seen[key] = answer
+    return answer
+
+
+def _form_marked_walk(obj, depth, seen):
+    import pikepdf
+    try:
+        props, xobjs = {}, {}
+        res = obj.get("/Resources")
+        if isinstance(res, pikepdf.Dictionary):
+            for key_name, store in (("/Properties", props),
+                                    ("/XObject", xobjs)):
+                table = res.get(key_name)
+                if isinstance(table, pikepdf.Dictionary):
+                    for key in table.keys():
+                        store[str(key)] = table[key]
+        stack, drew = [], False
+        for inst in pikepdf.parse_content_stream(obj):
+            if isinstance(inst, pikepdf.ContentStreamInlineImage):
+                if not any(stack):
+                    return False
+                drew = True
+                continue
+            op = str(inst.operator)
+            if op in ("BMC", "BDC"):
+                ops = list(inst.operands)
+                marked = bool(ops) and str(ops[0]) == "/Artifact"
+                if op == "BDC" and len(ops) == 2:
+                    prop = ops[1]
+                    if isinstance(prop, pikepdf.Name):
+                        prop = props.get(str(prop))
+                    if (isinstance(prop, pikepdf.Dictionary)
+                            and "/MCID" in prop):
+                        marked = True
+                stack.append(marked)
+            elif op == "EMC":
+                if stack:
+                    stack.pop()
+            elif op in _CONTENT_OPS or op in _VECTOR_OPS:
+                drew = True
+                if any(stack):
+                    continue
+                if (op == "Do" and len(inst.operands) == 1
+                        and _form_marked_inside(
+                            xobjs.get(str(inst.operands[0])), depth + 1,
+                            seen)):
+                    continue
+                return False
+        return drew
+    except Exception:
+        return False
+
+
+def _page_marks(page, forms=None):
+    """(content outside tags and artifacts, MCIDs present, any content,
+    object numbers of the images drawn outside them, vector drawings
+    outside them) for one page's own content stream. A form drawn outside
+    them whose own content is all marked is not counted outside; `forms`
+    caches that answer across the pages of one file."""
+    import pikepdf
+    props = {}
+    res = page.obj.get("/Resources")
+    if isinstance(res, pikepdf.Dictionary):
+        table = res.get("/Properties")
+        if isinstance(table, pikepdf.Dictionary):
+            for key in table.keys():
+                props[str(key)] = table[key]
+    xobjs = {}
+    if isinstance(res, pikepdf.Dictionary):
+        table = res.get("/XObject")
+        if isinstance(table, pikepdf.Dictionary):
+            for key in table.keys():
+                xobjs[str(key)] = table[key]
+    stack, present, loose = [], set(), set()
+    outside = content = vector = False
+    for inst in pikepdf.parse_content_stream(page):
+        if isinstance(inst, pikepdf.ContentStreamInlineImage):
+            content = True
+            if "tag" not in stack and "artifact" not in stack:
+                outside = True
+            continue
+        op = str(inst.operator)
+        if op in ("BMC", "BDC"):
+            ops = list(inst.operands)
+            kind = "artifact" if ops and str(ops[0]) == "/Artifact" else "other"
+            if op == "BDC" and len(ops) == 2:
+                prop = ops[1]
+                if isinstance(prop, pikepdf.Name):
+                    prop = props.get(str(prop))
+                if isinstance(prop, pikepdf.Dictionary) and "/MCID" in prop:
+                    present.add(int(prop.MCID))
+                    if kind == "other":
+                        kind = "tag"
+            stack.append(kind)
+        elif op == "EMC":
+            if stack:
+                stack.pop()
+        elif op in _VECTOR_OPS:
+            content = True
+            if "tag" not in stack and "artifact" not in stack:
+                vector = True
+        elif op in _CONTENT_OPS:
+            content = True
+            if "tag" not in stack and "artifact" not in stack:
+                obj = None
+                if op == "Do" and len(inst.operands) == 1:
+                    obj = xobjs.get(str(inst.operands[0]))
+                if _form_marked_inside(obj, seen=forms):
+                    continue
+                outside = True
+                try:
+                    if obj is not None and obj.Subtype == pikepdf.Name.Image:
+                        loose.add(obj.objgen[0])
+                except (AttributeError, KeyError):
+                    pass
+    return outside, present, content, loose, vector
+
+
+def pdf_structure(pdf):
+    """What the structure tree of an open pikepdf.Pdf holds, measured."""
+    import pikepdf
+    root = pdf.Root
+    out = {"pages": len(pdf.pages), "tree": False, "elements": 0,
+           "marked": None, "figures": 0, "figures_alt": 0, "tables": 0,
+           "tables_th": 0, "headings": 0, "content_pages": 0,
+           "untagged_pages": 0, "vector_pages": 0, "orphans": 0,
+           "unparsed_pages": 0, "loose_images": set(),
+           "figures_placeholder": 0, "placeholder_example": ""}
+    mark = root.get("/MarkInfo")
+    if isinstance(mark, pikepdf.Dictionary):
+        out["marked"] = bool(mark.get("/Marked", False))
+    page_no = {}
+    for i, page in enumerate(pdf.pages):
+        page_no[page.obj.objgen] = i
+    referenced = {}
+    tree = root.get("/StructTreeRoot")
+    if isinstance(tree, pikepdf.Dictionary):
+        out["tree"] = True
+        roles = {}
+        role_map = tree.get("/RoleMap")
+        if isinstance(role_map, pikepdf.Dictionary):
+            for key in role_map.keys():
+                roles[str(key)] = str(role_map[key])
+
+        def standard(name):
+            hops = 0
+            while name in roles and hops < 16:
+                name, hops = roles[name], hops + 1
+            return name
+
+        def page_of(obj, inherited):
+            pg = obj.get("/Pg")
+            if isinstance(pg, pikepdf.Dictionary):
+                return page_no.get(pg.objgen, inherited)
+            return inherited
+
+        seen, with_th = set(), set()
+        stack = [(tree.get("/K"), None, None)]
+        while stack:
+            node, pg, table = stack.pop()
+            if node is None or isinstance(node, bool):
+                continue
+            if isinstance(node, int):
+                if pg is not None:
+                    referenced.setdefault(pg, set()).add(node)
+                continue
+            if isinstance(node, pikepdf.Array):
+                for kid in node:
+                    stack.append((kid, pg, table))
+                continue
+            if not isinstance(node, pikepdf.Dictionary):
+                continue
+            kind = str(node.get("/Type", ""))
+            if kind == "/MCR":
+                if "/Stm" not in node and "/MCID" in node:
+                    where = page_of(node, pg)
+                    if where is not None:
+                        referenced.setdefault(where, set()).add(
+                            int(node.MCID))
+                continue
+            if kind == "/OBJR":
+                continue
+            og = node.objgen
+            if og != (0, 0):
+                if og in seen:
+                    continue
+                seen.add(og)
+            role = standard(str(node.get("/S", "")))
+            out["elements"] += 1
+            if role == "/Figure":
+                out["figures"] += 1
+                alt = str(node.get("/Alt", "")).strip()
+                actual = str(node.get("/ActualText", "")).strip()
+                if actual or not alt_is_missing(alt):
+                    out["figures_alt"] += 1
+                elif alt:
+                    out["figures_placeholder"] += 1
+                    if not out["placeholder_example"]:
+                        out["placeholder_example"] = alt[:40]
+            elif role == "/Table":
+                out["tables"] += 1
+                table = out["tables"]
+            elif role == "/TH" and table is not None:
+                with_th.add(table)
+            elif _HEADING_RE.match(role):
+                out["headings"] += 1
+            stack.append((node.get("/K"), page_of(node, pg), table))
+        out["tables_th"] = len(with_th)
+    forms = {}
+    for i, page in enumerate(pdf.pages):
+        try:
+            outside, present, content, loose, vector = _page_marks(page, forms)
+        except Exception:
+            out["unparsed_pages"] += 1
+            continue
+        out["loose_images"] |= loose
+        if content:
+            out["content_pages"] += 1
+        if outside:
+            out["untagged_pages"] += 1
+        if vector:
+            out["vector_pages"] += 1
+        out["orphans"] += len(referenced.get(i, set()) - present)
+    return out
+
+
+def tag_verdict(s):
+    """(Tagged column value, problems) from pdf_structure()."""
+    if not s["tree"]:
+        return ("No (marked as tagged, but no structure tree)"
+                if s["marked"] else "No"), []
+    if not s["elements"]:
+        return "Empty tree", []
+    problems = []
+    if s["marked"] is not True:
+        problems.append("MarkInfo is not set")
+    if s["untagged_pages"]:
+        problems.append("untagged content on {} of {} page(s)".format(
+            s["untagged_pages"], s["pages"]))
+    if s.get("vector_pages"):
+        problems.append("vector drawings outside the tags on {} of {} "
+                        "page(s)".format(s["vector_pages"], s["pages"]))
+    if s["orphans"]:
+        problems.append("{} tag(s) point at content that is not on the "
+                        "page".format(s["orphans"]))
+    if s["unparsed_pages"]:
+        problems.append("{} page(s) could not be read".format(
+            s["unparsed_pages"]))
+    if problems:
+        return "Incomplete — " + "; ".join(problems), problems
+    return "Yes", []
+
+
+# ---------------------------------------------------------------------------
+# The detectors (headings and tables). A validator checks that tags are
+# present and well formed; it cannot see that a document with chapters tags
+# none of them as headings, that a level is skipped, that every line is a
+# heading, or that one table on the page was tagged as several. Each
+# detector is a named, counted finding about the structure tree — roles,
+# levels, pages, the size text is shown at, what a marked-content sequence
+# draws — never the document's text. A finding is a question for a person
+# (or, later, for an AI assessment), not a verdict, and nothing is changed.
+# Calibrated by a person in the Tags pane on real files before being
+# trusted: a heading on a page of its own is a place to check the level and
+# the parent heading, not a wrong heading; a table can be a data table and
+# be mistyped for its look at once.
+# ---------------------------------------------------------------------------
+DETECT_FEW_HEADINGS_PAGES = 20   # more pages than this per heading is "few"
+DETECT_FLOOD_SHARE = 0.25        # headings over this share of text blocks
+DETECT_FLOOD_MIN = 20            # ... and at least this many headings
+DETECT_FORM_TABLES = 3           # one-row tables on one page before "a form"
+DETECT_TITLE_RATIO = 1.2         # largest text this far above the median
+
+_LEVEL_RE = re.compile(r"^/H([1-6])$")
+_TEXT_BLOCK_ROLES = ("/P", "/LI", "/LBody", "/Caption", "/Note",
+                     "/BlockQuote")
+
+# id -> what it means, for the Summary and the Detectors sheet.
+DETECTORS = [
+    ("no-headings", "no heading is tagged in a document of more than one "
+     "page"),
+    ("few-headings", "more than {} pages for each tagged heading".format(
+        DETECT_FEW_HEADINGS_PAGES)),
+    ("first-heading-not-h1", "the first numbered heading is below H1"),
+    ("skipped-level", "a heading more than one level below the one before "
+     "it"),
+    ("too-many-headings", "headings are more than {:.0f}% of the text "
+     "blocks — paragraphs styled as headings".format(
+         DETECT_FLOOD_SHARE * 100)),
+    ("heading-on-own-page", "a heading with no other tagged text on its "
+     "page — check its level and its parent heading"),
+    ("largest-text-not-heading", "the largest text on the first page is "
+     "tagged as something other than a heading or title"),
+    ("table-no-header-cells", "a table with data cells and no header "
+     "cells"),
+    ("table-header-cells-only", "a table with header cells and no data "
+     "cells"),
+    ("one-row-table", "a table of one row — layout, a form, or a piece of "
+     "a larger table"),
+    ("one-row-tables-on-page", "{} or more one-row tables on one page — a "
+     "form or a layout drawn as tables".format(DETECT_FORM_TABLES)),
+    ("split-table", "adjacent tagged tables that are likely one visual "
+     "table"),
+    ("image-in-text", "an image drawn in an element that is not a Figure "
+     "and carries no alt text"),
+]
+DETECTOR_WORDS = dict(DETECTORS)
+
+
+def _tree_elements(pdf):
+    """Every element of the structure tree in reading (pre)order, the
+    RoleMap resolved: [{"n", "role", "tag", "parent", "mcids": [(page,
+    mcid)], "alt"}]. "n" is the element's id in a finding; "tag" the name
+    the file gives it (what the Tags pane shows), "role" the standard type
+    it maps to; "alt" that it carries /Alt or /ActualText. None when there is no tree."""
+    import pikepdf
+    tree = pdf.Root.get("/StructTreeRoot")
+    if not isinstance(tree, pikepdf.Dictionary):
+        return None
+    roles = {}
+    role_map = tree.get("/RoleMap")
+    if isinstance(role_map, pikepdf.Dictionary):
+        for key in role_map.keys():
+            roles[str(key)] = str(role_map[key])
+
+    def standard(name):
+        hops = 0
+        while name in roles and hops < 16:
+            name, hops = roles[name], hops + 1
+        return name
+
+    page_no = {p.obj.objgen: i for i, p in enumerate(pdf.pages)}
+
+    def page_of(obj, inherited):
+        pg = obj.get("/Pg")
+        if isinstance(pg, pikepdf.Dictionary):
+            return page_no.get(pg.objgen, inherited)
+        return inherited
+
+    out, seen = [], set()
+    stack = [(tree.get("/K"), None, None)]
+    steps = 0
+    while stack and steps < 2000000:
+        steps += 1
+        node, pg, parent = stack.pop()
+        if isinstance(node, pikepdf.Array):
+            stack.extend((k, pg, parent) for k in reversed(list(node)))
+            continue
+        if not isinstance(node, pikepdf.Dictionary) or "/S" not in node:
+            continue
+        if node.is_indirect:
+            if node.objgen in seen:
+                continue
+            seen.add(node.objgen)
+        pg = page_of(node, pg)
+        el = {"n": len(out), "role": standard(str(node.S)),
+              "tag": str(node.S),
+              "parent": parent, "mcids": [],
+              "alt": bool(str(node.get("/Alt", "")).strip()
+                          or str(node.get("/ActualText", "")).strip())}
+        out.append(el)
+        kids = node.get("/K")
+        kids = list(kids) if isinstance(kids, pikepdf.Array) else [kids]
+        sub = []
+        for kid in kids:
+            if isinstance(kid, pikepdf.Dictionary):
+                kind = kid.get("/Type")
+                if kind == pikepdf.Name.MCR:
+                    if "/Stm" not in kid and "/MCID" in kid:
+                        where = page_of(kid, pg)
+                        if where is not None:
+                            el["mcids"].append((where, int(kid.MCID)))
+                    continue
+                if kind == pikepdf.Name.OBJR:
+                    continue
+                sub.append(kid)
+            elif kid is not None and not isinstance(kid, bool):
+                try:
+                    mcid = int(kid)
+                except (TypeError, ValueError):
+                    continue
+                if pg is not None:
+                    el["mcids"].append((pg, mcid))
+        stack.extend((k, pg, el["n"]) for k in reversed(sub))
+    return out
+
+
+def _mcid_text_sizes(page):
+    """{mcid: the largest size its text is shown at, in points on the
+    page}: the font size (Tf) through the text matrix and the current
+    transformation, measured vertically. Text in a form XObject is not
+    followed."""
+    import pikepdf
+    props = {}
+    res = page.obj.get("/Resources")
+    if isinstance(res, pikepdf.Dictionary):
+        table = res.get("/Properties")
+        if isinstance(table, pikepdf.Dictionary):
+            for key in table.keys():
+                props[str(key)] = table[key]
+    out = {}
+    ctm, saved, marks = _MAT_ID, [], []
+    tm, size = _MAT_ID, 0.0
+    for inst in pikepdf.parse_content_stream(page):
+        if isinstance(inst, pikepdf.ContentStreamInlineImage):
+            continue
+        op = str(inst.operator)
+        ops = list(inst.operands)
+        if op == "q":
+            saved.append((ctm, size))
+        elif op == "Q":
+            ctm, size = saved.pop() if saved else (_MAT_ID, size)
+        elif op == "cm" and len(ops) == 6:
+            ctm = _mat_mul(tuple(float(v) for v in ops), ctm)
+        elif op == "BT":
+            tm = _MAT_ID
+        elif op == "Tm" and len(ops) == 6:
+            tm = tuple(float(v) for v in ops)
+        elif op == "Tf" and len(ops) == 2:
+            try:
+                size = abs(float(ops[1]))
+            except (TypeError, ValueError):
+                pass
+        elif op in ("BMC", "BDC"):
+            mcid = None
+            if op == "BDC" and len(ops) == 2:
+                prop = ops[1]
+                if isinstance(prop, pikepdf.Name):
+                    prop = props.get(str(prop))
+                if isinstance(prop, pikepdf.Dictionary) and "/MCID" in prop:
+                    mcid = int(prop.MCID)
+            marks.append(mcid)
+        elif op == "EMC":
+            if marks:
+                marks.pop()
+        elif op in ("Tj", "TJ", "'", '"'):
+            cur = next((m for m in reversed(marks) if m is not None), None)
+            if cur is None:
+                continue
+            m = _mat_mul(tm, ctm)
+            shown = size * math.hypot(m[2], m[3])
+            if shown > out.get(cur, 0.0):
+                out[cur] = shown
+    return out
+
+
+def _is_heading(el):
+    return el["role"] == "/H" or bool(_LEVEL_RE.match(el["role"]))
+
+
+def structure_findings(pdf, heuristic=False):
+    """The detectors on an open pikepdf.Pdf: [{"detector", "page" (1-based,
+    or None for the whole file), "element" ("#N Role", or ""),
+    "observed"}], in detector order. The element is named by its tag and,
+    when the RoleMap maps it, the standard role in parentheses. `heuristic`: the tree is the toolkit's
+    own heuristic tags, which tag no headings by design, so "no-headings"
+    is not said (the row already says to review headings)."""
+    els = _tree_elements(pdf)
+    if not els:
+        return []
+    n_pages = len(pdf.pages)
+    found = []
+
+    def add(det, page, el, observed):
+        found.append({"detector": det,
+                      "page": None if page is None else page + 1,
+                      "element": "" if el is None else "#{} {}{}".format(
+                          el["n"], el["tag"][1:],
+                          "" if el["tag"] == el["role"]
+                          else " ({})".format(el["role"][1:])),
+                      "observed": observed})
+
+    kids = {}
+    for el in els:
+        if el["parent"] is not None:
+            kids.setdefault(el["parent"], []).append(el["n"])
+    first = {}                 # element -> the first page its content is on
+    for el in reversed(els):
+        pages = [p for p, _ in el["mcids"]]
+        pages += [first[k] for k in kids.get(el["n"], ())
+                  if first.get(k) is not None]
+        first[el["n"]] = min(pages) if pages else None
+
+    heads = [el for el in els if _is_heading(el)]
+    blocks = [el for el in els if el["role"] in _TEXT_BLOCK_ROLES]
+    if not heads:
+        if n_pages > 1 and not heuristic:
+            add("no-headings", None, None,
+                "no heading is tagged in {} page(s); {} paragraph-level "
+                "element(s)".format(n_pages, len(blocks)))
+    else:
+        if n_pages >= DETECT_FEW_HEADINGS_PAGES and \
+                n_pages / len(heads) > DETECT_FEW_HEADINGS_PAGES:
+            add("few-headings", None, None,
+                "{} heading(s) in {} page(s)".format(len(heads), n_pages))
+        numbered = [(int(_LEVEL_RE.match(h["role"]).group(1)), h)
+                    for h in heads if _LEVEL_RE.match(h["role"])]
+        if numbered and numbered[0][0] > 1:
+            add("first-heading-not-h1", first[numbered[0][1]["n"]],
+                numbered[0][1],
+                "the first heading is H{}".format(numbered[0][0]))
+        for (a, _h), (b, h) in zip(numbered, numbered[1:]):
+            if b > a + 1:
+                add("skipped-level", first[h["n"]], h,
+                    "H{} follows H{}".format(b, a))
+        if len(heads) >= DETECT_FLOOD_MIN and len(heads) > \
+                DETECT_FLOOD_SHARE * (len(heads) + len(blocks)):
+            add("too-many-headings", None, None,
+                "{} heading(s) and {} paragraph-level element(s)".format(
+                    len(heads), len(blocks)))
+
+    # Which element shows text where, and how large.
+    owner = {}
+    for el in els:
+        for key in el["mcids"]:
+            owner[key] = el
+    head_pages = sorted({p for h in heads for p, _ in h["mcids"]})
+    first_text = min((p for p, _ in owner), default=None)
+    sizes = {}
+    for p in sorted(set(head_pages) | ({first_text} - {None})):
+        try:
+            sizes[p] = _mcid_text_sizes(pdf.pages[p])
+        except Exception:
+            sizes[p] = {}
+    for p in head_pages:
+        shown = [owner[(p, m)] for m in sizes.get(p, {}) if (p, m) in owner]
+        on_page = sorted({el["n"] for el in shown if _is_heading(el)})
+        if on_page and all(_is_heading(el) for el in shown):
+            add("heading-on-own-page", p, els[on_page[0]],
+                "{} heading(s) and no other tagged text on the page — "
+                "check the level and the parent heading".format(
+                    len(on_page)))
+    if first_text is not None:
+        items = [(size, owner[(first_text, m)])
+                 for m, size in sizes.get(first_text, {}).items()
+                 if (first_text, m) in owner]
+        if items:
+            big, el = max(items, key=lambda t: t[0])
+            ordered = sorted(size for size, _el in items)
+            median = ordered[len(ordered) // 2]
+            if not _is_heading(el) and el["role"] != "/Title" and \
+                    big >= DETECT_TITLE_RATIO * median:
+                add("largest-text-not-heading", first_text, el,
+                    "the largest text on the first page ({:.0f} pt; the "
+                    "page's median {:.0f} pt) is tagged {}".format(
+                        big, median, el["role"][1:]))
+
+    # Tables. Adjacent sibling Tables are reported once, as one visual
+    # table split into several, with their cells counted together.
+    group_of = {}
+    for _parent, children in kids.items():
+        run = []
+        for child in list(children) + [None]:
+            if child is not None and els[child]["role"] == "/Table":
+                run.append(child)
+                continue
+            if len(run) >= 2:
+                for t in run:
+                    group_of[t] = run[0]
+            run = []
+
+    def cells(table):
+        rows = th = td = 0
+        stack = list(kids.get(table["n"], ()))
+        while stack:
+            el = els[stack.pop()]
+            if el["role"] == "/Table":
+                continue           # a nested table counts on its own
+            if el["role"] == "/TR":
+                rows += 1
+            elif el["role"] == "/TH":
+                th += 1
+            elif el["role"] == "/TD":
+                td += 1
+            stack.extend(kids.get(el["n"], ()))
+        return rows, th, td
+
+    groups, one_row_pages = {}, {}
+    for table in (el for el in els if el["role"] == "/Table"):
+        rows, th, td = cells(table)
+        page = first[table["n"]]
+        head = group_of.get(table["n"])
+        if head is not None:
+            acc = groups.setdefault(head, {"n": 0, "rows": 0, "th": 0,
+                                           "td": 0, "one": 0,
+                                           "pages": set()})
+            acc["n"] += 1
+            acc["rows"] += rows
+            acc["th"] += th
+            acc["td"] += td
+            acc["one"] += rows == 1
+            if page is not None:
+                acc["pages"].add(page)
+            continue
+        if td and not th:
+            add("table-no-header-cells", page, table,
+                "{} row(s), {} cell(s), no TH".format(rows, td))
+        elif th and not td:
+            add("table-header-cells-only", page, table,
+                "{} row(s), {} TH, no TD".format(rows, th))
+        if rows == 1:
+            add("one-row-table", page, table,
+                "1 row, {} cell(s)".format(th + td))
+            if page is not None:
+                one_row_pages[page] = one_row_pages.get(page, 0) + 1
+    for head in sorted(groups):
+        acc = groups[head]
+        pages = sorted(acc["pages"])
+        if not pages:
+            span = "on no page"
+        elif len(pages) == 1:
+            span = "page {}".format(pages[0] + 1)
+        else:
+            span = "pages {}–{}".format(pages[0] + 1, pages[-1] + 1)
+        add("split-table", pages[0] if pages else None, els[head],
+            "{} adjacent tagged tables, {}: {} row(s) ({} of one row), {} "
+            "TH, {} TD — likely one visual table".format(
+                acc["n"], span, acc["rows"], acc["one"], acc["th"],
+                acc["td"]))
+    for page in sorted(one_row_pages):
+        if one_row_pages[page] >= DETECT_FORM_TABLES:
+            add("one-row-tables-on-page", page, None,
+                "{} one-row table(s) on the page".format(
+                    one_row_pages[page]))
+
+    # Images drawn in an element that is not a Figure and has no alt text.
+    by_page = {}
+    for el in els:
+        if el["role"] != "/Figure" and not el["alt"]:
+            for p, m in el["mcids"]:
+                by_page.setdefault(p, []).append((m, el))
+    for p in sorted(by_page):
+        try:
+            regions = _mcid_regions(pdf.pages[p],
+                                    {m for m, _el in by_page[p]})
+        except Exception:
+            continue
+        hit = {}
+        for m, el in by_page[p]:
+            if regions.get(m, {}).get("kinds", set()) & {"image", "inline"}:
+                hit.setdefault(el["n"], el)
+        for n in sorted(hit):
+            add("image-in-text", p, hit[n],
+                "an image is drawn in a {} element, which is not a Figure "
+                "and carries no alt text".format(hit[n]["role"][1:]))
+    order = {d: i for i, (d, _w) in enumerate(DETECTORS)}
+    found.sort(key=lambda f: order.get(f["detector"], len(order)))
+    return found
+
+
+def findings_word(findings):
+    """"detector ×N; …" for the Files sheet, in detector order."""
+    counts = {}
+    for f in findings:
+        counts[f["detector"]] = counts.get(f["detector"], 0) + 1
+    return "; ".join("{} ×{}".format(d, counts[d])
+                     for d, _w in DETECTORS if d in counts)
+
+
+def _detector_row(row, info, review, heuristic=False):
+    """The detectors' findings on a row, from one measured PDF (eval_pdf),
+    shared by Evaluate and the processing modes."""
+    if not info.get("tagged"):
+        row["findings"], row["detectors"] = None, ""
+        return
+    found = [f for f in info.get("findings") or ()
+             if not (heuristic and f["detector"] == "no-headings")]
+    row["findings"] = found
+    row["detectors"] = findings_word(found)
+    if info.get("findings_error"):
+        review.append("The heading and table detectors could not read the "
+                      "structure tree ({})".format(info["findings_error"]))
+    elif found:
+        review.append("{} detector finding(s) on headings and tables ({}) "
+                      "— see the Detectors sheet".format(
+                          len(found), row["detectors"]))
+
+
+def _detector_summary(rows):
+    """Summary lines for the detectors: how many PDFs they read, and each
+    detector that found something, with its findings, files and meaning."""
+    read = [r for r in rows if r.get("format") == "PDF"
+            and r.get("findings") is not None]
+    if not read:
+        return []
+    per, files = {}, {}
+    for r in read:
+        seen = set()
+        for f in r["findings"]:
+            per[f["detector"]] = per.get(f["detector"], 0) + 1
+            seen.add(f["detector"])
+        for d in seen:
+            files[d] = files.get(d, 0) + 1
+    total = sum(per.values())
+    pairs = [("Detectors (headings and tables)",
+              "{} finding(s) in {} of {} tagged PDF(s) read · structure "
+              "only; nothing was changed; each finding is a question for a "
+              "person, listed on the Detectors sheet".format(
+                  total, sum(1 for r in read if r["findings"]), len(read)))]
+    for d, words in DETECTORS:
+        if d in per:
+            pairs.append(("  " + d, "{} in {} file(s) — {}".format(
+                per[d], files[d], words)))
+    if not per:
+        pairs.append(("  Detector findings", "none"))
+    else:
+        pairs.append(("  Page and Element", DETECTOR_NOTE))
+    return pairs
+
+
+def _detector_rows(rows):
+    """The Detectors sheet: one row per finding, in file order."""
+    out = []
+    for r in rows:
+        for f in r.get("findings") or ():
+            out.append([r.get("order", ""), r.get("file", ""),
+                        f["page"] if f["page"] is not None else "",
+                        f["element"], f["detector"], f["observed"],
+                        DETECTOR_WORDS.get(f["detector"], "")])
+    return out
+
+
+DETECTOR_HEADERS = ["Order", "File", "Page", "Element", "Detector",
+                    "Observed", "What it means"]
+DETECTOR_WIDTHS = [8, 44, 7, 22, 26, 70, 60]
+DETECTOR_NOTE = ("Page is the page's position in the file (1 is the first "
+                 "page), not its printed number. Element is the element's "
+                 "position in the structure tree in reading order and its "
+                 "role, as Acrobat's Tags pane lists them; find it by page "
+                 "and role.")
+
+
+def _page_scan_xrefs(page):
+    """{xref: "/Name"} for the images drawn over at least SCAN_COVERAGE of
+    this (PyMuPDF) page: the page's scan, which needs its text read rather
+    than alt text."""
+    import fitz
+    found = {}
+    area = abs(page.rect.width * page.rect.height)
+    if not area:
+        return found
+    names = dict((img[0], "/" + str(img[7]).lstrip("/"))
+                 for img in page.get_images(full=True))
+    try:
+        infos = page.get_image_info(xrefs=True)
+    except Exception:
+        return found
+    for item in infos:
+        xref = item.get("xref") or 0
+        if not xref:
+            continue
+        box = fitz.Rect(item.get("bbox")) & page.rect
+        if box.is_empty:
+            continue
+        if box.width * box.height >= SCAN_COVERAGE * area:
+            found[xref] = names.get(xref, "")
+    return found
+
+
+def scan_image_names(path):
+    """{page index: ({"/Name", ...}, page has text)} for the pages with a
+    scan. The tagger marks a scan as an artifact on a page that has text,
+    because the text is what a reader needs; on a page with no text the scan
+    is the page's only content, and it is left untagged for a person (or an
+    OCR pass) to deal with, never tagged as an empty Figure."""
+    import fitz
+    out = {}
+    doc = fitz.open(path)
+    try:
+        for pno, page in enumerate(doc):
+            names = set(n for n in _page_scan_xrefs(page).values() if n)
+            if names:
+                out[pno] = (names, bool(page.get_text("text").strip()))
+    finally:
+        doc.close()
+    return out
 
 
 # Alt text equal to a bare image filename (what PowerPoint/export tools
 # often auto-fill, and what python-pptx writes) is treated as MISSING —
-# it reads "img0041.png" to a screen-reader user.
+# it reads "img0041.png" to a screen-reader user. So is a generic label an
+# auto-tagger or exporter fills in ("image 18", "Figure 3", "Picture",
+# "graphic") and text that is only digits or punctuation: a screen reader
+# announces it, and it says nothing about the picture. A label followed by
+# words ("Figure 3: enrollment by year") is real alt text.
 _FILENAME_ALT_RE = re.compile(
     r"^[\w,\s()-]+\.(png|jpe?g|tiff?|bmp|gif|wmf|emf|svg)$", re.I)
+_PLACEHOLDER_ALT_RE = re.compile(
+    r"^\(?\s*(image|img|figure|fig|picture|pic|photo|graphic|chart|"
+    r"diagram|drawing|object|untitled|alt|alt text|placeholder)"
+    r"[\s._#:()-]*(\d+([.-]\d+)*[a-z]?)?[\s.)]*$", re.I)
+_NO_WORDS_RE = re.compile(r"^[\W\d_]+$")
 
 
 def alt_is_missing(alt) -> bool:
     a = (alt or "").strip()
-    return not a or bool(_FILENAME_ALT_RE.match(a))
+    return (not a or bool(_FILENAME_ALT_RE.match(a))
+            or bool(_PLACEHOLDER_ALT_RE.match(a))
+            or bool(_NO_WORDS_RE.match(a)))
+
+
+def placeholder_alt(alt):
+    """The alt text when it is there but counts as none (alt_is_missing) —
+    "image 18", "Picture 3", a file name — so a step can quote it; "" when
+    there is none at all, or when it is real."""
+    a = (alt or "").strip()
+    return a if a and alt_is_missing(a) else ""
+
+
+def _note_placeholder(pr, tally):
+    """Count one picture still without alt text into `tally` when what it
+    carries is placeholder alt text, keeping the first as the example."""
+    shown = placeholder_alt(pr.get("descr")) if pr is not None else ""
+    if shown:
+        tally["held"] += 1
+        tally["example"] = tally["example"] or shown
+
+
+def alt_step(missing, held, example, noun):
+    """The one wording, for PDF figures and Office pictures alike, of alt
+    text still to write, `held` of the `missing` carrying placeholder alt
+    text that counts as none."""
+    step = "Add alt text for {} {}(s)".format(missing, noun)
+    if missing and held:
+        step += (" — {} only placeholder alt text, such as “{}”, "
+                 "which counts as none").format(
+                     "each carries" if held >= missing
+                     else "{} of them carry".format(held), example[:40])
+    return step
+
+
+def drafted_step(drafted, replaced=0):
+    """The one review step for AI-drafted alt text, in every format."""
+    return "Review {} AI-drafted alt text(s) for accuracy{}".format(
+        drafted, " — {} replaced placeholder alt text".format(replaced)
+        if replaced else "")
 
 
 # python-docx / python-pptx XML namespaces used for alt-text access. The
@@ -1490,6 +2590,46 @@ _NS = {
     "r": ("http://schemas.openxmlformats.org/officeDocument/2006/"
           "relationships"),
 }
+
+
+# Word and PowerPoint mark a picture decorative with an extension on its
+# docPr / cNvPr, not with its alt text (1.13.0: an image so marked was counted
+# as missing alt text, and an AI "decorative" reply was written as descr="").
+_ADEC_URI = "{C183D7F6-B498-43B3-948B-1728B52AA6E4}"
+_ADEC_NS = "http://schemas.microsoft.com/office/drawing/2017/decorative"
+
+
+def is_decorative(pr) -> bool:
+    """True when Office marked this picture decorative."""
+    if pr is None:
+        return False
+    for el in pr.iter("{{{}}}decorative".format(_ADEC_NS)):
+        if str(el.get("val", "")).strip().lower() in ("1", "true"):
+            return True
+    return False
+
+
+def mark_decorative(pr):
+    """Mark a picture decorative the way Office does."""
+    from lxml import etree
+    if pr is None or is_decorative(pr):
+        return
+    a_ns = _NS["a"]
+    ext_lst = pr.find("{{{}}}extLst".format(a_ns))
+    if ext_lst is None:
+        ext_lst = etree.SubElement(pr, "{{{}}}extLst".format(a_ns))
+    ext = etree.SubElement(ext_lst, "{{{}}}ext".format(a_ns))
+    ext.set("uri", _ADEC_URI)
+    dec = etree.SubElement(ext, "{{{}}}decorative".format(_ADEC_NS),
+                           nsmap={"adec": _ADEC_NS})
+    dec.set("val", "1")
+
+
+def picture_needs_alt(pr) -> bool:
+    """A picture needs alt text unless it has some or is marked decorative."""
+    if pr is None:
+        return True
+    return alt_is_missing(pr.get("descr")) and not is_decorative(pr)
 
 
 def iter_docx_images(document):
@@ -1520,14 +2660,18 @@ def eval_docx(path: str) -> dict:
     import docx
     document = docx.Document(path)
     images = alt_missing = 0
+    tally = {"held": 0, "example": ""}
     for doc_pr, _part in iter_docx_images(document):
         images += 1
-        if doc_pr is None or alt_is_missing(doc_pr.get("descr")):
+        if picture_needs_alt(doc_pr):
             alt_missing += 1
+            _note_placeholder(doc_pr, tally)
     headings = any(p.style is not None
                    and str(p.style.name or "").startswith("Heading")
                    for p in document.paragraphs)
     return {"images": images, "alt_missing": alt_missing,
+            "alt_placeholder": tally["held"],
+            "placeholder_example": tally["example"],
             "headings": headings, "tables": len(document.tables),
             "title": document.core_properties.title or ""}
 
@@ -1559,10 +2703,12 @@ def eval_pptx(path: str) -> dict:
     import pptx
     prs = pptx.Presentation(path)
     images = alt_missing = 0
+    tally = {"held": 0, "example": ""}
     for _idx, cnv, _image in iter_pptx_pictures(prs):
         images += 1
-        if alt_is_missing(cnv.get("descr")):
+        if picture_needs_alt(cnv):
             alt_missing += 1
+            _note_placeholder(cnv, tally)
     untitled = 0
     for slide in prs.slides:
         t = slide.shapes.title
@@ -1570,6 +2716,8 @@ def eval_pptx(path: str) -> dict:
             untitled += 1
     return {"slides": len(prs.slides), "images": images,
             "alt_missing": alt_missing, "untitled": untitled,
+            "alt_placeholder": tally["held"],
+            "placeholder_example": tally["example"],
             "title": prs.core_properties.title or ""}
 
 
@@ -1585,6 +2733,133 @@ def eval_image(path: str) -> dict:
             doc.close()
     except Exception:
         return {"width": 0, "height": 0}
+
+
+# ---------------------------------------------------------------------------
+# veraPDF (1.13.0, optional). When installed it is the verdict for a PDF:
+# PDF/UA-1, run on the file the row describes (the source in Evaluate, the
+# output otherwise). The structure walk runs either way, and the Checked By
+# column names what ran. PDF/UA-1 rather than UA-2: UA-2 requires a PDF 2.0
+# file and fails every 1.x file on that rule alone.
+# ---------------------------------------------------------------------------
+VERAPDF_PROFILE = "ua1"
+VERAPDF_TIMEOUT = 900        # seconds per file
+# Rule 5-1 asks for the PDF/UA identifier in the metadata: a declaration
+# that the file conforms. The toolkit never writes it — a file earns it after
+# a person's review — so a file whose only failed rule is 5-1 is reported as
+# needing that review rather than as needing manual work.
+VERAPDF_DECLARATION_RULES = ("5-1",)
+# A Windows batch file runs through cmd.exe, which reads these characters in
+# its arguments as commands; a path containing one is not handed to it.
+_BATCH_UNSAFE = set('&|<>^%"!')
+
+
+def find_verapdf() -> str:
+    """The veraPDF launcher: $DC_VERAPDF, then PATH, then the installer's
+    default folder. "" when none is found."""
+    candidates = []
+    env = os.environ.get("DC_VERAPDF", "").strip()
+    if env:
+        candidates.append(env)
+    for name in ("verapdf", "verapdf.bat"):
+        found = shutil.which(name)
+        if found:
+            candidates.append(found)
+    home = os.path.expanduser("~")
+    candidates += [os.path.join(home, "verapdf", "verapdf"),
+                   os.path.join(home, "verapdf", "verapdf.bat")]
+    for cand in candidates:
+        if os.path.isfile(cand) and (cand.lower().endswith(".bat")
+                                     or os.access(cand, os.X_OK)):
+            return cand
+    return ""
+
+
+def parse_verapdf_json(text):
+    """The parts of a veraPDF --format json report the toolkit uses. Raises
+    ValueError (or KeyError/IndexError/TypeError) for anything else."""
+    report = json.loads(text)["report"]
+    version = ""
+    for rel in (report.get("buildInformation") or {}).get(
+            "releaseDetails") or []:
+        if rel.get("id") == "apps":
+            version = str(rel.get("version") or "")
+    job = report["jobs"][0]
+    results = job.get("validationResult")
+    if isinstance(results, dict):
+        results = [results]
+    if not results:
+        raise ValueError("no validation result")
+    res = results[0]
+    status = res.get("jobEndStatus", "normal")
+    if status != "normal":
+        raise ValueError("job ended {!r}".format(status))
+    details = res.get("details") or {}
+    rules = []
+    for rule in details.get("ruleSummaries") or []:
+        rules.append(("{}-{}".format(rule.get("clause"),
+                                     rule.get("testNumber")),
+                      int(rule.get("failedChecks") or 0),
+                      str(rule.get("description") or "")))
+    return {"version": version, "profile": str(res.get("profileName") or ""),
+            "compliant": bool(res.get("compliant")),
+            "failed_rules": int(details.get("failedRules") or len(rules)),
+            "rules": rules, "error": ""}
+
+
+def verapdf_check(path, launcher):
+    """veraPDF PDF/UA-1 on one file: the parsed report, or {"error": what
+    was observed}. Exit 0 is compliant and 1 is not; anything else is
+    reported as itself."""
+    if launcher.lower().endswith(".bat") and _BATCH_UNSAFE & set(path):
+        return {"error": "not run — the path holds a character a Windows "
+                         "batch file would read as a command"}
+    try:
+        proc = subprocess.run(
+            [launcher, "-f", VERAPDF_PROFILE, "--format", "json", path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=VERAPDF_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return {"error": "did not finish within {} min".format(
+            VERAPDF_TIMEOUT // 60)}
+    except OSError as e:
+        return {"error": "could not be started: {}".format(e)}
+    if proc.returncode not in (0, 1):
+        tail = (proc.stderr or b"").decode("utf-8", "replace").strip()
+        tail = tail.splitlines()[-1][:200] if tail else "no message"
+        return {"error": "exit {}: {}".format(proc.returncode, tail)}
+    try:
+        return parse_verapdf_json(
+            (proc.stdout or b"").decode("utf-8", "replace"))
+    except (ValueError, KeyError, IndexError, TypeError) as e:
+        return {"error": "its report could not be read ({})".format(
+            e.__class__.__name__)}
+
+
+def apply_verapdf(row, result, manual, review):
+    """Fold one veraPDF result into a PDF row. None means it did not run."""
+    if result is None:
+        row["checked_by"] = "structure walk (veraPDF not run)"
+        return
+    row["verapdf"] = result
+    if result.get("error"):
+        row["checked_by"] = "structure walk (veraPDF: {})".format(
+            result["error"])
+        return
+    row["checked_by"] = "veraPDF {} PDF/UA-1 + structure walk".format(
+        result["version"] or "(version not reported)")
+    rules = result["rules"]
+    row["rule_failures"] = ("; ".join("{} ×{}".format(r, n)
+                                      for r, n, _d in rules)
+                            if rules else "none")
+    real = [r for r in rules if r[0] not in VERAPDF_DECLARATION_RULES]
+    if real:
+        manual.append("veraPDF PDF/UA-1: {} rule(s) failed — see Rule "
+                      "Failures and the Summary".format(len(real)))
+    elif rules:
+        review.append("veraPDF PDF/UA-1: only the PDF/UA identifier is "
+                      "missing (rule 5-1) — declare conformance only after "
+                      "a person has reviewed the file")
 
 
 # ---------------------------------------------------------------------------
@@ -1649,6 +2924,45 @@ def run_tesseract_text(src) -> str:
     return (proc.stdout or b"").decode("utf-8", "replace").strip()
 
 
+# A title a tool filled in, not one a person wrote: what a screen reader
+# would announce as the document's name tells the listener nothing.
+_PLACEHOLDER_TITLE_RE = re.compile(
+    r"^(untitled( document)?|document\s*\d*|presentation\s*\d*|"
+    r"microsoft (word|powerpoint|excel) - .*|.*\.(docx?|pdf|pptx?|odt|"
+    r"rtf|tex))$", re.I)
+
+
+def title_is_placeholder(title, path=""):
+    """True for a tool's placeholder title, or the file's own name."""
+    t = (title or "").strip()
+    if not t:
+        return False
+    if _PLACEHOLDER_TITLE_RE.match(t):
+        return True
+    name = os.path.basename(path or "")
+    stem = os.path.splitext(name)[0]
+    return bool(stem) and t.lower() in (name.lower(), stem.lower())
+
+
+def title_word(title, path=""):
+    """The Doc Title column: Present, Placeholder or Missing."""
+    if not (title or "").strip():
+        return "Missing"
+    return "Placeholder" if title_is_placeholder(title, path) else "Present"
+
+
+def title_set_word(entry):
+    """Doc Title for a title this run set: where it came from, so a title
+    made from the file's name is not called a placeholder by the run that
+    chose it."""
+    return ("Set (record title)" if (entry.get("title") or "").strip()
+            else "Set (from the file name)")
+
+
+TITLE_FROM_NAME = ("The document title was set from the file's name — "
+                   "replace it if it does not describe the document")
+
+
 def prettify_title(entry) -> str:
     """Document title: the record title when the downloader supplied one,
     else the filename stem with separators spaced (never case-mangled)."""
@@ -1699,27 +3013,177 @@ def _mc_close():
     return pikepdf.ContentStreamInstruction([], pikepdf.Operator("EMC"))
 
 
-def _rewrite_page_content(pdf, page):
-    """Wrap text objects and image draws in marked content. Returns
-    (new_instructions_or_None, elems) — elems = [(mcid, kind, xobj_name)];
-    None means the page could not be safely rewritten."""
+def _artifact_open():
     import pikepdf
+    return pikepdf.ContentStreamInstruction(
+        [pikepdf.Name("/Artifact")], pikepdf.Operator("BMC"))
+
+
+def _text_form_names(page):
+    """Names of the Form XObjects in this page's resources whose content
+    holds text objects — ocrmypdf's text layer is one. Each is tagged as a P
+    where the page draws it; a form without text is left unwrapped."""
+    import pikepdf
+    names = set()
+    try:
+        xobjs = page.Resources.XObject
+    except (AttributeError, KeyError):
+        return names
+    for name, ref in xobjs.items():
+        try:
+            if ref.Subtype != pikepdf.Name.Form:
+                continue
+            for inst in pikepdf.parse_content_stream(ref):
+                if (not isinstance(inst, pikepdf.ContentStreamInlineImage)
+                        and str(inst.operator) == "BT"):
+                    names.add(str(name))
+                    break
+        except Exception:
+            continue
+    return names
+
+
+def _vector_form_names(page):
+    """Names of the Form XObjects in this page's resources that only draw:
+    path painting or shadings, with no text, no image and no further
+    XObject inside. Each is marked /Artifact where the page draws it, as a
+    vector drawing on the page itself is."""
+    import pikepdf
+    names = set()
+    try:
+        xobjs = page.Resources.XObject
+    except (AttributeError, KeyError):
+        return names
+    for name, ref in xobjs.items():
+        try:
+            if ref.Subtype != pikepdf.Name.Form:
+                continue
+            draws = False
+            for inst in pikepdf.parse_content_stream(ref):
+                if isinstance(inst, pikepdf.ContentStreamInlineImage):
+                    draws = False
+                    break
+                op = str(inst.operator)
+                if op in ("BT", "Do"):
+                    draws = False
+                    break
+                if op in _VECTOR_OPS:
+                    draws = True
+            if draws:
+                names.add(str(name))
+        except Exception:
+            continue
+    return names
+
+
+def _drawn_images(page, scans=frozenset()):
+    """The image XObjects this page draws outside text objects, scans
+    excluded: the candidates for an alt-text draft, so a draft is never
+    spent on an image the page lists but does not draw."""
+    import pikepdf
+    img_names = _image_xobject_names(page)
+    drawn, in_text = [], False
     try:
         instrs = pikepdf.parse_content_stream(page)
     except Exception:
-        return None, []
-    img_names = _image_xobject_names(page)
-    new, elems = [], []
-    mcid = 0
-    in_text = False
+        return drawn
     for inst in instrs:
         if isinstance(inst, pikepdf.ContentStreamInlineImage):
-            new.append(inst)
             continue
         op = str(inst.operator)
         if op == "BT":
+            in_text = True
+        elif op == "ET":
+            in_text = False
+        elif op == "Do" and not in_text and len(inst.operands) == 1:
+            name = str(inst.operands[0])
+            if name in img_names and name not in scans and name not in drawn:
+                drawn.append(name)
+    return drawn
+
+
+def _rewrite_page_content(pdf, page, scans=frozenset(), decisions=None,
+                          leave=frozenset()):
+    """Wrap text objects, image draws and text-bearing Form XObjects in
+    marked content, and mark vector drawings /Artifact. Returns
+    (new_instructions_or_None, elems, marked): elems = [(mcid, kind,
+    xobject_name)], marked = {"scan": n, "decorative": n, "vector": n} for
+    what was made /Artifact; None means the page is left as it was.
+
+    A vector drawing is a painted path, a shading, or a Form XObject that
+    only draws (_vector_form_names), outside the stream's own tags and
+    artifacts. Each becomes /Artifact — rules, borders and fills are
+    decoration — and the row says how many, because a chart or diagram
+    drawn in lines needs a Figure with alt text instead. A clipping path
+    (ended by "n") paints nothing and is left as it is.
+
+    `scans`: this page's scans on a page that has text — an /Artifact, since
+    the page's text is what a reader needs. `leave`: scans on a page with
+    no text, drawn as they were. `decisions`: {image name: alt text, "" for
+    decorative (an /Artifact), None for not drafted}."""
+    import pikepdf
+    decisions = decisions or {}
+    try:
+        instrs = pikepdf.parse_content_stream(page)
+    except Exception:
+        return None, [], {}
+    img_names = _image_xobject_names(page)
+    text_forms = _text_form_names(page)
+    vector_forms = _vector_form_names(page)
+    new, elems = [], []
+    marked = {"scan": 0, "decorative": 0, "vector": 0}
+    mcid = 0
+    in_text = False
+    path = None          # a path object being built, held until it ends
+    own = []             # the stream's own marked content: tag/artifact/other
+    for inst in instrs:
+        if isinstance(inst, pikepdf.ContentStreamInlineImage):
+            if path is not None:
+                new.extend(path)
+                path = None
+            new.append(inst)
+            continue
+        op = str(inst.operator)
+        free = "tag" not in own and "artifact" not in own
+        if not in_text and op in _PATH_BUILD_OPS:
+            path = (path or []) + [inst]
+            continue
+        if path is not None:
+            if op in _PATH_END_OPS and op != "n" and free:
+                new.append(_artifact_open())
+                new.extend(path)
+                new.append(inst)
+                new.append(_mc_close())
+                marked["vector"] += 1
+                path = None
+                continue
+            new.extend(path)
+            path = None
+            if op in _PATH_END_OPS:
+                new.append(inst)
+                continue
+        if op == "sh" and not in_text and free:
+            new.append(_artifact_open())
+            new.append(inst)
+            new.append(_mc_close())
+            marked["vector"] += 1
+            continue
+        if op in ("BMC", "BDC"):
+            ops = list(inst.operands)
+            kind = ("artifact" if ops and str(ops[0]) == "/Artifact"
+                    else "tag" if op == "BDC" and len(ops) == 2 else
+                    "other")
+            own.append(kind)
+            new.append(inst)
+            continue
+        if op == "EMC":
+            if own:
+                own.pop()
+            new.append(inst)
+            continue
+        if op == "BT":
             if in_text:            # nested BT = malformed; bail out
-                return None, []
+                return None, [], {}
             new.append(_mc_open("/P", mcid))
             new.append(inst)
             elems.append((mcid, "P", ""))
@@ -1727,22 +3191,48 @@ def _rewrite_page_content(pdf, page):
             in_text = True
         elif op == "ET":
             if not in_text:
-                return None, []
+                return None, [], {}
             new.append(inst)
             new.append(_mc_close())
             in_text = False
-        elif (op == "Do" and not in_text and len(inst.operands) == 1
-                and str(inst.operands[0]) in img_names):
-            new.append(_mc_open("/Figure", mcid))
-            new.append(inst)
-            new.append(_mc_close())
-            elems.append((mcid, "Figure", str(inst.operands[0])))
-            mcid += 1
+        elif op == "Do" and not in_text and len(inst.operands) == 1:
+            name = str(inst.operands[0])
+            if name in leave:
+                new.append(inst)
+            elif name in img_names and (name in scans
+                                        or decisions.get(name) == ""):
+                new.append(_artifact_open())
+                new.append(inst)
+                new.append(_mc_close())
+                marked["scan" if name in scans else "decorative"] += 1
+            elif name in img_names:
+                new.append(_mc_open("/Figure", mcid))
+                new.append(inst)
+                new.append(_mc_close())
+                elems.append((mcid, "Figure", name))
+                mcid += 1
+            elif name in text_forms:
+                new.append(_mc_open("/P", mcid))
+                new.append(inst)
+                new.append(_mc_close())
+                elems.append((mcid, "P", name))
+                mcid += 1
+            elif name in vector_forms and free:
+                new.append(_artifact_open())
+                new.append(inst)
+                new.append(_mc_close())
+                marked["vector"] += 1
+            else:
+                new.append(inst)
         else:
             new.append(inst)
+    if path is not None:           # a path the stream never ended
+        new.extend(path)
     if in_text:                    # unbalanced at end of stream
-        return None, []
-    return (new if elems else None), elems
+        return None, [], {}
+    changed = (elems or marked["scan"] or marked["decorative"]
+               or marked["vector"])
+    return (new if changed else None), elems, marked
 
 
 def collect_pdf_image_bytes(path, max_images=AI_MAX_ALT_PER_FILE):
@@ -1768,14 +3258,587 @@ def collect_pdf_image_bytes(path, max_images=AI_MAX_ALT_PER_FILE):
     return out
 
 
-def tag_pdf(path, doc_lang, title, alt_fn=None):
-    """Metadata + heuristic tagging, in place (path is rewritten only after
-    the result verifies). alt_fn(page_index, xobject_name) → alt text or
-    None. Returns a result dict for the report row."""
+# ---------------------------------------------------------------------------
+# Alt text into an existing structure tree (set_alt). A Figure that a word
+# processor or an auto-tagger tagged without alt text, or with placeholder
+# alt text ("image 18"), is located on its page from the content it marks,
+# rendered as a reader sees it, and given an AI draft — never a Figure whose
+# alt text is real. What cannot be drafted is counted and named: a figure
+# that could not be located, a page drawn in slices, a draft that is itself
+# a placeholder, the per-file limit. A Figure the AI judges decorative, or
+# one that is only a line, becomes an artifact. The file is saved only
+# after a second walk finds the tags no worse than before.
+# ---------------------------------------------------------------------------
+_MAT_ID = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+STRIP_MIN_PER_PAGE = 3     # page-wide strips on one page before it is "slices"
+LINE_MAX_PT = 2.0          # a Figure thinner than this is a line (a rule)
+REGION_MIN_PX = 512        # a small figure is rendered up to this long edge
+REGION_MAX_ZOOM = 8.0
+
+
+def _mat_mul(a, b):
+    """a, then b (PDF's row-vector convention)."""
+    return (a[0] * b[0] + a[1] * b[2], a[0] * b[1] + a[1] * b[3],
+            a[2] * b[0] + a[3] * b[2], a[2] * b[1] + a[3] * b[3],
+            a[4] * b[0] + a[5] * b[2] + b[4],
+            a[4] * b[1] + a[5] * b[3] + b[5])
+
+
+def _mat_pt(m, x, y):
+    return (x * m[0] + y * m[2] + m[4], x * m[1] + y * m[3] + m[5])
+
+
+def _grow_box(box, pts):
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    if box is None:
+        return [min(xs), min(ys), max(xs), max(ys)]
+    return [min(box[0], min(xs)), min(box[1], min(ys)),
+            max(box[2], max(xs)), max(box[3], max(ys))]
+
+
+def _unit_square(m):
+    return [_mat_pt(m, 0, 0), _mat_pt(m, 1, 0), _mat_pt(m, 0, 1),
+            _mat_pt(m, 1, 1)]
+
+
+def _mcid_regions(page, wanted):
+    """{mcid: {"box": [x0, y0, x1, y1] in PDF user space or None, "kinds":
+    set of what it draws ("image", "inline", "form", "vector", "text"),
+    "images": object ids of the image XObjects}} for the marked-content ids
+    in `wanted`, from the page's own content stream. The box follows the
+    current transformation (q, Q, cm): an image is its unit square, a form
+    its /BBox through its /Matrix, a path its points when painted. Text
+    adds no box — its extent needs the font — so a Figure that holds only
+    text is not located."""
+    import pikepdf
+    xobjs, props = {}, {}
+    res = page.obj.get("/Resources")
+    if isinstance(res, pikepdf.Dictionary):
+        for key_name, store in (("/XObject", xobjs), ("/Properties", props)):
+            table = res.get(key_name)
+            if isinstance(table, pikepdf.Dictionary):
+                for key in table.keys():
+                    store[str(key)] = table[key]
+    out = {m: {"box": None, "kinds": set(), "images": set()} for m in wanted}
+    ctm, saved, marks, path = _MAT_ID, [], [], []
+    for inst in pikepdf.parse_content_stream(page):
+        cur = next((m for m in reversed(marks) if m is not None), None)
+        hit = out.get(cur)
+        if isinstance(inst, pikepdf.ContentStreamInlineImage):
+            if hit is not None:
+                hit["box"] = _grow_box(hit["box"], _unit_square(ctm))
+                hit["kinds"].add("inline")
+            continue
+        op = str(inst.operator)
+        ops = list(inst.operands)
+        if op == "q":
+            saved.append(ctm)
+        elif op == "Q":
+            ctm = saved.pop() if saved else _MAT_ID
+        elif op == "cm" and len(ops) == 6:
+            ctm = _mat_mul(tuple(float(v) for v in ops), ctm)
+        elif op in ("BMC", "BDC"):
+            mcid = None
+            if op == "BDC" and len(ops) == 2:
+                prop = ops[1]
+                if isinstance(prop, pikepdf.Name):
+                    prop = props.get(str(prop))
+                if isinstance(prop, pikepdf.Dictionary) and "/MCID" in prop:
+                    mcid = int(prop.MCID)
+            marks.append(mcid)
+        elif op == "EMC":
+            if marks:
+                marks.pop()
+        elif op == "Do" and len(ops) == 1 and hit is not None:
+            obj = xobjs.get(str(ops[0]))
+            try:
+                kind = obj.Subtype
+            except (AttributeError, KeyError):
+                continue
+            if kind == pikepdf.Name.Image:
+                hit["box"] = _grow_box(hit["box"], _unit_square(ctm))
+                hit["kinds"].add("image")
+                hit["images"].add(obj.objgen)
+            elif kind == pikepdf.Name.Form:
+                try:
+                    b = [float(v) for v in obj.BBox]
+                    fm = tuple(float(v) for v in obj.get("/Matrix", _MAT_ID))
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    continue
+                m2 = _mat_mul(fm, ctm)
+                hit["box"] = _grow_box(hit["box"], [
+                    _mat_pt(m2, b[0], b[1]), _mat_pt(m2, b[2], b[1]),
+                    _mat_pt(m2, b[0], b[3]), _mat_pt(m2, b[2], b[3])])
+                hit["kinds"].add("form")
+        elif op in ("m", "l") and len(ops) == 2:
+            path.append(_mat_pt(ctm, float(ops[0]), float(ops[1])))
+        elif op == "c" and len(ops) == 6:
+            path += [_mat_pt(ctm, float(ops[i]), float(ops[i + 1]))
+                     for i in (0, 2, 4)]
+        elif op in ("v", "y") and len(ops) == 4:
+            path += [_mat_pt(ctm, float(ops[i]), float(ops[i + 1]))
+                     for i in (0, 2)]
+        elif op == "re" and len(ops) == 4:
+            x, y, w, h = (float(v) for v in ops)
+            path += [_mat_pt(ctm, x, y), _mat_pt(ctm, x + w, y),
+                     _mat_pt(ctm, x, y + h), _mat_pt(ctm, x + w, y + h)]
+        elif op in _PATH_END_OPS:
+            if hit is not None and path and op != "n":
+                hit["box"] = _grow_box(hit["box"], path)
+                hit["kinds"].add("vector")
+            path = []
+        elif op == "sh" and hit is not None:
+            hit["kinds"].add("vector")
+        elif op in ("Tj", "TJ", "'", '"') and hit is not None:
+            hit["kinds"].add("text")
+    return out
+
+
+def _figure_targets(pdf):
+    """The Figures of an existing tree a reader gets nothing from — no alt
+    text, or placeholder alt text (alt_is_missing), and no /ActualText — in
+    tree order: [{"elem", "page", "mcids", "held", "in_form"}]. `page` is
+    the index of the page the Figure's content is on (its /Pg, an MCR's,
+    or an ancestor's); `mcids` the ids it marks there; `held` the
+    placeholder it carries, or ""; `in_form` that some of its content is
+    marked inside a form XObject (an MCR with /Stm), which this does not
+    read."""
+    import pikepdf
+    root = pdf.Root
+    tree = root.get("/StructTreeRoot")
+    if not isinstance(tree, pikepdf.Dictionary):
+        return []
+    roles = {}
+    role_map = tree.get("/RoleMap")
+    if isinstance(role_map, pikepdf.Dictionary):
+        for key in role_map.keys():
+            roles[str(key)] = str(role_map[key])
+
+    def standard(name):
+        hops = 0
+        while name in roles and hops < 16:
+            name, hops = roles[name], hops + 1
+        return name
+
+    page_no = {page.obj.objgen: i for i, page in enumerate(pdf.pages)}
+
+    def page_of(obj, inherited):
+        pg = obj.get("/Pg")
+        if isinstance(pg, pikepdf.Dictionary):
+            return page_no.get(pg.objgen, inherited)
+        return inherited
+
+    out, seen = [], set()
+    stack = [(tree.get("/K"), None)]
+    steps = 0
+    while stack and steps < 1000000:
+        steps += 1
+        node, pg = stack.pop()
+        if isinstance(node, pikepdf.Array):
+            stack.extend((kid, pg) for kid in reversed(list(node)))
+            continue
+        if not isinstance(node, pikepdf.Dictionary):
+            continue
+        if node.is_indirect:
+            if node.objgen in seen:
+                continue
+            seen.add(node.objgen)
+        if "/S" not in node:
+            continue
+        pg = page_of(node, pg)
+        if standard(str(node.S)) == "/Figure":
+            alt = str(node.get("/Alt", "")).strip()
+            actual = str(node.get("/ActualText", "")).strip()
+            if actual or not alt_is_missing(alt):
+                continue
+            mcids, page, in_form = [], pg, False
+            kids = node.get("/K")
+            kids = list(kids) if isinstance(kids, pikepdf.Array) else [kids]
+            for kid in kids:
+                if isinstance(kid, pikepdf.Dictionary):
+                    if kid.get("/Type") == pikepdf.Name.MCR:
+                        if "/Stm" in kid:
+                            in_form = True
+                            continue
+                        kpg = page_of(kid, page)
+                        if page is None:
+                            page = kpg
+                        if kpg == page and "/MCID" in kid:
+                            mcids.append(int(kid.MCID))
+                elif kid is not None and not isinstance(kid, pikepdf.Array):
+                    try:
+                        mcids.append(int(kid))
+                    except (TypeError, ValueError):
+                        pass
+            out.append({"elem": node, "page": page, "mcids": mcids,
+                        "held": placeholder_alt(alt), "in_form": in_form})
+            continue
+        stack.append((node.get("/K"), pg))
+    return out
+
+
+def _is_strip(box, page_width):
+    """A region as wide as half the page and at least eight times wider
+    than it is tall."""
+    w, h = box[2] - box[0], box[3] - box[1]
+    return h > 0 and w >= 0.5 * page_width and w / h >= 8
+
+
+def _pix_bytes(pix):
+    """A rendered pixmap as bytes ready to send: PNG, RGB, with a JPEG
+    fallback for one too large to send at all."""
+    import fitz
+    try:
+        if pix.alpha:
+            pix = fitz.Pixmap(pix, 0)
+        if pix.colorspace is not None and pix.colorspace.n == 4:
+            pix = fitz.Pixmap(fitz.csRGB, pix)
+    except Exception:
+        pass
+    data = pix.tobytes("png")
+    if len(data) > AI_MAX_SEND_BYTES:
+        try:
+            return pix.tobytes("jpeg", jpg_quality=88), "image/jpeg"
+        except (TypeError, ValueError, RuntimeError):
+            pass
+    return data, "image/png"
+
+
+def _region_bytes(fpage, box):
+    """The region `box` (PDF user space) of a pymupdf page, rendered as a
+    reader sees it — overlapping text and drawings included — or None when
+    it lies off the page."""
+    import fitz
+    rect = (fitz.Rect(*box) * fpage.transformation_matrix) & fpage.rect
+    if rect.is_empty or rect.width < 1 or rect.height < 1:
+        return None
+    scale = _clamp_scale(rect.width, rect.height)
+    longest = max(rect.width, rect.height)
+    if longest * scale < REGION_MIN_PX:
+        scale = min(REGION_MIN_PX / longest, REGION_MAX_ZOOM)
+    pix = fpage.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=rect)
+    return _pix_bytes(pix)
+
+
+def _parent_tree_entry(tree, key):
+    """The ParentTree value for `key`: a number tree, flat or with Kids."""
+    import pikepdf
+    stack, steps = [tree.get("/ParentTree")], 0
+    while stack and steps < 100000:
+        steps += 1
+        node = stack.pop()
+        if not isinstance(node, pikepdf.Dictionary):
+            continue
+        nums = node.get("/Nums")
+        if isinstance(nums, pikepdf.Array):
+            for i in range(0, len(nums) - 1, 2):
+                try:
+                    if int(nums[i]) == key:
+                        return nums[i + 1]
+                except (TypeError, ValueError):
+                    continue
+        kids = node.get("/Kids")
+        if isinstance(kids, pikepdf.Array):
+            stack.extend(list(kids))
+    return None
+
+
+def _figures_to_artifacts(pdf, page, targets):
+    """Make these Figures of one page artifacts: each MCID's marked content
+    becomes /Artifact, the element leaves its parent's /K, and its
+    ParentTree slot is emptied. Returns how many were converted; a Figure
+    that is a direct object, or whose parent cannot be found, is left."""
+    import pikepdf
+    tree = pdf.Root.StructTreeRoot
+    done, mcids = [], set()
+    for t in targets:
+        elem = t["elem"]
+        parent = elem.get("/P")
+        if not elem.is_indirect or not isinstance(parent, pikepdf.Dictionary):
+            continue
+        kids = parent.get("/K")
+        if isinstance(kids, pikepdf.Array):
+            keep = [k for k in kids if not (
+                isinstance(k, pikepdf.Dictionary) and k.is_indirect
+                and k.objgen == elem.objgen)]
+            if len(keep) == len(kids):
+                continue
+            parent.K = pikepdf.Array(keep)
+        elif (isinstance(kids, pikepdf.Dictionary) and kids.is_indirect
+              and kids.objgen == elem.objgen):
+            parent.K = pikepdf.Array([])
+        else:
+            continue
+        done.append(t)
+        mcids.update(t["mcids"])
+    if not done:
+        return 0
+    props = {}
+    res = page.obj.get("/Resources")
+    if isinstance(res, pikepdf.Dictionary):
+        table = res.get("/Properties")
+        if isinstance(table, pikepdf.Dictionary):
+            for key in table.keys():
+                props[str(key)] = table[key]
+    new = []
+    for inst in pikepdf.parse_content_stream(page):
+        if (not isinstance(inst, pikepdf.ContentStreamInlineImage)
+                and str(inst.operator) == "BDC" and len(inst.operands) == 2):
+            prop = inst.operands[1]
+            if isinstance(prop, pikepdf.Name):
+                prop = props.get(str(prop))
+            if (isinstance(prop, pikepdf.Dictionary) and "/MCID" in prop
+                    and int(prop.MCID) in mcids):
+                new.append(pikepdf.ContentStreamInstruction(
+                    [pikepdf.Name.Artifact], pikepdf.Operator("BMC")))
+                continue
+        new.append(inst)
+    page.Contents = pdf.make_stream(pikepdf.unparse_content_stream(new))
+    key = page.obj.get("/StructParents")
+    entry = _parent_tree_entry(tree, int(key)) if key is not None else None
+    if isinstance(entry, pikepdf.Array):
+        for m in mcids:
+            if 0 <= m < len(entry):
+                entry[m] = None
+    return len(done)
+
+
+def tree_alt_wanted(path):
+    """How many Figures in an existing tree need alt text (none, or a
+    placeholder): what a barred file would have asked for."""
+    import pikepdf
+    try:
+        with pikepdf.open(path) as pdf:
+            return len(_figure_targets(pdf))
+    except Exception:
+        return 0
+
+
+def _tree_no_worse(before, after, written, removed=0):
+    """"" when the tags after writing are no worse than before, else what
+    got worse. `removed` Figures were made artifacts on purpose."""
+    worse = []
+    for key, word in (("untagged_pages", "untagged pages"),
+                      ("vector_pages", "pages with untagged drawings"),
+                      ("orphans", "tags pointing at nothing"),
+                      ("unparsed_pages", "unreadable pages")):
+        if after.get(key, 0) > before.get(key, 0):
+            worse.append("{} {} → {}".format(word, before.get(key, 0),
+                                             after.get(key, 0)))
+    if after.get("elements", 0) < before.get("elements", 0) - removed:
+        worse.append("elements {} → {}, {} made artifacts".format(
+            before.get("elements", 0), after.get("elements", 0), removed))
+    if after.get("figures_alt", 0) < before.get("figures_alt", 0) + written:
+        worse.append("figures with alt text {} → {}, {} written".format(
+            before.get("figures_alt", 0), after.get("figures_alt", 0),
+            written))
+    return "; ".join(worse)
+
+
+def draft_tree_alt(path, ai_ctx, log_fn, check=None):
+    """Draft alt text into the Figures of an existing tree that need it, in
+    place; the file is rewritten only after a second walk finds the tags no
+    worse (_tree_no_worse). Returns what happened, counted."""
+    import fitz
+    import pikepdf
+    res = {"wanted": 0, "drafted": 0, "replaced": 0, "decorative": 0,
+           "shared": 0, "strips": 0, "strip_pages": 0, "unlocated": 0,
+           "rejected": 0, "rejected_example": "", "over_budget": 0,
+           "failed": 0, "lines": 0, "offpage": 0, "artifacts": 0,
+           "rolled_back": ""}
+    tmp = path + ".alt.tmp"
+    with pikepdf.open(path) as pdf:
+        targets = _figure_targets(pdf)
+        res["wanted"] = len(targets)
+        if not targets:
+            return res
+        before = pdf_structure(pdf)
+        by_page = {}
+        for t in targets:
+            by_page.setdefault(t["page"], []).append(t)
+        drafts = {}            # the image's id, or the render's digest -> draft
+        to_artifact = {}       # page index -> targets to make artifacts
+        doc = fitz.open(path)
+        try:
+            for pno in sorted(by_page, key=lambda p: -1 if p is None else p):
+                group = by_page[pno]
+                if pno is None:
+                    res["unlocated"] += len(group)
+                    continue
+                page = pdf.pages[pno]
+                regions = _mcid_regions(page, {m for t in group
+                                               for m in t["mcids"]})
+                boxes, same = [], []
+                for t in group:
+                    box, kinds, images = None, set(), set()
+                    for m in t["mcids"]:
+                        got = regions.get(m, {})
+                        kinds |= got.get("kinds", set())
+                        images |= got.get("images", set())
+                        b = got.get("box")
+                        if b:
+                            box = list(b) if box is None else [
+                                min(box[0], b[0]), min(box[1], b[1]),
+                                max(box[2], b[2]), max(box[3], b[3])]
+                    boxes.append(box)
+                    # A Figure that draws one image XObject and nothing else
+                    # shares its draft with every Figure drawing that image.
+                    same.append(("image",) + tuple(images)[0]
+                                if kinds == {"image"} and len(images) == 1
+                                else None)
+                width = float(page.mediabox[2]) - float(page.mediabox[0])
+                strips = [b is not None and _is_strip(b, width)
+                          for b in boxes]
+                sliced = sum(strips) >= STRIP_MIN_PER_PAGE
+                if sliced:
+                    res["strip_pages"] += 1
+                for t, box, strip, ident in zip(group, boxes, strips,
+                                                 same):
+                    if sliced and strip:
+                        res["strips"] += 1
+                        continue
+                    if box is None:
+                        res["unlocated"] += 1
+                        continue
+                    if min(box[2] - box[0], box[3] - box[1]) < LINE_MAX_PT:
+                        res["lines"] += 1
+                        to_artifact.setdefault(pno, []).append(t)
+                        continue
+                    rendered = _region_bytes(doc[pno], box)
+                    if rendered is None:
+                        res["offpage"] += 1
+                        continue
+                    blob, mime = rendered
+                    key = ident or hashlib.sha256(blob).hexdigest()
+                    if key in drafts:
+                        text = drafts[key]
+                        res["shared"] += 1
+                    else:
+                        if ai_ctx["budget"][0] <= 0:
+                            res["over_budget"] += 1
+                            ai_ctx["over_budget"] = \
+                                ai_ctx.get("over_budget", 0) + 1
+                            continue
+                        if check is not None:
+                            check()
+                        ai_ctx["budget"][0] -= 1
+                        try:
+                            text = ai_alt_text(
+                                ai_ctx["ep"], blob, mime,
+                                retries=ai_ctx.get("retries",
+                                                   AI_MAX_RETRIES),
+                                sink=ai_ctx)
+                        except AIError as e:
+                            ai_ctx["alt_failed"] = \
+                                ai_ctx.get("alt_failed", 0) + 1
+                            res["failed"] += 1
+                            log_fn("    WARNING: alt-text request failed: "
+                                   "{}".format(e))
+                            continue
+                        _record_alt_length(ai_ctx, text)
+                        drafts[key] = text
+                    if text == "":
+                        res["decorative"] += 1
+                        to_artifact.setdefault(pno, []).append(t)
+                        continue
+                    if alt_is_missing(text):
+                        res["rejected"] += 1
+                        res["rejected_example"] = (res["rejected_example"]
+                                                   or text[:40])
+                        continue
+                    t["elem"].Alt = pikepdf.String(text)
+                    res["drafted"] += 1
+                    res["replaced"] += bool(t["held"])
+        finally:
+            doc.close()
+        for pno, group in to_artifact.items():
+            res["artifacts"] += _figures_to_artifacts(pdf, pdf.pages[pno],
+                                                      group)
+        if not (res["drafted"] or res["artifacts"]):
+            return res
+        pdf.save(tmp)
+    try:
+        with pikepdf.open(tmp) as check_pdf:
+            after = pdf_structure(check_pdf)
+        worse = _tree_no_worse(before, after, res["drafted"],
+                               res["artifacts"])
+    except Exception as e:
+        worse = "the written file could not be read ({})".format(
+            e.__class__.__name__)
+    if worse:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        res["rolled_back"] = worse
+        res["drafted"] = res["replaced"] = res["artifacts"] = 0
+        return res
+    os.replace(tmp, path)
+    return res
+
+
+def tree_alt_steps(res, manual, review):
+    """Next steps from one draft_tree_alt result."""
+    if res.get("rolled_back"):
+        manual.append("Alt text drafted into the tags was not saved — the "
+                      "check after writing found {}".format(
+                          res["rolled_back"]))
+    if res.get("drafted"):
+        review.append(drafted_step(res["drafted"], res.get("replaced", 0)))
+    if res.get("shared"):
+        review.append("{} figure(s) show the same picture as another and "
+                      "were given its draft".format(res["shared"]))
+    if res.get("artifacts"):
+        review.append("{} figure(s) were made artifacts (decoration) — {} "
+                      "the AI judged decorative, {} that are only lines; "
+                      "confirm each".format(res["artifacts"],
+                                            res.get("decorative", 0),
+                                            res.get("lines", 0)))
+    left = (res.get("decorative", 0) + res.get("lines", 0)
+            - res.get("artifacts", 0))
+    if left > 0 and not res.get("rolled_back"):
+        manual.append("{} figure(s) judged decoration could not be made "
+                      "artifacts — make each an artifact in Acrobat"
+                      .format(left))
+    if res.get("rejected"):
+        manual.append("{} AI draft(s) were themselves placeholder text, "
+                      "such as “{}”, and were not written".format(
+                          res["rejected"], res.get("rejected_example", "")))
+    if res.get("strips"):
+        manual.append("{} figure(s) on {} page(s) are page-wide strips "
+                      "stacked down the page — a page drawn in slices; not "
+                      "sent for alt text: a person should decide whether "
+                      "they are text (OCR or ActualText) or one figure"
+                      .format(res["strips"], res["strip_pages"]))
+    if res.get("unlocated"):
+        manual.append("{} figure(s) could not be located on their page (no "
+                      "drawn content this reads) and were not sent for alt "
+                      "text".format(res["unlocated"]))
+    if res.get("offpage"):
+        manual.append("{} figure(s) are drawn outside the visible page and "
+                      "were not sent for alt text".format(res["offpage"]))
+
+
+def tag_pdf(path, doc_lang, title, alt_fn=None, tag=True):
+    """Metadata, and heuristic tagging when `tag` is set, in place (path is
+    rewritten only after the result verifies). alt_fn(page_index,
+    xobject_name) → alt text, "" for decorative, or None. A structure tree
+    that holds elements is kept as it is; an empty one is replaced. Returns
+    a result dict for the report row.
+
+    1.13.0: `tag` is the Auto-tag box. Before it the box was never consulted
+    here, so an untagged file was tagged whenever a title or a language was
+    being set. A page scan on a page with text and an image the AI judged
+    decorative become /Artifact rather than an empty Figure, and the text
+    layer ocrmypdf draws as a Form XObject is tagged as a P, where before it
+    was left outside the tags."""
     import pikepdf
     res = {"tagged": False, "already": False, "p": 0, "figures": 0,
-           "alts": 0, "title_set": False, "lang_set": False, "note": ""}
+           "alts": 0, "decorative": 0, "scans": 0, "title_set": False,
+           "lang_set": False, "note": "", "vectors": 0}
     tmp = path + ".tagging.tmp"
+    scans_by_page = scan_image_names(path) if tag else {}
     with pikepdf.open(path) as pdf:
         root = pdf.Root
         # --- metadata (applies even when tagging is skipped) ---
@@ -1784,7 +3847,8 @@ def tag_pdf(path, doc_lang, title, alt_fn=None):
                 else ""
         except Exception:
             existing = ""
-        if title and not existing.strip():
+        if title and (not existing.strip()
+                      or title_is_placeholder(existing, path)):
             pdf.docinfo["/Title"] = title
             try:
                 with pdf.open_metadata() as meta:
@@ -1799,21 +3863,35 @@ def tag_pdf(path, doc_lang, title, alt_fn=None):
             root.ViewerPreferences = pikepdf.Dictionary()
         root.ViewerPreferences.DisplayDocTitle = True
 
-        if "/StructTreeRoot" in root:
+        tree = pdf_structure(pdf) if "/StructTreeRoot" in root else None
+        if tree is not None and tree["elements"]:
             res["already"] = True
-            pdf.save(tmp)
-        else:
+        elif tag:
+            if tree is not None:
+                del root.StructTreeRoot     # empty: nothing in it to keep
             doc_elem = pdf.make_indirect(pikepdf.Dictionary(
                 Type=pikepdf.Name.StructElem, S=pikepdf.Name.Document))
             kids, nums = [], []
             struct_root = pdf.make_indirect(pikepdf.Dictionary(
                 Type=pikepdf.Name.StructTreeRoot))
             for pno, page in enumerate(pdf.pages):
-                new, elems = _rewrite_page_content(pdf, page)
+                names, has_text = scans_by_page.get(pno, (set(), True))
+                decisions = {}
+                if alt_fn is not None:
+                    for name in _drawn_images(page, names):
+                        decisions[name] = alt_fn(pno, name)
+                new, elems, marked = _rewrite_page_content(
+                    pdf, page, names if has_text else set(), decisions,
+                    leave=set() if has_text else names)
                 if new is None:
                     continue
                 page.Contents = pdf.make_stream(
                     pikepdf.unparse_content_stream(new))
+                res["scans"] += marked.get("scan", 0)
+                res["decorative"] += marked.get("decorative", 0)
+                res["vectors"] += marked.get("vector", 0)
+                if not elems:
+                    continue
                 page.StructParents = pno
                 page_refs = []
                 for mcid, kind, xname in elems:
@@ -1822,7 +3900,7 @@ def tag_pdf(path, doc_lang, title, alt_fn=None):
                         S=pikepdf.Name("/" + kind),
                         Pg=page.obj, K=mcid, P=doc_elem)
                     if kind == "Figure":
-                        alt = alt_fn(pno, xname) if alt_fn else None
+                        alt = decisions.get(xname)
                         if alt:
                             d.Alt = pikepdf.String(alt)
                             res["alts"] += 1
@@ -1846,7 +3924,7 @@ def tag_pdf(path, doc_lang, title, alt_fn=None):
                 res["tagged"] = True
             else:
                 res["note"] = "no taggable content found"
-            pdf.save(tmp)
+        pdf.save(tmp)
     # --- verify before replacing the input ---
     try:
         import fitz
@@ -1874,59 +3952,85 @@ def tag_pdf(path, doc_lang, title, alt_fn=None):
 def process_docx(src, dst, title, ai_ctx, log_fn):
     import docx
     document = docx.Document(src)
-    drafted = missing = images = 0
+    drafted = missing = images = decorative = askable = replaced = 0
+    tally = {"held": 0, "example": ""}
     for doc_pr, part in iter_docx_images(document):
         images += 1
         if doc_pr is None:
             missing += 1
             continue
-        if not alt_is_missing(doc_pr.get("descr")):
+        if not picture_needs_alt(doc_pr):
             continue
+        if part is not None:
+            askable += 1
+        was = placeholder_alt(doc_pr.get("descr"))
         alt = _draft_alt(ai_ctx, part, log_fn)
         if alt is None:
             missing += 1
+            _note_placeholder(doc_pr, tally)
+        elif alt == "":
+            # The model judged it decorative: marked the way Word marks it.
+            mark_decorative(doc_pr)
+            decorative += 1
         else:
-            doc_pr.set("descr", alt if alt else "")
-            # An empty draft = model judged it decorative; Word treats
-            # descr="" as present, matching decorative marking.
+            doc_pr.set("descr", alt)
             drafted += 1
+            replaced += bool(was)
     title_set = False
-    if title and not (document.core_properties.title or "").strip():
+    if title and (not (document.core_properties.title or "").strip()
+                  or title_is_placeholder(document.core_properties.title,
+                                          src)):
         document.core_properties.title = title
         title_set = True
     _atomic_save(document.save, dst)
     return {"images": images, "alt_missing": missing,
-            "alt_drafted": drafted, "title_set": title_set}
+            "alt_drafted": drafted, "decorative": decorative,
+            "askable": askable, "title_set": title_set,
+            "alt_placeholder": tally["held"],
+            "placeholder_example": tally["example"], "replaced": replaced}
 
 
 def process_pptx(src, dst, title, ai_ctx, log_fn):
     import pptx
     prs = pptx.Presentation(src)
-    drafted = missing = images = 0
+    drafted = missing = images = decorative = askable = replaced = 0
+    tally = {"held": 0, "example": ""}
     for _idx, cnv, image in iter_pptx_pictures(prs):
         images += 1
-        if not alt_is_missing(cnv.get("descr")):
+        if not picture_needs_alt(cnv):
             continue
         part = image if image is not None else None
+        if part is not None:
+            askable += 1
+        was = placeholder_alt(cnv.get("descr"))
         alt = _draft_alt(ai_ctx, part, log_fn)
         if alt is None:
             missing += 1
+            _note_placeholder(cnv, tally)
+        elif alt == "":
+            mark_decorative(cnv)
+            decorative += 1
         else:
-            cnv.set("descr", alt if alt else "")
+            cnv.set("descr", alt)
             drafted += 1
+            replaced += bool(was)
     untitled = 0
     for slide in prs.slides:
         t = slide.shapes.title
         if t is None or not (t.text_frame.text or "").strip():
             untitled += 1
     title_set = False
-    if title and not (prs.core_properties.title or "").strip():
+    if title and (not (prs.core_properties.title or "").strip()
+                  or title_is_placeholder(prs.core_properties.title, src)):
         prs.core_properties.title = title
         title_set = True
     _atomic_save(prs.save, dst)
     return {"images": images, "alt_missing": missing,
-            "alt_drafted": drafted, "untitled": untitled,
-            "title_set": title_set}
+            "alt_drafted": drafted, "decorative": decorative,
+            "untitled": untitled, "askable": askable,
+            "title_set": title_set,
+            "alt_placeholder": tally["held"],
+            "placeholder_example": tally["example"], "replaced": replaced}
 
 
 def _record_alt_length(ai_ctx, text):
@@ -1948,6 +4052,7 @@ def _draft_alt(ai_ctx, image_part, log_fn):
     if not ai_ctx or ai_ctx.get("ep") is None or image_part is None:
         return None
     if ai_ctx["budget"][0] <= 0:
+        ai_ctx["over_budget"] = ai_ctx.get("over_budget", 0) + 1
         return None
     try:
         blob = image_part.blob
@@ -2087,12 +4192,21 @@ def _image_send_bytes(img_path):
         return raw, mime
 
 
+REQUEST_FAILED = "request failed"
+
+
 def _page_placeholder(reason):
     """The hole, named, in the transcript itself.
 
     A reader of the sidecar must see where the gap is and why. The report
     says the same thing in the same word (NO TRANSCRIPTION), so transcript
-    and report cannot be read as describing different events."""
+    and report cannot be read as describing different events. A request
+    that failed is not a model that stopped: before 1.13.0 both read "the
+    model stopped for ..."."""
+    if reason == REQUEST_FAILED:
+        return ("[NO TRANSCRIPTION — the request for this page failed and "
+                "no reply came back. This page was not transcribed; its "
+                "content is missing from this file.]")
     return ("[NO TRANSCRIPTION — the model stopped for {!r}. This page "
             "was not transcribed; its content is missing from this file.]"
             .format(str(reason)))
@@ -2129,7 +4243,7 @@ def _ocr_one_page(ep, doc, doc_lock, pno, retries, log_fn, fails,
                     "like the endpoint rather than the pages, so the run was "
                     "stopped. Last error: {}".format(
                         fails.limit, fails.size, err))
-            reason = "request failed"
+            reason = REQUEST_FAILED
         elif fails is not None:
             fails.record(False)
         log_fn("    WARNING: page {} not transcribed: {}".format(
@@ -2273,7 +4387,7 @@ def ai_ocr_image_sidecar(ep, img_path, sidecar_path,
                     "like the endpoint rather than the pages, so the run was "
                     "stopped. Last error: {}".format(
                         fails.limit, fails.size, err))
-            reason = "request failed"
+            reason = REQUEST_FAILED
         elif fails is not None:
             fails.record(False)
         log("    WARNING: image not transcribed: {}".format(err))
@@ -2384,6 +4498,12 @@ def page_flags(pages):
         if groups[label]:
             parts.append("{} {}".format(label, ", ".join(groups[label])))
     counts = dict((k, len(v)) for k, v in groups.items())
+    # The two kinds of NO TRANSCRIPTION, counted apart for the Summary
+    # and the next steps: a model that stopped, and a request that failed.
+    counts["request_failed"] = sum(
+        1 for p in pages if p.get("refused") == REQUEST_FAILED)
+    counts["model_stopped"] = (counts["NO TRANSCRIPTION"]
+                               - counts["request_failed"])
     counts["median_chars"] = median
     # Semicolons between flags, commas inside one flag's page list — so
     # "INCOMPLETE REPLY p7, p31" cannot be misread as two flags.
@@ -2401,7 +4521,8 @@ def new_ai_ctx(cfg, ep):
     if ep is None:
         return None
     return {"ep": ep,
-            "budget": [AI_MAX_ALT_PER_FILE],
+            "budget": [cfg.get("alt_limit", AI_MAX_ALT_PER_FILE)],
+            "alt_limit": cfg.get("alt_limit", AI_MAX_ALT_PER_FILE),
             "retries": cfg.get("ai_retries", AI_MAX_RETRIES),
             "max_tokens": cfg.get("max_tokens", DEFAULT_REPLY_LIMIT),
             "concurrency": cfg.get("ai_concurrency",
@@ -2446,7 +4567,11 @@ def apply_ai_results(row, ai_ctx, manual, review):
     row["cache_tok"] = usage.get("cache_read", 0)
     row["served"] = usage.get("model", "")
     pages = ai_ctx.get("pages") or []
+    # Sent and answered, counted apart (1.13.0). "AI Pages" counted every
+    # page with a record, refused and failed ones included, and the
+    # Summary called that total "transcribed".
     row["ai_pages"] = len(pages)
+    row["ai_pages_ok"] = sum(1 for p in pages if not p.get("refused"))
     flags, counts = page_flags(pages)
     row["flags"] = flags
     row["flag_counts"] = counts
@@ -2460,12 +4585,17 @@ def apply_ai_results(row, ai_ctx, manual, review):
                 "{} alt-text draft(s) run over {} characters — usually a "
                 "sign the description belongs in the body text".format(
                     over, AI_ALT_MAX_CHARS))
-    refused = counts.get("NO TRANSCRIPTION", 0)
-    if refused:
+    if counts.get("model_stopped"):
         manual.append(
-            "{} page(s) were not transcribed — the model stopped early; "
-            "see the Flags column and the placeholders in the sidecar, and "
-            "re-run those pages against a stronger model".format(refused))
+            "{} page(s) were not transcribed — the model stopped and named "
+            "a reason; see the Flags column and the placeholders in the "
+            "sidecar, and re-run those pages against a stronger model or a "
+            "higher reply limit".format(counts["model_stopped"]))
+    if counts.get("request_failed"):
+        manual.append(
+            "{} page(s) were not transcribed — the request failed and no "
+            "reply came back; re-run those pages".format(
+                counts["request_failed"]))
     if counts.get("INCOMPLETE REPLY"):
         review.append(
             "{} page(s) returned no coverage line — the reply may have "
@@ -2475,6 +4605,13 @@ def apply_ai_results(row, ai_ctx, manual, review):
         review.append(
             "{} alt-text request(s) failed and were not drafted".format(
                 ai_ctx["alt_failed"]))
+    if ai_ctx.get("over_budget"):
+        manual.append(
+            "{} alt-text draft(s) not requested — this run drafts at "
+            "most {} per file (Alt-text drafts per file); process the "
+            "output again to draft the rest".format(
+                ai_ctx["over_budget"],
+                ai_ctx.get("alt_limit", AI_MAX_ALT_PER_FILE)))
 
 
 def join_steps(manual_items, review_items):
@@ -2548,11 +4685,17 @@ REPORT_HEADERS = ["Order", "File", "Format", "Context ID", "Article ID",
                   "Accessibility", "Next Steps", "Output File", "Status",
                   "Time", "Admin Record URL",
                   "In Tok", "Out Tok", "Think Tok", "Cached Tok",
-                  "AI Pages", "Alt Max Chars", "Alt Over Limit", "Flags",
-                  "Served Model"]
-REPORT_WIDTHS = [8, 44, 11, 26, 10, 36, 15, 8, 11, 11, 18, 14, 12, 10,
+                  "AI Pages Sent", "Alt Max Chars", "Alt Over Limit",
+                  "Flags", "Served Model",
+                  # Appended 1.13.0.
+                  "AI Pages Transcribed", "Page Scans", "Checked By",
+                  "Rule Failures", "AI Gate",
+                  # Appended 1.13.0, the detectors.
+                  "Detector Findings"]
+REPORT_WIDTHS = [8, 44, 11, 26, 10, 36, 15, 8, 11, 11, 18, 30, 12, 10,
                  8, 11, 11, 24, 70, 52, 34, 9, 60,
-                 10, 10, 11, 12, 10, 14, 14, 46, 26]
+                 10, 10, 11, 12, 12, 14, 14, 46, 26,
+                 12, 10, 36, 40, 28, 46]
 REPORT_LINK_COLS = (23,)
 
 # The checks no automated pass can make — one Summary block, not per-row
@@ -2576,10 +4719,11 @@ AI_REVIEW_NOTE = [
     "· Out Tok includes Think Tok, the model's reasoning. Both count",
     "  against the reply limit, so a page refused for max_tokens may show",
     "  far less visible text than the limit would suggest.",
-    "· NO TRANSCRIPTION means the model stopped and named a reason, so that",
-    "  page is missing from the sidecar — a placeholder marks the gap.",
-    "  Re-running it identically will refuse again: raise the reply limit",
-    "  or send the page to a stronger model.",
+    "· NO TRANSCRIPTION means the page is missing from the sidecar — a",
+    "  placeholder marks the gap. Either the model stopped and named a",
+    "  reason, and re-running it identically will refuse again (raise the",
+    "  reply limit or send the page to a stronger model), or the request",
+    "  failed with no reply (\"request failed\"), which a re-run may fix.",
     "· INCOMPLETE REPLY means the page came back with no coverage line, so",
     "  the reply may have stopped mid-transcription without saying so. A",
     "  plain re-run often succeeds; escalate only if it recurs.",
@@ -2589,13 +4733,17 @@ AI_REVIEW_NOTE = [
     "  legible. Check it against the page before trusting it.",
     "· Alt text over the character limit still works, but is usually a sign",
     "  the description belongs in the body text instead.",
-    "· Token totals EXCLUDE refused pages: the request was billed but the",
-    "  counts are lost with the error, and a refusal spends the whole",
-    "  ceiling — so these totals are a floor, not a measurement.",
+    "· Token totals include what the provider reported for refused pages",
+    "  and drafts. A request that failed with no reply (a dropped",
+    "  connection) reports nothing, so the totals are a floor.",
 ]
 
 
-def write_report(path, rows, summary_pairs, header_rgb, extra_note=()):
+def write_report(path, rows, summary_pairs, header_rgb, extra_note=(),
+                 findings=None):
+    """The run's workbook: Files, Summary and — when the detectors read at
+    least one tagged PDF — Detectors, one row per finding (`findings`, from
+    _detector_rows()), or one row saying they found nothing."""
     from openpyxl import Workbook
     st = _styles(header_rgb)
     wb = Workbook()
@@ -2609,6 +4757,12 @@ def write_report(path, rows, summary_pairs, header_rgb, extra_note=()):
         body += [("", "")] + [(line, "") for line in extra_note]
     body += [("", "")] + [(line, "") for line in MANUAL_CHECKS_NOTE]
     _write_sheet(ws2, ["Item", "Value"], body, [58, 60], (), st)
+    if findings is not None:
+        ws3 = wb.create_sheet("Detectors")
+        _write_sheet(ws3, DETECTOR_HEADERS, list(findings) or [
+            ["", "", "", "", "(none)", "the detectors read every tagged "
+             "PDF in this run and found nothing", ""]],
+            DETECTOR_WIDTHS, (), st)
     wb.save(path)
 
 
@@ -2791,11 +4945,11 @@ def outcome_tone(problems, succeeded=None):
 
 
 # The page's settings, by element id, remembered across launches (DC-FORM, 1.0.1).
-FORM_FIELDS = ("srcrun", "srcfolder", "srcpaths", "srcdir", "recursive",
+FORM_FIELDS = ("srcrun", "srcfolder", "srcpaths", "srcdir", "rptdir", "recursive",
     "pathbox", "meval", "mauto", "mforce", "tag", "deskew", "langs", "jobs",
     "settitle", "doclang", "iopdf", "iotext", "ioboth", "endpoint",
-    "airetries", "aiconc", "aimaxtok", "englocal", "engai", "aialt", "scopy",
-    "sover", "outdir", "suffix",
+    "airetries", "aiconc", "aimaxtok", "aialtmax", "englocal", "engai", "aialt", "scopy",
+    "sover", "outdir", "suffix", "vpdf", "aioverride",
 )
 # The page's other controls, which are NOT kept, and why: the queue filter, the log copy box.
 # Every control on the page is in one list or the other (_verify_pages.py).
@@ -3096,12 +5250,16 @@ def _pdf_alt_fn(out_path, ai_ctx, log_fn):
     tagged and drafts /Alt via the AI endpoint (per-file budget shared)."""
     if not ai_ctx or ai_ctx.get("ep") is None:
         return None, lambda: 0
-    cache = collect_pdf_image_bytes(out_path)
+    cache = collect_pdf_image_bytes(out_path,
+                                    max_images=ai_ctx["budget"][0])
     drafted = [0]
 
     def alt_fn(pno, xname):
+        if ai_ctx["budget"][0] <= 0:
+            ai_ctx["over_budget"] = ai_ctx.get("over_budget", 0) + 1
+            return None
         item = cache.get((pno, xname))
-        if item is None or ai_ctx["budget"][0] <= 0:
+        if item is None:
             return None
         blob, mime = item
         try:
@@ -3112,7 +5270,7 @@ def _pdf_alt_fn(out_path, ai_ctx, log_fn):
                 sink=ai_ctx)
             drafted[0] += 1
             _record_alt_length(ai_ctx, text)
-            return text or None       # decorative → no /Alt, stays counted
+            return text    # "" = decorative: the tagger makes it an Artifact
         except AIError as e:
             ai_ctx["alt_failed"] = ai_ctx.get("alt_failed", 0) + 1
             log_fn("    WARNING: alt-text request failed: {}".format(e))
@@ -3125,12 +5283,176 @@ def _text_cov(info):
     return "{}/{}".format(info.get("text_pages", 0), info.get("pages", 0))
 
 
+def _pdf_steps(info, manual, review, processed=False, heuristic=False,
+               tag_on=True, textless_why=""):
+    """Next steps from one measured PDF (eval_pdf), shared by Evaluate and
+    the processing modes so the two word a finding the same way. Returns the
+    Alt Missing count (1.13.0: counted, where it had been read back out of
+    this text): the Figures without alt text in a tagged file; in an untagged
+    one, the images that are not page scans — a scan needs its text read,
+    not alt text. `textless_why` is why a processed file's pages still have
+    no text layer, where the run knows (_textless_why)."""
+    s = info.get("structure") or {}
+    textless = info["pages"] - info["text_pages"]
+    if info["tagged"]:
+        if textless and heuristic:
+            manual.append("{} page(s) still have no text layer — run the "
+                          "local engine first, then tag".format(textless))
+        elif textless:
+            manual.append("{} page(s) without text in a tagged PDF — OCR "
+                          "would add text outside its tags; remediate from "
+                          "the source, or re-tag after OCR".format(textless))
+        if info["problems"]:
+            manual.append("Tags are incomplete ({}) — repair them in "
+                          "Acrobat, or re-export from the source".format(
+                              "; ".join(info["problems"])))
+        missing = max(s.get("figures", 0) - s.get("figures_alt", 0), 0)
+        loose = info.get("loose_figure_images", 0)
+        alt_missing = missing + loose
+        if missing:
+            manual.append(alt_step(missing, s.get("figures_placeholder", 0),
+                                   s.get("placeholder_example", ""),
+                                   "figure"))
+        if loose:
+            manual.append("{} image(s) outside the tags need tagging and alt "
+                          "text".format(loose))
+        no_th = s.get("tables", 0) - s.get("tables_th", 0)
+        if no_th > 0:
+            manual.append("{} table(s) have no header cells — mark each "
+                          "header row (or retag a layout table)".format(no_th))
+        if not heuristic and not s.get("headings") and info["pages"] > 1:
+            review.append("No headings are tagged — confirm the document "
+                          "has none")
+    else:
+        if textless and processed and textless_why:
+            manual.append("{} page(s) still have no text layer — {}".format(
+                textless, textless_why))
+        elif textless:
+            manual.append(("{} page(s) still have no text layer — inspect "
+                           "the source scans" if processed else
+                           "Run OCR ({} page(s) without text)")
+                          .format(textless))
+        if processed:
+            manual.append("Untagged — tag the document in Acrobat" if tag_on
+                          else "Untagged — rerun with Auto-tag on, or tag "
+                               "the document in Acrobat")
+        elif info["verdict"] == "Empty tree":
+            manual.append("The structure tree is empty — rerun in a "
+                          "processing mode to tag it, then review semantics")
+        else:
+            manual.append("Tag the document (rerun in a processing mode, "
+                          "then review semantics)")
+        alt_missing = info["figure_images"]
+        if alt_missing:
+            manual.append("Add alt text for {} image(s)".format(alt_missing))
+    if not info["title"].strip():
+        manual.append("Set a descriptive document title")
+    elif info.get("title_placeholder"):
+        manual.append("Replace the placeholder document title")
+    if not info["lang"]:
+        manual.append("Set the document language")
+    return alt_missing
+
+
+def _verapdf_row(row, path, cfg, manual, review):
+    """veraPDF on the file this row describes, when the run has it on."""
+    launcher = cfg.get("verapdf") or ""
+    if not launcher:
+        apply_verapdf(row, None, manual, review)
+        if cfg.get("verapdf_wanted"):
+            row["checked_by"] = "structure walk (veraPDF not installed)"
+        elif cfg.get("verapdf_wanted") is False:
+            row["checked_by"] = "structure walk (veraPDF turned off)"
+        return
+    result = verapdf_check(path, launcher)
+    if result.get("error"):
+        add_warning()
+        log("    WARNING: veraPDF: {}".format(result["error"]))
+    apply_verapdf(row, result, manual, review)
+
+
+# ---- What the AI gate held back --------------------------------------------
+# The gate decides for every file this run's settings could send
+# (ai_can_reach). What it held back is only work the run would otherwise
+# have sent, recorded where that work is skipped (gate_held): a file the
+# gate bars but the run never needed to send is not counted, and Evaluate
+# mode, which sends nothing, holds nothing back.
+GATE_ALT_STEP = ("AI alt-text drafts not requested ({}) — rerun with the "
+                 "override on, or write the alt text")
+
+
+def gate_reason(label):
+    """A gate label without its closing "— not sent", for a sentence that
+    already says the file was not sent ("Not sent (hidden)", not "Not sent
+    (hidden — not sent)")."""
+    tail = " — not sent"
+    return label[:-len(tail)] if label.endswith(tail) else label
+
+
+def gate_alt_step(row):
+    """The Next Steps line for alt drafts the gate withheld."""
+    return GATE_ALT_STEP.format(gate_reason(row.get("ai_gate") or ""))
+
+
+def _textless_why(ocr_action):
+    """Why a processed PDF's pages still have no text layer, where this
+    run's own OCR action explains it. Otherwise "" — and the advice stays
+    "inspect the source scans", which is right only when local OCR ran and
+    still found no text."""
+    if ocr_action.startswith("Not sent"):
+        return "the AI gate held back their transcription"
+    if ocr_action == "AI text sidecar":
+        return ("the AI engine writes its transcription to a text sidecar, "
+                "not into the PDF")
+    return ""
+
+
+def ai_can_reach(entry, cfg):
+    """Whether this run's settings could send any of this file to an AI
+    endpoint: the files the gate decides for. Evaluate mode sends nothing,
+    but the gate still decides for these files — the preview its Summary
+    gives."""
+    fmt = entry.get("format")
+    if fmt in ("pdf", "image"):
+        return cfg.get("engine") == "ai" or bool(cfg.get("ai_alt"))
+    if fmt in ("docx", "pptx"):
+        return bool(cfg.get("ai_alt"))
+    return False
+
+
+def gate_held(row, what):
+    """The gate withheld `what` ("transcription" or "alt text") from this
+    file: logged once per kind of work, and the file counted once in "Files
+    the gate held back"."""
+    held = row.setdefault("gate_held", [])
+    if what not in held:
+        held.append(what)
+        log("    AI gate: {} ({})".format(row.get("ai_gate") or "held back",
+                                         what))
+
+
+def _gate_alt_fn(row):
+    """alt_fn for a file the gate bars: drafts nothing — tag_pdf treats a
+    None reply exactly as it treats no alt_fn — and records that the tagger
+    had an image to ask about."""
+    def alt_fn(pno, xname):
+        gate_held(row, "alt text")
+        return None
+    return alt_fn
+
+
+VECTOR_STEP = ("{} vector path(s) — lines, rules, borders, fills — were "
+               "marked as artifacts (decoration): a chart or diagram drawn "
+               "this way needs a Figure with alt text instead")
+
+
 def process_pdf_entry(entry, cfg, ep, run_dir, row):
     src = entry["path"]
     before = eval_pdf(src)
     row["pages"] = before["pages"]
     row["text_before"] = _text_cov(before)
     row["images"] = before["images"]
+    row["scan_pages"] = before["scan_pages"]
     manual, review = [], []
     if before["encrypted"]:
         row["accessibility"] = STATUS_MANUAL
@@ -3142,39 +5464,43 @@ def process_pdf_entry(entry, cfg, ep, run_dir, row):
     if cfg["mode"] == "evaluate":
         row["ocr"] = "Evaluate only"
         row["text_after"] = row["text_before"]
-        row["tagged"] = "Yes" if before["tagged"] else "No"
-        row["doc_title"] = "Present" if before["title"].strip() else "Missing"
+        row["tagged"] = before["verdict"]
+        row["doc_title"] = title_word(before["title"], src)
         row["language"] = before["lang"] or "Missing"
-        if before["text_pages"] < before["pages"]:
-            manual.append("Run OCR ({} page(s) without text)".format(
-                before["pages"] - before["text_pages"]))
-        if not before["tagged"]:
-            manual.append("Tag the document (rerun in a processing mode, "
-                          "then review semantics)")
-            if before["images"]:
-                manual.append("Add alt text for {} image(s)".format(
-                    before["images"]))
-        if not before["title"].strip():
-            manual.append("Set a descriptive document title")
-        if not before["lang"]:
-            manual.append("Set the document language")
+        row["alt_missing"] = _pdf_steps(before, manual, review)
+        _detector_row(row, before, review)
+        _verapdf_row(row, src, cfg, manual, review)
         row["accessibility"] = classify_accessibility(manual, review)
         row["next"] = join_steps(manual, review)
         row["status"] = "Evaluated"
         return row
 
     # --- processing modes ---
-    need_ocr = (cfg["mode"] == "force"
-                or before["text_pages"] < before["pages"])
+    textless = before["pages"] - before["text_pages"]
+    want_text = cfg["mode"] == "force" or textless > 0
+    use_ai = cfg["engine"] == "ai"
+    # Never OCR a tagged PDF (1.13.0). ocrmypdf puts the text it adds
+    # outside the tags, where a screen reader following them never reaches
+    # it, and a forced OCR orphans the tags (16.x) or deletes them (17.x).
+    local_ocr = want_text and not use_ai and not before["tagged"]
     out = _out_path(entry, cfg, run_dir)
     # Built here, above the OCR branch, and not gated on cfg["ai_alt"] —
     # otherwise the AI OCR path has no channel to report usage through.
     ai_ctx = new_ai_ctx(cfg, ep)
-    if cfg["engine"] == "ai":
-        if cfg["save"] == "copy":
-            shutil.copy2(src, out)
-        if need_ocr:
+    row["_ai_ctx"] = ai_ctx            # a Stop part-way still reports it
+    if cfg["save"] == "copy" and not local_ocr:
+        shutil.copy2(src, out)
+    if want_text and use_ai:
+        if ep is None:
+            gate = gate_reason(row.get("ai_gate") or "") or "AI gate"
+            row["ocr"] = "Not sent ({})".format(gate)
+            gate_held(row, "transcription")
+            manual.append("Not sent to the AI endpoint ({}) — rerun with "
+                          "the override on, or with the local engine"
+                          .format(gate))
+        else:
             sidecar = os.path.splitext(out)[0] + "_ai_text.txt"
+            row["_partial"] = sidecar
             ai_ocr_pdf_sidecar(ep, out, sidecar, log,
                                check_pause_stop,
                                retries=cfg["ai_retries"], sink=ai_ctx,
@@ -3183,83 +5509,103 @@ def process_pdf_entry(entry, cfg, ep, run_dir, row):
                                    DEFAULT_AI_CONCURRENCY))
             row["ocr"] = "AI text sidecar"
             review.append("AI OCR wrote a text sidecar ({}) — the PDF "
-                          "itself has no new text layer; run the local "
-                          "engine for a searchable PDF".format(
-                              os.path.basename(sidecar)))
-        else:
-            row["ocr"] = "None needed"
+                          "itself has no new text layer{}".format(
+                              os.path.basename(sidecar),
+                              "; the tagged PDF is left as it is"
+                              if before["tagged"] else
+                              "; run the local engine for a searchable "
+                              "PDF"))
+    elif want_text and before["tagged"]:
+        row["ocr"] = "Skipped (tagged PDF)"
+    elif local_ocr:
+        tmp = out + ".ocr.tmp"
+        tail = run_ocrmypdf(src, tmp, cfg["mode"], cfg["langs"],
+                            cfg["jobs"], cfg["deskew"])
+        os.replace(tmp, out)
+        for t in tail[-2:]:
+            if t.strip():
+                log("    ocrmypdf: " + t.strip())
+        row["ocr"] = ("Force OCR" if cfg["mode"] == "force"
+                      else "OCR (new text layer)")
+        review.append("Confirm OCR text accuracy on critical content")
     else:
-        if need_ocr:
-            tmp = out + ".ocr.tmp"
-            tail = run_ocrmypdf(src, tmp, cfg["mode"], cfg["langs"],
-                                cfg["jobs"], cfg["deskew"])
-            os.replace(tmp, out)
-            for t in tail[-2:]:
-                if t.strip():
-                    log("    ocrmypdf: " + t.strip())
-            row["ocr"] = ("Force OCR" if cfg["mode"] == "force"
-                          else "OCR (new text layer)")
-            review.append("Confirm OCR text accuracy on critical content")
-        else:
-            if cfg["save"] == "copy":
-                shutil.copy2(src, out)
-            row["ocr"] = "None needed"
+        row["ocr"] = "None needed"
 
     # Metadata + heuristic tagging on the output file.
     title = prettify_title(entry) if cfg["set_title"] else ""
     tag_res = {"tagged": False, "already": before["tagged"], "alts": 0,
-               "figures": 0, "title_set": False, "lang_set": False}
+               "figures": 0, "decorative": 0, "scans": 0,
+               "title_set": False, "lang_set": False}
+    # Alt drafting is gated separately from the context itself.
+    alt_ctx = ai_ctx if (ai_ctx and cfg["ai_alt"]) else None
     if cfg["tag"] or cfg["set_title"] or cfg["doc_lang"]:
-        alt_fn, drafted_count = (None, lambda: 0)
-        # Alt drafting is gated separately from the context itself.
-        alt_ctx = ai_ctx if (ai_ctx and cfg["ai_alt"]) else None
+        alt_fn = None
         try:
             if cfg["tag"] and alt_ctx:
-                alt_fn, drafted_count = _pdf_alt_fn(out, alt_ctx, log)
-            tag_res = tag_pdf(out, cfg["doc_lang"],
-                              title, alt_fn if cfg["tag"] else None)
+                alt_fn, _drafted = _pdf_alt_fn(out, alt_ctx, log)
+            elif cfg["tag"] and cfg["ai_alt"] and row.get("gate_barred"):
+                alt_fn = _gate_alt_fn(row)
+            tag_res = tag_pdf(out, cfg["doc_lang"], title, alt_fn,
+                              tag=cfg["tag"])
         except FileError as e:
             add_warning()
             log("    WARNING: {}".format(e))
             manual.append("Auto-tagging failed — tag in Acrobat")
         row["alt_drafted"] = tag_res.get("alts", 0)
+        if "alt text" in row.get("gate_held", ()):
+            manual.append(gate_alt_step(row))
 
+    # An existing tree — a word processor's, an auto-tagger's: its Figures
+    # with no alt text, or placeholder alt text, get drafts (set_alt).
+    tree_res = None
+    if cfg["ai_alt"] and tag_res.get("already"):
+        if alt_ctx:
+            tree_res = draft_tree_alt(out, alt_ctx, log, check_pause_stop)
+            row["alt_drafted"] = (row.get("alt_drafted") or 0) + \
+                tree_res["drafted"]
+            if tree_res["wanted"]:
+                log("    Alt text into the existing tags: {} of {} "
+                    "figure(s) drafted{}".format(
+                        tree_res["drafted"], tree_res["wanted"],
+                        " (not saved: {})".format(tree_res["rolled_back"])
+                        if tree_res["rolled_back"] else ""))
+        elif row.get("gate_barred") and tree_alt_wanted(out):
+            gate_held(row, "alt text")
+            if gate_alt_step(row) not in manual:
+                manual.append(gate_alt_step(row))
+
+    # Everything the row says about the result is read from the result.
     after = eval_pdf(out)
+    if tag_res.get("title_set"):
+        after["title_placeholder"] = False     # this run's own choice
+        if not (entry.get("title") or "").strip():
+            review.append(TITLE_FROM_NAME)
+    heuristic = bool(tag_res.get("tagged"))
     row["text_after"] = _text_cov(after)
     row["output"] = out
-    row["tagged"] = ("Yes" if tag_res.get("already") or before["tagged"]
-                     else ("Yes (heuristic)" if tag_res.get("tagged")
-                           else "No"))
-    row["doc_title"] = ("Set" if tag_res.get("title_set")
-                        else ("Present" if after["title"].strip()
-                              else "Missing"))
+    row["tagged"] = after["verdict"] + (" (heuristic)" if heuristic else "")
+    row["doc_title"] = (title_set_word(entry) if tag_res.get("title_set")
+                        else title_word(after["title"], out))
     row["language"] = after["lang"] or "Missing"
-
-    if after["text_pages"] < after["pages"]:
-        manual.append("{} page(s) still have no text layer — inspect the "
-                      "source scans".format(
-                          after["pages"] - after["text_pages"]))
-    if tag_res.get("tagged"):
+    row["alt_missing"] = _pdf_steps(after, manual, review, processed=True,
+                                    heuristic=heuristic, tag_on=cfg["tag"],
+                                    textless_why=_textless_why(row["ocr"]))
+    if heuristic:
         review.append("Heuristic tags only (paragraphs/figures) — review "
                       "headings, lists, tables, and reading order in "
                       "Acrobat")
-        missing_alt = tag_res.get("figures", 0) - tag_res.get("alts", 0)
-        if missing_alt > 0:
-            manual.append("Add alt text for {} image(s) (no AI draft)"
-                          .format(missing_alt))
-        if tag_res.get("alts"):
-            review.append("Review {} AI-drafted alt text(s) for accuracy"
-                          .format(tag_res["alts"]))
-    elif not (tag_res.get("already") or before["tagged"]):
-        manual.append("Untagged — tag the document in Acrobat")
-        if after["images"]:
-            manual.append("Add alt text for {} image(s)".format(
-                after["images"]))
-    if row["doc_title"] == "Missing":
-        manual.append("Set a descriptive document title")
-    if row["language"] == "Missing":
-        manual.append("Set the document language")
-
+    _detector_row(row, after, review, heuristic=heuristic)
+    if tag_res.get("alts"):
+        review.append(drafted_step(tag_res["alts"]))
+    if tree_res:
+        tree_alt_steps(tree_res, manual, review)
+    if tag_res.get("decorative"):
+        review.append("{} image(s) the AI judged decorative were marked as "
+                      "artifacts — confirm each".format(
+                          tag_res["decorative"]))
+    if tag_res.get("vectors"):
+        review.append(VECTOR_STEP.format(tag_res["vectors"]))
+    _verapdf_row(row, out, cfg, manual, review)
     apply_ai_results(row, ai_ctx, manual, review)
     row["accessibility"] = classify_accessibility(manual, review)
     row["next"] = join_steps(manual, review)
@@ -3274,9 +5620,11 @@ def process_image_entry(entry, cfg, ep, run_dir, row):
     row["text_before"] = "0/1"
     manual, review = [], []
     ai_ctx = new_ai_ctx(cfg, ep)
+    row["_ai_ctx"] = ai_ctx
     if cfg["mode"] == "evaluate":
         row["ocr"] = "Evaluate only"
         row["text_after"] = "0/1"
+        row["alt_missing"] = 1
         manual.append("Image file — produce a searchable PDF or text "
                       "equivalent, plus alt text where it is used")
         row["accessibility"] = STATUS_MANUAL
@@ -3285,6 +5633,7 @@ def process_image_entry(entry, cfg, ep, run_dir, row):
         return row
 
     outputs = []
+    decorative = False
     if cfg["engine"] == "ai":
         sidecar = _out_path(entry, cfg, run_dir, force_ext="_ai_text.txt") \
             if cfg["save"] == "overwrite" else \
@@ -3292,14 +5641,24 @@ def process_image_entry(entry, cfg, ep, run_dir, row):
             "_ai_text.txt"
         if cfg["save"] == "copy":
             shutil.copy2(src, _out_path(entry, cfg, run_dir))
-        ai_ocr_image_sidecar(ep, src, sidecar,
-                             retries=cfg["ai_retries"], sink=ai_ctx,
-                             log_fn=log)
-        outputs.append(sidecar)
-        row["ocr"] = "AI text sidecar"
-        row["text_after"] = "1/1" if os.path.getsize(sidecar) else "0/1"
-        review.append("AI OCR wrote a text sidecar — review it, and run "
-                      "the local engine for a searchable PDF")
+        if ep is None:
+            gate = gate_reason(row.get("ai_gate") or "") or "AI gate"
+            row["ocr"] = "Not sent ({})".format(gate)
+            gate_held(row, "transcription")
+            row["text_after"] = "0/1"
+            manual.append("Not sent to the AI endpoint ({}) — rerun with "
+                          "the override on, or with the local engine"
+                          .format(gate))
+        else:
+            row["_partial"] = sidecar
+            ai_ocr_image_sidecar(ep, src, sidecar,
+                                 retries=cfg["ai_retries"], sink=ai_ctx,
+                                 log_fn=log)
+            outputs.append(sidecar)
+            row["ocr"] = "AI text sidecar"
+            row["text_after"] = "1/1" if os.path.getsize(sidecar) else "0/1"
+            review.append("AI OCR wrote a text sidecar — review it, and run "
+                          "the local engine for a searchable PDF")
     else:
         made_text = False
         if cfg["image_out"] in ("pdf", "both"):
@@ -3312,7 +5671,8 @@ def process_image_entry(entry, cfg, ep, run_dir, row):
             title = prettify_title(entry) if cfg["set_title"] else ""
             if cfg["tag"] or title or cfg["doc_lang"]:
                 try:
-                    tag_pdf(pdf_out, cfg["doc_lang"], title, None)
+                    tag_pdf(pdf_out, cfg["doc_lang"], title, None,
+                            tag=cfg["tag"])
                 except FileError as e:
                     add_warning()
                     log("    WARNING: {}".format(e))
@@ -3352,12 +5712,20 @@ def process_image_entry(entry, cfg, ep, run_dir, row):
                 row["alt_drafted"] = 1
                 review.append("Review the AI-drafted alt text (_alt.txt) "
                               "and add it where the image is used")
+            else:
+                decorative = True
+                review.append("The AI judged this image decorative — mark "
+                              "it decorative wherever it is used")
         except AIError as e:
             add_warning()
             ai_ctx["alt_failed"] = ai_ctx.get("alt_failed", 0) + 1
             log("    WARNING: alt-text request failed: {}".format(e))
-    if not row["alt_drafted"]:
+    elif cfg["ai_alt"] and row.get("gate_barred"):
+        gate_held(row, "alt text")
+        manual.append(gate_alt_step(row))
+    if not row["alt_drafted"] and not decorative:
         manual.append("Write alt text for wherever this image is used")
+    row["alt_missing"] = 0 if (row["alt_drafted"] or decorative) else 1
 
     row["output"] = "; ".join(outputs)
     apply_ai_results(row, ai_ctx, manual, review)
@@ -3378,13 +5746,20 @@ def process_office_entry(entry, cfg, ep, run_dir, row):
     row["ocr"] = "—"
     manual, review = [], []
     ai_ctx = new_ai_ctx(cfg, ep) if cfg.get("ai_alt") else None
+    row["_ai_ctx"] = ai_ctx
 
-    def flag_structure(info, alt_missing, alt_drafted):
+    def flag_structure(info, alt_missing, alt_drafted, decorative=0,
+                       replaced=0):
         if alt_missing:
-            manual.append("Add alt text for {} image(s)".format(alt_missing))
+            manual.append(alt_step(alt_missing,
+                                   info.get("alt_placeholder", 0),
+                                   info.get("placeholder_example", ""),
+                                   "image"))
         if alt_drafted:
-            review.append("Review {} AI-drafted alt text(s) for accuracy"
-                          .format(alt_drafted))
+            review.append(drafted_step(alt_drafted, replaced))
+        if decorative:
+            review.append("{} image(s) the AI judged decorative were marked "
+                          "decorative — confirm each".format(decorative))
         if is_docx:
             if not info["headings"]:
                 manual.append("Apply Heading styles to structure the "
@@ -3398,10 +5773,13 @@ def process_office_entry(entry, cfg, ep, run_dir, row):
                     info["untitled"]))
 
     if cfg["mode"] == "evaluate":
-        row["doc_title"] = ("Present" if before["title"].strip()
-                            else "Missing")
+        row["doc_title"] = title_word(before["title"], src)
         if row["doc_title"] == "Missing":
             manual.append("Set a document title (File > Info > Properties)")
+        elif row["doc_title"] == "Placeholder":
+            manual.append("Replace the placeholder document title (File > "
+                          "Info > Properties)")
+        row["alt_missing"] = before["alt_missing"]
         flag_structure(before, before["alt_missing"], 0)
         row["accessibility"] = classify_accessibility(manual, review)
         row["next"] = join_steps(manual, review)
@@ -3416,17 +5794,28 @@ def process_office_entry(entry, cfg, ep, run_dir, row):
     else:
         res = process_pptx(src, out, title, ai_ctx, log)
     row["alt_drafted"] = res["alt_drafted"]
+    row["alt_missing"] = res["alt_missing"]
+    if cfg.get("ai_alt") and row.get("gate_barred") and res.get("askable"):
+        gate_held(row, "alt text")
+        manual.append(gate_alt_step(row))
     row["output"] = out
-    row["doc_title"] = ("Set" if res["title_set"]
-                        else ("Present" if before["title"].strip()
-                              else "Missing"))
+    row["doc_title"] = (title_set_word(entry) if res["title_set"]
+                        else title_word(before["title"], src))
+    if res["title_set"] and not (entry.get("title") or "").strip():
+        review.append(TITLE_FROM_NAME)
     if row["doc_title"] == "Missing":
         manual.append("Set a document title (File > Info > Properties)")
+    elif row["doc_title"] == "Placeholder":
+        manual.append("Replace the placeholder document title (File > "
+                      "Info > Properties)")
     after_info = dict(before)
     after_info["alt_missing"] = res["alt_missing"]
+    after_info["alt_placeholder"] = res["alt_placeholder"]
+    after_info["placeholder_example"] = res["placeholder_example"]
     if not is_docx:
         after_info["untitled"] = res["untitled"]
-    flag_structure(after_info, res["alt_missing"], res["alt_drafted"])
+    flag_structure(after_info, res["alt_missing"], res["alt_drafted"],
+                   res.get("decorative", 0), res.get("replaced", 0))
     apply_ai_results(row, ai_ctx, manual, review)
     row["accessibility"] = classify_accessibility(manual, review)
     row["next"] = join_steps(manual, review)
@@ -3434,9 +5823,33 @@ def process_office_entry(entry, cfg, ep, run_dir, row):
     return row
 
 
+def _stopped_part_way(row, err, t_file):
+    """The file a Stop, or a systemic AI stop, interrupted — as a row: what
+    it was billed, what was transcribed, and where the partial sidecar is.
+    Before 1.13.0 it was left out of the report, and its sidecar and tokens
+    with it; a Stop during the only file wrote no report at all and logged
+    that no file had been processed."""
+    manual, review = [], []
+    apply_ai_results(row, row.get("_ai_ctx"), manual, review)
+    why = ("a Stop" if isinstance(err, StopRequested)
+           else "the AI endpoint failing")
+    steps = ["Stopped part-way by {} — run this file again".format(why)]
+    partial = row.get("_partial") or ""
+    if partial and os.path.isfile(partial):
+        row["output"] = partial
+        steps.append("the partial sidecar holds {} of the {} page(s) sent"
+                     .format(row.get("ai_pages_ok") or 0,
+                             row.get("ai_pages") or 0))
+    row["status"] = "Stopped part-way"
+    row["accessibility"] = STATUS_NA
+    row["next"] = "; ".join(steps + manual)
+    row["time"] = _hms(time.time() - t_file)
+
+
 def process_one(entry, idx, cfg, ep, run_dir):
     """Returns a finished report-row dict; never raises for per-file
-    problems (FileError → Failed row + warning)."""
+    problems (FileError → Failed row + warning). A Stop or a systemic AI
+    stop is re-raised carrying the row as far as it got (err.row)."""
     t_file = time.time()
     row = {"order": idx, "file": entry["rel"],
            "format": FORMAT_LABELS[entry["format"]],
@@ -3449,15 +5862,23 @@ def process_one(entry, idx, cfg, ep, run_dir):
            "admin_url": entry["admin_url"],
            # Seeded zeroed so a Failed or Skipped row still sums cleanly.
            "in_tok": 0, "out_tok": 0, "think_tok": 0, "cache_tok": 0,
-           "ai_pages": 0, "alt_chars": 0, "alt_over": "", "flags": "",
-           "flag_counts": {}, "served": ""}
+           "ai_pages": 0, "ai_pages_ok": 0, "alt_chars": 0, "alt_over": "",
+           "flags": "", "flag_counts": {}, "served": "",
+           "scan_pages": "", "checked_by": "", "rule_failures": "",
+           "ai_gate": "", "findings": None, "detectors": ""}
+    file_ep = ep
+    if ep is not None and ai_can_reach(entry, cfg):
+        allowed, row["ai_gate"] = ai_gate(entry, cfg.get("ai_override"))
+        if not allowed:
+            file_ep = None
+            row["gate_barred"] = True
     try:
         if entry["format"] == "pdf":
-            row = process_pdf_entry(entry, cfg, ep, run_dir, row)
+            row = process_pdf_entry(entry, cfg, file_ep, run_dir, row)
         elif entry["format"] == "image":
-            row = process_image_entry(entry, cfg, ep, run_dir, row)
+            row = process_image_entry(entry, cfg, file_ep, run_dir, row)
         elif entry["format"] in ("docx", "pptx"):
-            row = process_office_entry(entry, cfg, ep, run_dir, row)
+            row = process_office_entry(entry, cfg, file_ep, run_dir, row)
         elif entry["format"] == "legacy":
             row["accessibility"] = STATUS_MANUAL
             row["next"] = LEGACY_ADVICE
@@ -3466,9 +5887,12 @@ def process_one(entry, idx, cfg, ep, run_dir):
             row["accessibility"] = STATUS_NA
             row["next"] = OTHER_ADVICE
             row["status"] = "Not processed"
-    except (StopRequested, SystemicAIFailure):
+    except (StopRequested, SystemicAIFailure) as err:
         # Neither is this file's problem: Stop is the user, and a systemic
         # AI failure means the next forty-nine files would fail the same way.
+        # The row goes with it, so the report still has this file.
+        _stopped_part_way(row, err, t_file)
+        err.row = row
         raise
     except FileError as e:
         add_warning()
@@ -3483,12 +5907,6 @@ def process_one(entry, idx, cfg, ep, run_dir):
         row["accessibility"] = STATUS_FAILED
         row["status"] = "Failed"
         row["next"] = "Unexpected {}: {}".format(e.__class__.__name__, e)
-    # Fill the Alt Missing column from the next-steps text when set there.
-    m = re.search(r"Add alt text for (\d+)", row["next"])
-    if m:
-        row["alt_missing"] = int(m.group(1))
-    elif row["images"] != "":
-        row["alt_missing"] = row.get("alt_missing") or 0
     row["time"] = _hms(time.time() - t_file)
     return row
 
@@ -3512,7 +5930,44 @@ def _row_values(row):
             row.get("think_tok") or "", row.get("cache_tok") or "",
             row.get("ai_pages") or "", row.get("alt_chars") or "",
             row.get("alt_over") or "", row.get("flags") or "",
-            row.get("served") or ""]
+            row.get("served") or "",
+            # A measured nought is shown: pages sent and none answered, a
+            # PDF with no page scans.
+            row.get("ai_pages_ok", 0) if row.get("ai_pages") else "",
+            row.get("scan_pages", ""),
+            row.get("checked_by") or "", row.get("rule_failures") or "",
+            row.get("ai_gate") or "", row.get("detectors") or ""]
+
+
+def _verapdf_summary(rows):
+    """Summary lines for the veraPDF results in this run: what ran, and
+    each PDF/UA-1 rule that failed with the number of files and its text."""
+    ran = [r["verapdf"] for r in rows
+           if isinstance(r.get("verapdf"), dict)
+           and not r["verapdf"].get("error")]
+    errors = sum(1 for r in rows if isinstance(r.get("verapdf"), dict)
+                 and r["verapdf"].get("error"))
+    pdfs = sum(1 for r in rows if r.get("format") == "PDF"
+               and r.get("checked_by"))
+    if not ran and not errors:
+        return []
+    versions = sorted(set(v["version"] for v in ran if v["version"]))
+    pairs = [("veraPDF (PDF/UA-1)", "{} of {} PDF(s) checked{}{}".format(
+        len(ran), pdfs,
+        " · veraPDF " + ", ".join(versions) if versions else "",
+        " · {} could not be checked (see the log)".format(errors)
+        if errors else ""))]
+    files, texts = {}, {}
+    for v in ran:
+        for rule, _n, text in v["rules"]:
+            files[rule] = files.get(rule, 0) + 1
+            texts.setdefault(rule, text)
+    for rule in sorted(files, key=lambda k: (-files[k], k)):
+        pairs.append(("  PDF/UA-1 rule " + rule, "{} file(s) — {}".format(
+            files[rule], texts[rule][:160])))
+    if not files:
+        pairs.append(("  PDF/UA-1 rules failed", "none"))
+    return pairs
 
 
 def process_worker(session, cfg, ep):
@@ -3549,14 +6004,41 @@ def process_worker(session, cfg, ep):
                  ("Files in run", "{} of {} queued{}".format(
                      len(rows), total,
                      " — " + note if note else ""))]
+        pairs += _verapdf_summary(rows)
+        pairs += _detector_summary(rows)
         used_ai = bool(ep) and (cfg["engine"] == "ai" or cfg["ai_alt"])
         if used_ai:
+            policy = ("public files only (the downloader report's "
+                      "Visibility public and Access open or n/a); files "
+                      "with no downloader record are sent, marked "
+                      "\"visibility not known\"; a downloader's file "
+                      "no report describes is held back")
+            if cfg["mode"] == "evaluate":
+                # Evaluate sends nothing, so nothing was held back: what the
+                # gate decided is a preview of a processing run.
+                pairs.append(("AI gate", "Evaluate only sends nothing to "
+                              "the AI endpoint. " + (
+                                  "With the override on, a processing run "
+                                  "would send hidden and restricted files "
+                                  "too." if cfg.get("ai_override") else
+                                  "A processing run would send " + policy
+                                  + ".")))
+                pairs.append(("Files a processing run could not send",
+                              sum(1 for r in rows if r.get("gate_barred"))))
+            else:
+                pairs.append(("AI gate", "override on — hidden and "
+                              "restricted files were sent"
+                              if cfg.get("ai_override") else policy))
+                pairs.append(("Files the gate held back",
+                              sum(1 for r in rows if r.get("gate_held"))))
             pairs.append(("Concurrent AI requests",
                           cfg.get("ai_concurrency",
                                   DEFAULT_AI_CONCURRENCY)))
             pairs.append(("Reply limit", "{:,} output tokens per page and "
                           "per alt draft".format(
                               cfg.get("max_tokens", DEFAULT_REPLY_LIMIT))))
+            pairs.append(("Alt-text drafts per file", "at most {}".format(
+                cfg.get("alt_limit", AI_MAX_ALT_PER_FILE))))
             pairs.append(("Max AI raster dimension",
                           "{} px".format(AI_OCR_MAX_DIM)))
             pairs.append(("Model requested", ep.get("model") or "—"))
@@ -3565,14 +6047,16 @@ def process_worker(session, cfg, ep):
             tok_out = sum(r.get("out_tok") or 0 for r in rows)
             tok_think = sum(r.get("think_tok") or 0 for r in rows)
             tok_cache = sum(r.get("cache_tok") or 0 for r in rows)
-            ai_pages = sum(r.get("ai_pages") or 0 for r in rows)
+            ai_sent = sum(r.get("ai_pages") or 0 for r in rows)
+            ai_ok = sum(r.get("ai_pages_ok") or 0 for r in rows)
             flag_totals = {}
             for r in rows:
                 for key, val in (r.get("flag_counts") or {}).items():
                     if key != "median_chars":
                         flag_totals[key] = flag_totals.get(key, 0) + val
             pairs += [
-                ("AI pages transcribed", ai_pages),
+                ("AI pages sent", ai_sent),
+                ("AI pages transcribed", ai_ok),
                 ("Total input tokens", "{:,}".format(tok_in)),
                 ("Total output tokens", "{:,}".format(tok_out)),
                 # Zero here means "this endpoint publishes no separate
@@ -3585,8 +6069,10 @@ def process_worker(session, cfg, ep):
                     " (this endpoint reports no separate figure)")),
                 ("Total cached input tokens", "{:,}".format(tok_cache)),
                 ("Pages not transcribed",
-                 "{} (model stopped and named a reason)".format(
-                     flag_totals.get("NO TRANSCRIPTION", 0))),
+                 "{} (the model stopped and named a reason) · {} (the "
+                 "request failed with no reply)".format(
+                     flag_totals.get("model_stopped", 0),
+                     flag_totals.get("request_failed", 0))),
                 ("Pages with no coverage line",
                  "{} (reply may have stopped mid-transcription)".format(
                      flag_totals.get("INCOMPLETE REPLY", 0))),
@@ -3608,7 +6094,10 @@ def process_worker(session, cfg, ep):
             path = os.path.join(report_dir, fname)
             write_report(path, [_row_values(r) for r in rows], pairs,
                          header_rgb,
-                         extra_note=AI_REVIEW_NOTE if used_ai else ())
+                         extra_note=AI_REVIEW_NOTE if used_ai else (),
+                         findings=_detector_rows(rows) if any(
+                             r.get("findings") is not None for r in rows)
+                         else None)
             log("Report written: " + path)
             set_state(last_file=path)
             return path
@@ -3616,6 +6105,9 @@ def process_worker(session, cfg, ep):
             log("ERROR writing report: {}: {}".format(
                 e.__class__.__name__, e))
             return None
+
+    def part_way():
+        return sum(1 for r in rows if r.get("status") == "Stopped part-way")
 
     try:
         set_state(phase="processing", summary="", warnings=0,
@@ -3637,6 +6129,8 @@ def process_worker(session, cfg, ep):
             total, MODE_LABELS.get(cfg["mode"], cfg["mode"]),
             "overwriting originals" if cfg["save"] == "overwrite"
             else "new copies"))
+        if cfg.get("verapdf"):
+            log("veraPDF PDF/UA-1 checks every PDF: " + cfg["verapdf"])
         for idx, entry in enumerate(entries, start=1):
             check_pause_stop()
             set_progress(idx - 1, total, "{} · {}".format(
@@ -3673,23 +6167,31 @@ def process_worker(session, cfg, ep):
     except SystemicAIFailure as e:
         # Not "unexpected": the run was stopped deliberately, and the
         # partial report plus the reason is the whole point of stopping.
+        if getattr(e, "row", None) is not None:
+            rows.append(e.row)
         log("AI endpoint failing systemically — {}".format(e))
         path = finish_report("stopped: AI endpoint failing")
-        fail("Run stopped after {} of {} file(s) — {}{}".format(
-            len(rows), total, e,
+        fail("Run stopped with {} of {} file(s) done{} — {}{}".format(
+            len(rows) - part_way(), total,
+            ", 1 stopped part-way" if part_way() else "", e,
             " Partial report: " + os.path.basename(path) if path else ""))
-    except StopRequested:
-        log("Stop requested — {} of {} file(s) done.".format(
-            len(rows), total))
+    except StopRequested as e:
+        if getattr(e, "row", None) is not None:
+            rows.append(e.row)
+        done = len(rows) - part_way()
+        log("Stop requested — {} of {} file(s) done{}.".format(
+            done, total, ", 1 stopped part-way" if part_way() else ""))
         path = finish_report("stopped early")
         if path:
             set_state(phase="done", paused=False,
                       outcome=outcome_tone(
                           sum(1 for r in rows if r["status"] == "Failed")
                           + run_warnings()),
-                      summary="Stopped early ({} of {} file(s)). Partial "
-                              "report: {}".format(len(rows), total,
-                                                  os.path.basename(path)))
+                      summary="Stopped early ({} of {} file(s) done{}). "
+                              "Partial report: {}".format(
+                                  done, total,
+                                  ", 1 stopped part-way" if part_way()
+                                  else "", os.path.basename(path)))
         else:
             set_state(phase="idle", paused=False)
             set_progress(0, 0, "")
@@ -3880,6 +6382,17 @@ PAGE = r"""<!DOCTYPE html>
   </div>
   <button type="button" id="scan" class="small">Scan</button>
  </div>
+ <div class="row" id="rptrow">
+  <div>
+   <label for="rptdir" id="rptdirlabel">Reports folder, if saved elsewhere (optional)</label>
+   <span class="browse-row"><input type="text" id="rptdir" data-path="folder" value="" autocomplete="off" spellcheck="false" aria-describedby="rpthint"><button type="button" class="small secondary" data-browse="folder" data-for="rptdir" data-title="Reports folder, if saved elsewhere (optional)" aria-label="Browse for Reports folder, if saved elsewhere (optional)" hidden>Browse…</button></span><span class="browse-msg" id="rptdir-browsemsg" role="status" aria-live="polite"></span>
+   <p class="hint" id="rpthint">When the downloader wrote its reports to a
+    folder of their own, choose that run's report folder (or the folder
+    that holds it), so each file's visibility and access are read from
+    them. A file no report describes is held back from the AI endpoint
+    unless the override is on.</p>
+  </div>
+ </div>
  <div id="pathswrap" hidden>
   <label for="pathbox">File paths</label>
   <textarea id="pathbox" data-path="files" spellcheck="false"
@@ -3920,6 +6433,9 @@ PAGE = r"""<!DOCTYPE html>
    <div class="inline"><input type="checkbox" id="tag" checked>
     <label for="tag">Auto-tag untagged PDFs (heuristic — paragraphs and
      figures; semantics still need review)</label></div>
+   <div class="inline"><input type="checkbox" id="vpdf" checked>
+    <label for="vpdf">Check each PDF with veraPDF (PDF/UA-1) when it is
+     installed — the structure walk runs either way</label></div>
    <div class="inline"><input type="checkbox" id="deskew" checked>
     <label for="deskew">Deskew and auto-rotate pages during OCR</label></div>
    <div class="row">
@@ -3966,6 +6482,11 @@ PAGE = r"""<!DOCTYPE html>
    <input type="number" id="aimaxtok" min="64" max="32000" step="100"
     value="8000" disabled aria-describedby="aimaxtokhint">
   </div>
+  <div style="flex:0 0 11rem">
+   <label for="aialtmax">Alt-text drafts per file</label>
+   <input type="number" id="aialtmax" min="1" max="500" value="25" disabled
+    aria-describedby="aialtmaxhint">
+  </div>
   <button type="button" id="testep" class="small secondary" disabled>Test</button>
  </div>
  <p class="hint" id="aimaxtokhint">The reply limit is the ceiling on one reply,
@@ -3973,6 +6494,10 @@ PAGE = r"""<!DOCTYPE html>
   model's reasoning as well as the text it returns, and the reasoning varies
   from one run to the next &mdash; so 8000 is the default even for alt text.
   Raise it if pages come back NO TRANSCRIPTION (<code>max_tokens</code>).</p>
+ <p class="hint" id="aialtmaxhint">Alt-text drafts per file caps the alt-text
+  requests one file can make. A figure past the cap is not asked about, and
+  the file's row says how many; processing the output again drafts the
+  next ones, since figures already drafted have alt text.</p>
  <p class="hint">Requests stream, so a long transcription cannot be cut off
   part-way by an idle connection. If a request is rate-limited or the
   connection drops, it is retried this many times with a doubling wait
@@ -4001,6 +6526,16 @@ PAGE = r"""<!DOCTYPE html>
     <label for="aialt">Draft alt text with the AI endpoint for images
      missing it (embedded in Word/PowerPoint and PDF tags; always flagged
      for review)</label></div>
+   <h3 id="gateh" style="margin-top:.7rem">Which files may be sent</h3>
+   <div class="inline"><input type="checkbox" id="aioverride" disabled
+     aria-describedby="gatehint">
+    <label for="aioverride">Also send hidden and restricted files
+     (override)</label></div>
+   <p class="hint" id="gatehint">By default a file goes to the AI endpoint
+    only when the downloader's report marks it public and open. A file the
+    downloader named but no report describes is held back; other files from
+    a plain folder carry no visibility and are sent. The report's AI Gate
+    column says what was decided for each file.</p>
   </div>
  </div>
  <div id="epstatus" class="hint" role="status" aria-live="polite"></div>
@@ -4057,6 +6592,10 @@ PAGE = r"""<!DOCTYPE html>
     <code>winget install -e --id ArtifexSoftware.Ghostscript</code></li>
    <li>macOS: <code>brew install tesseract ghostscript</code></li>
   </ul>
+  <p>Optional: veraPDF, which checks each PDF against PDF/UA-1. It needs
+   Java 11 or later; install it from verapdf.org into the default folder
+   (<code>verapdf</code> in your home folder), or set
+   <code>DC_VERAPDF</code> to its launcher.</p>
   <p>Then click Re-check tools — no restart needed.</p></details>
 </fieldset>
 
@@ -4494,7 +7033,7 @@ const srcrun=$('srcrun'),srcfolder=$('srcfolder'),srcpaths=$('srcpaths'),
       refreshep=$('refreshep'),epstatus=$('epstatus'),
       englocal=$('englocal'),engai=$('engai'),aialt=$('aialt'),
       airetries=$('airetries'),
-      aiconc=$('aiconc'),aimaxtok=$('aimaxtok'),
+      aiconc=$('aiconc'),aimaxtok=$('aimaxtok'),aialtmax=$('aialtmax'),
       outdir=$('outdir'),suffix=$('suffix'),sufwrap=$('sufwrap'),
       overwarn=$('overwarn'),toolchips=$('toolchips'),recheck=$('recheck'),
       go=$('go'),pauseBtn=$('pause'),stopBtn=$('stop'),
@@ -4562,6 +7101,7 @@ function syncSource(){
  const m=srcMode();
  pathswrap.hidden=m!=='paths';
  folderrow.style.display=m==='paths'?'none':'';
+ $('rptrow').hidden=m!=='run';
  recwrap.style.display=m==='folder'?'':'none';
  srcdirlabel.textContent=m==='run'
    ?'Downloader run folder (or the folder that holds it)':'Folder to scan';
@@ -4616,7 +7156,8 @@ async function doScan(){
  clearErr();   // a fixed problem takes its message down
  const m=srcMode();
  const body=m==='paths'?{mode:m,paths:pathbox.value}
-   :{mode:m,folder:srcdir.value,recursive:recursive.checked};
+   :{mode:m,folder:srcdir.value,recursive:recursive.checked,
+     reports:$('rptdir').value};
  filesum.textContent='Scanning…';
  const data=await api('/api/scan',body);
  if(data.error){filesum.className='sum bad';filesum.textContent='Scan failed.';
@@ -4646,7 +7187,10 @@ function syncAI(){
  airetries.disabled=!has;
  aiconc.disabled=!has;
  aimaxtok.disabled=!has;
- if(!has){englocal.checked=true;aialt.checked=false;}
+ aialtmax.disabled=!has;
+ $('aioverride').disabled=!has;
+ if(!has){englocal.checked=true;aialt.checked=false;
+  $('aioverride').checked=false;}
 }
 endpoint.addEventListener('change',syncAI);
 
@@ -4717,7 +7261,8 @@ go.addEventListener('click',async()=>{
   engine:engai.checked?'ai':'local',ai_alt:aialt.checked,
   ai_retries:parseInt(airetries.value||'4',10),
   ai_concurrency:parseInt(aiconc.value||'1',10),
-  max_tokens:aimaxtok.value.trim(),
+  max_tokens:aimaxtok.value.trim(),alt_limit:aialtmax.value.trim(),
+  ai_override:$('aioverride').checked,verapdf:$('vpdf').checked,
   endpoint:endpoint.value,confirm_overwrite:over};
  const data=await api('/api/start',body);
  if(data.error)showErr(data.error);
@@ -5246,6 +7791,8 @@ def validate_start(req, model, tools, ai_cfg):
                                           DEFAULT_AI_CONCURRENCY)),
             "endpoint": str(req.get("endpoint", "")).strip(),
             "confirm": bool(req.get("confirm_overwrite", False)),
+            "ai_override": bool(req.get("ai_override", False)),
+            "verapdf_wanted": bool(req.get("verapdf", True)),
         }
     except (TypeError, ValueError):
         return "Bad request.", None, None
@@ -5257,6 +7804,9 @@ def validate_start(req, model, tools, ai_cfg):
     if not 0 <= cfg["ai_retries"] <= 10:
         return "AI retries must be between 0 and 10.", None, None
     cfg["max_tokens"], err = parse_reply_limit(req.get("max_tokens"))
+    if err:
+        return err, None, None
+    cfg["alt_limit"], err = parse_alt_limit(req.get("alt_limit"))
     if err:
         return err, None, None
     if not 1 <= cfg["ai_concurrency"] <= MAX_AI_CONCURRENCY:
@@ -5324,6 +7874,11 @@ def validate_start(req, model, tools, ai_cfg):
         return "Overwrite mode needs the confirmation prompt.", None, None
     if cfg["save"] == "overwrite":
         cfg["suffix"] = ""
+    # The launcher comes from the tool check, so this stays a pure function.
+    cfg["verapdf"] = ((tools.get("verapdf") or "")
+                      if cfg["verapdf_wanted"] else "")
+    if cfg["ai_override"] and not (cfg["engine"] == "ai" or cfg["ai_alt"]):
+        cfg["ai_override"] = False     # nothing would be sent to override
     return "", cfg, ep
 
 
@@ -5433,8 +7988,16 @@ def make_handler(session: dict, page: bytes):
                         if err_:
                             return self._json({"error": err_}, 400)
                         if mode == "run":
-                            entries, run = scan_run_folder(folder)
+                            reports = os.path.expanduser(
+                                str(req.get("reports", "")).strip())
+                            if reports:
+                                err_ = folder_error("Reports folder",
+                                                    reports)
+                                if err_:
+                                    return self._json({"error": err_}, 400)
+                            entries, run = scan_run_folder(folder, reports)
                             source = os.path.basename(run)
+                            log(reported_note(entries))
                         else:
                             entries = scan_folder(
                                 folder, bool(req.get("recursive", False)))

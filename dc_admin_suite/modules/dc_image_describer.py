@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Image Description Generator v1.2 — DC Admin Suite module.
+"""Image Description Generator — DC Admin Suite module (version: MANIFEST).
+
+v1.11.0 adds the AI gate the OCR & Accessibility Toolkit shares: an image
+goes to the endpoint only when the downloader's report marks it public
+(Visibility public, Access open or n/a), unless the run's override is on.
+An image with no downloader record carries no visibility and is sent; the
+report's AI Gate column says what was decided for each image, and Preview
+refuses an image the gate holds back.
 
 v1.2 (2026-08-23) reads AI endpoints from the SUITE-LEVEL registry the shell
 now owns (config/ai_endpoints.json, path supplied in session.json as
@@ -102,7 +109,7 @@ MANIFEST = {
     "id": "image-describer",
     "name": "Image Description Generator",
     "description": "Generate reviewable alt-text and transcription sidecar files for folders of scanned images, using a Gemini, OpenAI, or Claude endpoint.",
-    "version": "1.10.0",
+    "version": "1.11.0",
     "requires": ["openpyxl", "pymupdf"],
 }
 
@@ -136,7 +143,8 @@ XLSX_MIME = ("application/vnd.openxmlformats-officedocument"
 
 # Batch File Downloader artifacts recognized during run-folder ingest.
 DL_RUN_PREFIX = "DC_FileDownloads_"
-DL_REPORT_GLOB = "DC_FileDownload_Report_*.xlsx"
+DL_REPORT_GLOBS = ("DC_FileDownload_Report_*.xlsx",
+                   "DC_FileDownload_Retry_*.xlsx")
 
 SCAN_MAX_FILES = 5000       # hard cap per source scan (safety)
 # Because requests stream, these are IDLE timeouts — the longest gap allowed
@@ -1431,7 +1439,7 @@ def infer_meta(path: str, root: str) -> dict:
 
 
 def _entry(path, rel, meta=None):
-    meta = meta or {}
+    meta = _with_name_meta(path, meta)
     try:
         size = os.path.getsize(path)
     except OSError:
@@ -1441,7 +1449,133 @@ def _entry(path, rel, meta=None):
             "sidecar": os.path.isfile(sidecar_for(path)),
             "ctx": meta.get("ctx", ""), "article": meta.get("article", ""),
             "title": meta.get("title", ""), "state": meta.get("state", ""),
-            "admin_url": meta.get("admin_url", "")}
+            "admin_url": meta.get("admin_url", ""),
+            "record": bool(meta.get("record")),
+            "reported": bool(meta.get("reported")),
+            "visibility": meta.get("visibility", ""),
+            "access": meta.get("access", "")}
+
+
+# ---- Downloader names and reports -------------------------------------------
+# The Batch File Downloader names each file <context>_<article>_<kind>_
+# <visibility>_..., so a file carries its visibility even where its report
+# is not at hand: a copy in a plain folder, or a run whose reports were
+# saved to a folder of their own. Its access (an embargo) is in the report
+# only, so such a file reads "access not recorded" and the AI gate holds it
+# back unless the run's override is on. Duplicated verbatim in both AI
+# modules and held to agreement by ast.
+# <kind> is primary, native, coverletter or supp<N>: a supplemental file's
+# kind carries its number, so digits are allowed after the first letter.
+_DL_NAME_RE = re.compile(
+    r"^(?P<ctx>.+?)_(?P<article>\d+)_(?P<kind>[a-z][a-z0-9-]*)_"
+    r"(?P<visibility>public|hidden)_")
+
+
+def downloader_name_meta(path):
+    """{"article", "visibility"} from a downloader's filename, or {}."""
+    m = _DL_NAME_RE.match(os.path.basename(path or ""))
+    if not m:
+        return {}
+    return {"article": m.group("article"),
+            "visibility": m.group("visibility")}
+
+
+def _with_name_meta(path, meta):
+    """A file's metadata, completed from its name where the name is a
+    downloader's: it is then a record, whatever its report said or did
+    not."""
+    meta = dict(meta or {})
+    named = downloader_name_meta(path)
+    if named:
+        meta["record"] = True
+        if not meta.get("visibility"):
+            meta["visibility"] = named["visibility"]
+        if not meta.get("article"):
+            meta["article"] = named["article"]
+    return meta
+
+
+def downloader_reports(folder):
+    """Every per-structure download report in `folder` — a structure's
+    first session writes a Report, each re-run session a Retry report with
+    the same columns — oldest first by the stamp in its name, the order the
+    downloader reads them in, so a later session's row for a file replaces
+    an earlier one's."""
+    found = []
+    for pattern in DL_REPORT_GLOBS:
+        found += glob.glob(os.path.join(folder, pattern))
+
+    def stamp(path):
+        m = re.search(r"(\d{8}_\d{6})", os.path.basename(path))
+        return (m.group(1) if m else "", os.path.basename(path))
+    return sorted(found, key=stamp)
+
+
+def external_reports(reports, run):
+    """Saved Filename → record metadata from the reports a downloader saved
+    to a folder of their own. `reports` is that run's report folder or the
+    folder that holds it. Raises ValueError, naming where it looked, when
+    there is no report there."""
+    if not reports:
+        return {}
+    name = os.path.basename(os.path.normpath(run))
+    inner = os.path.join(reports, name)
+    where = inner if os.path.isdir(inner) else reports
+    found = downloader_reports(where)
+    if not found:
+        raise ValueError(
+            "No downloader report ({}) in {} — choose the folder the "
+            "downloader saved this run's reports to, or the folder that "
+            "holds it.".format(" or ".join(DL_REPORT_GLOBS), where))
+    meta = {}
+    for rep in found:
+        try:
+            meta.update(load_downloader_meta(rep))
+        except Exception:
+            pass    # a damaged report never blocks the queue
+    return meta
+
+
+def reported_note(entries):
+    """The log line saying how many queued files a downloader report
+    describes, and what the AI gate does with the rest."""
+    n = sum(1 for e in entries if e.get("reported"))
+    rest = len(entries) - n
+    if not rest:
+        return "Downloader reports describe all {} file(s).".format(n)
+    return ("Downloader reports describe {} of {} file(s); the other {} "
+            "carry no access record, so the AI gate holds them back unless "
+            "the override is on.".format(n, len(entries), rest))
+
+
+# ---- AI gate ----------------------------------------------------------------
+# A file goes to an AI endpoint only when the Batch File Downloader's report
+# says it is public (Visibility public, Access open or n/a), unless the run's
+# override is on. A file with no downloader record carries no visibility; it
+# is sent, and its row says so. The report's AI Gate column says what this
+# decided for each file. Duplicated verbatim in both AI modules and held to
+# agreement by ast.
+AI_GATE_PUBLIC = "public"
+AI_GATE_UNKNOWN = "visibility not known"
+_AI_GATE_OPEN = ("open", "n/a")
+
+
+def ai_gate(entry, override=False):
+    """(allowed, label) for one queued file; the label is its AI Gate."""
+    if not entry.get("record"):
+        return True, AI_GATE_UNKNOWN
+    vis = str(entry.get("visibility") or "").strip().lower()
+    acc = str(entry.get("access") or "").strip().lower()
+    if vis == "public" and acc in _AI_GATE_OPEN:
+        return True, AI_GATE_PUBLIC
+    why = []
+    if vis != "public":
+        why.append(vis or "visibility not recorded")
+    if acc not in _AI_GATE_OPEN:
+        why.append("access " + acc if acc else "access not recorded")
+    if override:
+        return True, "sent under override ({})".format(", ".join(why))
+    return False, "{} — not sent".format(", ".join(why))
 
 
 # Extensions that legitimately sit alongside images in a digitization
@@ -1541,13 +1675,15 @@ def load_downloader_meta(report_path: str) -> dict:
                 meta[saved] = {"article": val("Article ID"),
                                "title": val("Title"),
                                "state": val("Record State"),
-                               "admin_url": val("Admin Record URL")}
+                               "admin_url": val("Admin Record URL"),
+                               "visibility": val("Visibility"),
+                               "access": val("Access")}
         return meta
     finally:
         wb.close()
 
 
-def scan_run_folder(folder: str):
+def scan_run_folder(folder: str, reports: str = ""):
     """Queue the images in a Batch File Downloader run. `folder` is either a
     DC_FileDownloads_* run folder or a folder holding one or more of them
     (newest picked). Returns (entries, run_folder); raises ValueError with a
@@ -1565,13 +1701,14 @@ def scan_run_folder(folder: str):
                 "Downloader run (or its parent folder).".format(
                     DL_RUN_PREFIX, folder))
         run = runs[0]
+    external = external_reports(reports, run)
     entries, skipped = [], []
     for sub in sorted(os.listdir(run)):
         sub_path = os.path.join(run, sub)
         if not os.path.isdir(sub_path):
             continue
         meta_by_name = {}
-        for rep in glob.glob(os.path.join(sub_path, DL_REPORT_GLOB)):
+        for rep in downloader_reports(sub_path):
             try:
                 meta_by_name.update(load_downloader_meta(rep))
             except Exception:
@@ -1585,7 +1722,13 @@ def scan_run_folder(folder: str):
                 if _is_noteworthy_skip(fname):
                     skipped.append("{}/{}".format(sub, fname))
                 continue
-            meta = dict(meta_by_name.get(fname, {}))
+            meta = dict(meta_by_name.get(fname)
+                        or external.get(fname) or {})
+            meta["reported"] = fname in meta_by_name or fname in external
+            # A file in a downloader run comes from a record even when its
+            # report is elsewhere or missing: the gate holds it back until
+            # a report says it is public.
+            meta["record"] = True
             meta["ctx"] = sub
             if not meta.get("article"):
                 meta.update({k: v for k, v in
@@ -1822,9 +1965,10 @@ REPORT_HEADERS = ["Order", "Image File", "Folder", "Context ID",
                   "Uncertain Readings", "Sidecar File", "Status",
                   "Retries", "Time", "Admin Record URL",
                   "In Tok", "Out Tok", "Think Tok", "Cached Tok",
-                  "Transcription Chars", "Flags", "Served Model"]
+                  "Transcription Chars", "Flags", "Served Model",
+                  "AI Gate"]
 REPORT_WIDTHS = [8, 44, 28, 26, 10, 36, 13, 11, 70, 11, 14, 34, 60, 44,
-                 30, 9, 9, 60, 10, 10, 11, 12, 20, 30, 26]
+                 30, 9, 9, 60, 10, 10, 11, 12, 20, 30, 26, 28]
 REPORT_LINK_COLS = (18,)
 
 # Under-transcription is judged against the run's OWN median, not a fixed
@@ -2097,9 +2241,9 @@ def outcome_tone(problems, succeeded=None):
 
 
 # The page's settings, by element id, remembered across launches (DC-FORM, 1.0.1).
-FORM_FIELDS = ("srcfolder", "srcrun", "srcpaths", "srcdir", "recursive",
+FORM_FIELDS = ("srcfolder", "srcrun", "srcpaths", "srcdir", "rptdir", "recursive",
     "pathbox", "profile", "endpoint", "dbeside", "dfolder", "skip", "outdir",
-    "delay", "retries", "maxdim", "conc", "maxtok",
+    "delay", "retries", "maxdim", "conc", "maxtok", "aioverride",
 )
 # The page's other controls, which are NOT kept, and why: the queue filter, the log copy box, and the profile dialog, which saves itself.
 # Every control on the page is in one list or the other (_verify_pages.py).
@@ -2419,7 +2563,7 @@ def process_one(entry, idx, cfg, ep, profile):
            "in_tok": 0, "out_tok": 0, "think_tok": 0, "cache_tok": 0,
            "tchars": 0,
            "uncertain_state": "absent", "has_notes": False, "flags": "",
-           "served": ""}
+           "served": "", "gate": ""}
     dest = _sidecar_dest(entry, cfg)
     try:
         if entry["sidecar"] and cfg["dest"] == "beside" and cfg["skip"]:
@@ -2429,6 +2573,13 @@ def process_one(entry, idx, cfg, ep, profile):
         if cfg["dest"] != "beside" and os.path.isfile(dest) and cfg["skip"]:
             row["status"] = "Skipped (sidecar exists)"
             row["sidecar"] = dest
+            return _finish_row(row, t_file)
+        # After the skips: an image this run would not describe anyway is
+        # not one the gate held back.
+        allowed, row["gate"] = ai_gate(entry, cfg.get("ai_override"))
+        if not allowed:
+            log("    AI gate: {}".format(row["gate"]))
+            row["status"] = "Skipped ({})".format(row["gate"])
             return _finish_row(row, t_file)
         text, sections, warnings, retries, _note, usage = describe_one(
             entry, ep, profile, cfg["max_dim"], cfg["retries"],
@@ -2515,7 +2666,8 @@ def _row_values(row):
             row["retries"], row["time"], row["admin_url"],
             row["in_tok"] or "", row["out_tok"] or "",
             row["think_tok"] or "", row["cache_tok"] or "",
-            row["tchars"] or "", row["flags"], row.get("served") or ""]
+            row["tchars"] or "", row["flags"], row.get("served") or "",
+            row.get("gate") or ""]
 
 
 # ---------------------------------------------------------------------------
@@ -2643,6 +2795,15 @@ def describe_worker(session, cfg, ep, profile):
                      ", {} concurrent".format(cfg["concurrency"]))),
             ("Max image dimension", "{} px".format(cfg["max_dim"])),
             ("Reply limit", "{} output tokens".format(cfg["max_tokens"])),
+            ("AI gate", "override on — hidden and restricted images "
+             "were sent" if cfg.get("ai_override") else
+             "public images only (the downloader report's Visibility "
+             "public and Access open or n/a); images with no downloader "
+             "record are sent, marked \"visibility not known\"; a "
+             "downloader's image no report describes is held back"),
+            ("Images the gate held back", sum(
+                1 for r in rows
+                if str(r.get("gate", "")).endswith("not sent"))),
             ("Images in run", "{} of {} queued{}".format(
                 len(rows), total, " — " + note if note else "")),
             ("Alt text over the limit", over),
@@ -2723,10 +2884,14 @@ def describe_worker(session, cfg, ep, profile):
             n_warn = STATE["warnings"]
         n_ok = sum(1 for r in rows if r["status"].startswith("Described"))
         n_skip = sum(1 for r in rows if r["status"].startswith("Skipped"))
+        n_held = sum(1 for r in rows
+                     if str(r.get("gate", "")).endswith("not sent"))
         n_fail = sum(1 for r in rows if r["status"].startswith("Failed"))
         summary = "{} described".format(n_ok)
-        if n_skip:
-            summary += ", {} skipped".format(n_skip)
+        if n_skip - n_held:
+            summary += ", {} skipped".format(n_skip - n_held)
+        if n_held:
+            summary += ", {} not sent (hidden or restricted)".format(n_held)
         if n_fail:
             summary += ", {} failed".format(n_fail)
         if n_warn:
@@ -3192,6 +3357,7 @@ def validate_start(req, model, tools, ai_cfg, profile_cfg):
                                        DEFAULT_CONCURRENCY)),
             "endpoint": str(req.get("endpoint", "")).strip(),
             "profile": str(req.get("profile", "")).strip(),
+            "ai_override": bool(req.get("ai_override", False)),
         }
     except (TypeError, ValueError):
         return "Bad request.", None, None, None
@@ -3432,6 +3598,17 @@ PAGE = r"""<!DOCTYPE html>
   </div>
   <button type="button" id="scan" class="small">Scan</button>
  </div>
+ <div class="row" id="rptrow" hidden>
+  <div>
+   <label for="rptdir" id="rptdirlabel">Reports folder, if saved elsewhere (optional)</label>
+   <span class="browse-row"><input type="text" id="rptdir" data-path="folder" value="" autocomplete="off" spellcheck="false" aria-describedby="rpthint"><button type="button" class="small secondary" data-browse="folder" data-for="rptdir" data-title="Reports folder, if saved elsewhere (optional)" aria-label="Browse for Reports folder, if saved elsewhere (optional)" hidden>Browse…</button></span><span class="browse-msg" id="rptdir-browsemsg" role="status" aria-live="polite"></span>
+   <p class="hint" id="rpthint">When the downloader wrote its reports to a
+    folder of their own, choose that run's report folder (or the folder
+    that holds it), so each file's visibility and access are read from
+    them. A file no report describes is held back from the AI endpoint
+    unless the override is on.</p>
+  </div>
+ </div>
  <div id="pathswrap" hidden>
   <label for="pathbox">Image paths</label>
   <textarea id="pathbox" data-path="files" spellcheck="false"
@@ -3484,6 +3661,15 @@ PAGE = r"""<!DOCTYPE html>
   <button type="button" id="testep" class="small secondary" disabled>Test</button>
  </div>
  <div id="epstatus" class="hint" role="status" aria-live="polite"></div>
+ <div class="inline"><input type="checkbox" id="aioverride"
+   aria-describedby="gatehint">
+  <label for="aioverride">Also send hidden and restricted images
+   (override)</label></div>
+ <p class="hint" id="gatehint">By default an image goes to the AI endpoint
+  only when the downloader's report marks it public and open. An image the
+  downloader named but no report describes is held back; other images from
+  a plain folder carry no visibility and are sent. The report's AI Gate
+  column says what was decided for each image.</p>
  <div class="row"><button type="button" id="usedim" class="small secondary"
    hidden>Use the recommended image size for this endpoint</button></div>
  <p class="hint">Endpoints are managed for the whole suite in
@@ -4076,6 +4262,7 @@ function syncSource(){
  const m=srcMode();
  $('pathswrap').hidden=m!=='paths';
  $('folderrow').style.display=m==='paths'?'none':'';
+ $('rptrow').hidden=m!=='run';
  $('recwrap').style.display=m==='folder'?'':'none';
  $('srcdirlabel').textContent=m==='run'
    ?'Downloader run folder (or the folder that holds it)':'Folder to scan';
@@ -4142,7 +4329,8 @@ async function doScan(){
  clearErr();   /* a fixed problem takes its message down */
  const m=srcMode();
  const body=m==='paths'?{mode:m,paths:$('pathbox').value}
-   :{mode:m,folder:$('srcdir').value,recursive:$('recursive').checked};
+   :{mode:m,folder:$('srcdir').value,recursive:$('recursive').checked,
+     reports:$('rptdir').value};
  $('filesum').textContent='Scanning…';
  const data=await api('/api/scan',body);
  if(data.error){$('filesum').className='sum bad';
@@ -4421,6 +4609,7 @@ function runBody(){
   max_dim:parseInt($('maxdim').value||'2000',10),
   concurrency:parseInt($('conc').value||'1',10),
   max_tokens:$('maxtok').value.trim(),
+  ai_override:$('aioverride').checked,
   endpoint:$('endpoint').value,profile:$('profile').value};
 }
 $('go').addEventListener('click',async()=>{
@@ -4628,8 +4817,16 @@ def make_handler(session: dict, page: bytes):
                     if err_:
                         return self._json({"error": err_}, 400)
                     if mode == "run":
-                        entries, run, skipped = scan_run_folder(folder)
+                        reports = os.path.expanduser(
+                            str(req.get("reports", "")).strip())
+                        if reports:
+                            err_ = folder_error("Reports folder", reports)
+                            if err_:
+                                return self._json({"error": err_}, 400)
+                        entries, run, skipped = scan_run_folder(folder,
+                                                                reports)
                         source = os.path.basename(run)
+                        log(reported_note(entries))
                     else:
                         entries, skipped = scan_folder(
                             folder, bool(req.get("recursive", False)))
@@ -4676,6 +4873,12 @@ def make_handler(session: dict, page: bytes):
             if msg:
                 return self._json({"error": msg}, 400)
             entry = cfg["entries"][0]
+            allowed, gate = ai_gate(entry, cfg.get("ai_override"))
+            if not allowed:
+                return self._json({"error": "The AI gate holds {} back "
+                                   "({}). Turn on the override to send "
+                                   "it.".format(entry["name"], gate)},
+                                  400)
             STOP_EVENT.clear()
             PAUSE_EVENT.clear()
             log("Preview: {} via {} ({}).".format(entry["name"], ep["name"],

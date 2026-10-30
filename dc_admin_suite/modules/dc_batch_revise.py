@@ -77,7 +77,7 @@ MANIFEST = {
     "id": "batch-revise-harvester",
     "name": "Batch Revise Manager",
     "description": "Generate, download, and bulk-upload batch revise Excel reports for selected structures.",
-    "version": "1.5.0",
+    "version": "1.6.0",
     "requires": ["selenium", "beautifulsoup4", "openpyxl"],
 }
 
@@ -1981,6 +1981,13 @@ PAGE = r"""<!DOCTYPE html>
 .browse-msg{display:block;font-size:.9em;margin-top:.2rem}
 .browse-msg:empty{display:none}
 /* /DC-BROWSE styles */
+/* DC-PICK 1 styles */
+#pickbar{display:flex;flex-wrap:wrap;gap:.6rem;align-items:center;margin-top:.4rem}
+#pickbar .hint{margin:0}
+#picked{margin:.4rem 0 0;padding-left:1.2rem}
+#picked li{margin:.2rem 0}
+#picked li button{margin-left:.6rem}
+/* /DC-PICK styles */
 /* DC-PALETTE 3 — one notification palette for the shell and every module.
    Gray: instructions and neutral state. Green: the state matches what the
    operator intended. Amber (version 3): a run that finished, with problems
@@ -2085,7 +2092,13 @@ PAGE = r"""<!DOCTYPE html>
   <label for="filter" style="margin-top:.4rem">Filter structures</label>
   <input type="text" id="filter" placeholder="type to filter…" autocomplete="off">
   <div id="list" role="group" aria-label="Parent structures"></div>
-  <p class="hint" id="selcount">0 parents checked.</p>
+<!-- DC-PICK 1: the parents checked, by name, each with Remove, and Clear all. -->
+  <div id="pickbar">
+   <p class="hint" id="selcount" aria-live="polite">0 parent(s) checked.</p>
+   <button type="button" id="pickclear" class="secondary small" disabled>Clear all</button>
+  </div>
+  <ul id="picked" aria-label="Checked parents" hidden></ul>
+<!-- /DC-PICK -->
  </div>
  <p class="hint">Community / Event structures (and intermediate parents that
  only appear mid-chain) have no batch revise page — they are excluded from
@@ -2574,6 +2587,39 @@ function browseInit(){
 }
 browseInit();
 /* /DC-BROWSE */
+/* DC-PICK 1: the parents checked, shown by name under the count, each
+   with its own Remove, and Clear all. A page can reopen with parents
+   already checked, so the list says what a run will use without a
+   search. The page supplies checked (a Set) and renderList(), and its
+   updateCount() calls renderPicked(). */
+function renderPicked(){
+  const ul=document.getElementById("picked"), clr=document.getElementById("pickclear");
+  ul.innerHTML='';
+  [...checked].sort().forEach(ctx=>{
+    const li=document.createElement('li');
+    const name=document.createElement('span'); name.textContent=ctx;
+    const b=document.createElement('button');
+    b.type='button'; b.className='secondary small'; b.textContent='Remove';
+    b.setAttribute('aria-label','Remove '+ctx);
+    b.addEventListener('click',()=>pickRemove(ctx));
+    li.append(name,b); ul.append(li);
+  });
+  ul.hidden=!checked.size;
+  clr.disabled=!checked.size;
+}
+function pickRemove(ctx){
+  const at=[...checked].sort().indexOf(ctx);
+  checked.delete(ctx); renderList();
+  const left=document.getElementById("picked").querySelectorAll('button');
+  if(left.length) left[Math.min(at,left.length-1)].focus();
+  else document.getElementById("filter").focus();
+}
+function pickClear(){
+  checked.clear(); renderList();
+  document.getElementById("filter").focus();
+}
+document.getElementById("pickclear").addEventListener('click',pickClear);
+/* /DC-PICK */
 
 (function(){
   const box = logEl(), btn = document.getElementById('logcopy');
@@ -2765,7 +2811,7 @@ function renderList(){
   }
   updateCount();
 }
-function updateCount(){ selcount.textContent=checked.size+' parent(s) checked.'; }
+function updateCount(){ selcount.textContent=checked.size+' parent(s) checked.'; renderPicked(); }
 
 go.addEventListener('click', async ()=>{
   clearErr();   // a fixed problem takes its message down

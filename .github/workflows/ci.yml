@@ -37,6 +37,16 @@ jobs:
         # The brief promises Windows and macOS. Nothing has ever
         # tested the Windows half — not CI, not a live run.
         os: [ubuntu-latest, windows-latest]
+        # ubuntu-latest became Ubuntu 26.04 in October 2026, and Python 3.9
+        # is not offered for that image: the job stopped at setup, before
+        # any check ran. 3.9 on Linux runs on 24.04 for as long as GitHub
+        # keeps that image; the floor stays tested on both systems.
+        exclude:
+          - python-version: "3.9"
+            os: ubuntu-latest
+        include:
+          - python-version: "3.9"
+            os: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@v7
@@ -74,6 +84,14 @@ jobs:
         # stubs them, so the check stays cheap and keeps that laziness
         # honest.
         run: python modules/_verify_ocr_toolkit.py
+
+      - name: OCR & Accessibility Toolkit verification, with the PDF and Office libraries
+        # The same suite again, with what the accessibility half needs.
+        # The step above keeps the module's lazy imports honest and skips
+        # these tests, saying so; here they run.
+        run: |
+          python -m pip install --quiet pikepdf pymupdf python-docx python-pptx
+          python modules/_verify_ocr_toolkit.py
 
       - name: Served pages parse, and their element ids exist
         run: python modules/_verify_pages.py

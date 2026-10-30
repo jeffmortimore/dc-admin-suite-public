@@ -1880,6 +1880,141 @@ def check_browse_in_node(node_bin, served, group, problems):
 
 
 
+# ---------------------------------------------------------------------------
+# DC-PICK 1 (suite 1.0.5). A page that reopens with parents already checked
+# said only how many; an operator could not see which, nor clear them
+# without searching for each. Every page with a parent picker — found by
+# its markup, not by a list — carries the one block: the checked parents
+# by name, each with Remove, and Clear all. Agreement first; then each
+# page's OWN renderList() and updateCount() are run in node with the block,
+# because a block that agrees and is never called is the adjacent check.
+# ---------------------------------------------------------------------------
+PICK_JS_RE = re.compile(r"/\* DC-PICK (\d+):.*?/\* /DC-PICK \*/", re.S)
+PICK_HTML_RE = re.compile(r"<!-- DC-PICK (\d+):.*?<!-- /DC-PICK -->", re.S)
+PICK_CSS_RE = re.compile(r"/\* DC-PICK (\d+) styles \*/.*?/\* /DC-PICK styles \*/",
+                         re.S)
+PICKER_MARK = 'aria-label="Parent structures"'
+
+
+def pick_pages(served):
+    """The group: every served page with a parent-structure picker."""
+    return [(label, html) for label, html in served if PICKER_MARK in html]
+
+
+def check_pick_blocks(served, problems):
+    group = pick_pages(served)
+    if not group:
+        problems.append("DC-PICK: no page carries a parent picker, so "
+                        "nothing was checked")
+        return group
+    js, mk, css = {}, {}, {}
+    for label, html in group:
+        for store, rx, what in ((js, PICK_JS_RE, "DC-PICK script"),
+                                (mk, PICK_HTML_RE, "DC-PICK markup"),
+                                (css, PICK_CSS_RE, "DC-PICK styles")):
+            block = _one_block(label, html, rx, what, problems)
+            if block is not None:
+                store[label] = block
+                if "\\" in block:
+                    problems.append("{}: its {} contains a backslash"
+                                    .format(label, what))
+        if label in mk and 'id="selcount"' not in mk[label]:
+            problems.append("{}: its count line is not inside DC-PICK"
+                            .format(label))
+    for store, what in ((js, "DC-PICK script"), (mk, "DC-PICK markup"),
+                        (css, "DC-PICK styles")):
+        _agree(store, what, problems)
+    return group
+
+
+def _js_function(src, name):
+    """The text of `function name(){...}` in src, by brace matching."""
+    at = src.find("function {}(".format(name))
+    if at < 0:
+        return None
+    depth, i = 0, src.index("{", at)
+    for j in range(i, len(src)):
+        depth += {"{": 1, "}": -1}.get(src[j], 0)
+        if depth == 0:
+            return src[at:j + 1]
+    return None
+
+
+PICK_NODE = r"""
+function mk(tag,id){ return {tag:tag,id:id||'',children:[],hidden:false,disabled:false,
+  value:'',textContent:'',attrs:{},listeners:{},style:{},className:'',
+  set innerHTML(v){ this.children=[]; }, get innerHTML(){ return ''; },
+  append(...k){ this.children.push(...k); },
+  setAttribute(a,v){ this.attrs[a]=v; },
+  addEventListener(t,f){ this.listeners[t]=f; },
+  focus(){ FOCUS=this; },
+  querySelectorAll(t){ const o=[]; (function w(e){ e.children.forEach(c=>{ if(c.tag===t) o.push(c); w(c); }); })(this); return o; }}; }
+let FOCUS=null, SAVES=0;
+const els={};
+const document={getElementById(id){ return els[id]||(els[id]=mk('x',id)); },
+  createElement(t){ return mk(t); }};
+els.picked=mk('ul','picked'); els.pickclear=mk('button','pickclear');
+const filter=document.getElementById('filter'), list=document.getElementById('list'),
+      selcount=document.getElementById('selcount');
+function saveForm(){ SAVES+=1; }
+let nodes=[{ctx:'b',type:'ETD',level:2,desc:0},{ctx:'a',type:'ETD',level:2,desc:0},
+           {ctx:'c',type:'ETD',level:2,desc:0}];
+let checked=new Set(['c','a']);
+"""
+
+PICK_DRIVE = r"""
+const out=[];
+const names=()=>els.picked.children.map(li=>li.children[0].textContent).join(',');
+renderList();
+out.push('shown='+names()+' clear='+(els.pickclear.disabled?'off':'on')+' hidden='+els.picked.hidden+' count='+selcount.textContent);
+const rm=els.picked.querySelectorAll('button').find(b=>b.attrs['aria-label']==='Remove a');
+rm.listeners.click();
+out.push('removed='+names()+' left='+[...checked].join(',')+' focus='+(FOCUS&&FOCUS.attrs['aria-label']));
+const before=SAVES;
+els.pickclear.listeners.click();
+out.push('cleared='+checked.size+' hidden='+els.picked.hidden+' clear='+(els.pickclear.disabled?'off':'on')+' count='+selcount.textContent+' focus='+(FOCUS&&FOCUS.id)+' saved='+(SAVES>before));
+console.log(out.join(' | '));
+"""
+
+
+def check_pick_in_node(node_bin, group, problems):
+    """Behavioral: each page's own renderList() and updateCount() with its
+    DC-PICK script, against a stub page. Two parents restored are listed by
+    name; Remove takes one off and moves focus to the next; Clear all
+    empties the set, hides the list, disables itself, updates the count,
+    returns focus to the filter, and — where the page keeps its settings —
+    saves the emptied set."""
+    for label, html in group:
+        page_js = "\n".join(SCRIPT_RE.findall(html))
+        block = PICK_JS_RE.search(html)
+        fns = [_js_function(page_js, n) for n in ("renderList", "updateCount")]
+        if block is None or None in fns:
+            problems.append("{}: DC-PICK not driven — missing {}".format(
+                label, "the block" if block is None else "renderList/updateCount"))
+            continue
+        saves = "saveForm" in fns[1]
+        js = PICK_NODE + block.group(0) + "\n" + "\n".join(fns) + PICK_DRIVE
+        with tempfile.NamedTemporaryFile("w", suffix=".js", encoding="utf-8",
+                                         delete=False) as fh:
+            fh.write(js)
+            tmp = fh.name
+        try:
+            done = subprocess.run([node_bin, tmp], capture_output=True,
+                                  text=True, encoding="utf-8",
+                                  errors="replace", timeout=30)
+        finally:
+            Path(tmp).unlink()
+        want = ("shown=a,c clear=on hidden=false count=2 parent(s) checked. | "
+                "removed=c left=c focus=Remove c | "
+                "cleared=0 hidden=true clear=off count=0 parent(s) checked. "
+                "focus=filter saved={}".format("true" if saves else "false"))
+        if done.returncode != 0 or done.stdout.strip() != want:
+            problems.append("{}: DC-PICK behaved as {!r}, expected {!r}{}"
+                            .format(label, done.stdout.strip(), want,
+                                    " — " + _node_error(done)
+                                    if done.returncode else ""))
+
+
 def main():
     node_bin = shutil.which("node")
     if not node_bin:
@@ -1923,6 +2058,8 @@ def main():
         check_browse_driven(browsers, problems)
     check_browse_in_node(node_bin, served, browsers, problems)
     win_csharp = check_browse_windows_compile(browsers, problems)
+    pickers = check_pick_blocks(served, problems)
+    check_pick_in_node(node_bin, pickers, problems)
 
     print("Served pages — verification")
     print("  pages checked: {}".format(len(PAGE_SOURCES)))
@@ -1953,6 +2090,10 @@ def main():
         print("  its Browse button(s); the one DC-BROWSE block in each was")
         print("  driven with the dialog faked, on the server and in node.")
         print("  The Windows dialog's C#: {}.".format(win_csharp))
+        print("  {} page(s) with a parent picker carry the one DC-PICK"
+              .format(len(pickers)))
+        print("  block; each page's own list was driven in node: the")
+        print("  checked parents by name, Remove, and Clear all.")
         print("  {} module(s) with a log carry the one DC-LOG block; each was".format(len(group)))
         print("  driven: Copy log is the whole run, Clear is refused during")
         print("  a run and keeps what is loaded, and one start of many wins.")

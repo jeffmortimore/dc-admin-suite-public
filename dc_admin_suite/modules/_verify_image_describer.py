@@ -1513,12 +1513,176 @@ class ServedModelInTheRun(unittest.TestCase):
         self.assertEqual(M.run_served_note(rows, {"model": "m"}),
                          "No request was sent in this run.")
 
-    def test_the_served_model_is_the_last_column(self):
-        self.assertEqual(M.REPORT_HEADERS[-1], "Served Model")
-        self.assertEqual(OCR.REPORT_HEADERS[-1], "Served Model")
-        self.assertEqual(len(M.REPORT_WIDTHS), len(M.REPORT_HEADERS))
-        self.assertEqual(len(OCR.REPORT_WIDTHS), len(OCR.REPORT_HEADERS))
+    def test_the_served_model_is_appended_after_the_link_column(self):
+        """By name: 1.13.0 / 1.11.0 appended columns after it, so it is no
+        longer the last one in either report; the AI Gate column follows it
+        in both (the OCR toolkit appends Detector Findings after that)."""
+        for mod in (M, OCR):
+            self.assertGreater(mod.REPORT_HEADERS.index("Served Model"),
+                               mod.REPORT_LINK_COLS[0] - 1, mod.__name__)
+            served = mod.REPORT_HEADERS.index("Served Model")
+            self.assertIn("AI Gate", mod.REPORT_HEADERS[served + 1:],
+                          mod.__name__)
+            self.assertEqual(len(mod.REPORT_WIDTHS),
+                             len(mod.REPORT_HEADERS), mod.__name__)
 
+
+
+class AIGate(unittest.TestCase):
+    """The gate the OCR toolkit shares (its copy is held to this one there):
+    an image goes to the endpoint only when the downloader's report marks it
+    public, unless the run's override is on."""
+
+    HIDDEN = {"record": True, "visibility": "hidden", "access": "open"}
+
+    def _entry(self, tmp, meta=None):
+        img = os.path.join(tmp, "a.jpg")
+        Path(img).write_bytes(b"x")
+        return M._entry(img, "a.jpg", meta)
+
+    def test_a_hidden_image_is_skipped_without_a_request(self):
+        tmp = tempfile.mkdtemp()
+        calls = []
+        real = (M.urllib.request.urlopen, M.log)
+        M.urllib.request.urlopen = lambda *a, **k: calls.append(1)
+        M.log = lambda *a, **k: None
+        try:
+            cfg = {"dest": "beside", "skip": False, "have_pymupdf": False,
+                   "max_dim": 2000, "retries": 0, "max_tokens": 300}
+            row = M.process_one(self._entry(tmp, dict(self.HIDDEN)), 1, cfg,
+                                ep("gemini"), {"name": "P", "prompt": "p",
+                                               "max_alt_chars": 125})
+        finally:
+            M.urllib.request.urlopen, M.log = real
+            shutil.rmtree(tmp, ignore_errors=True)
+        self.assertEqual(calls, [])
+        self.assertEqual(row["status"], "Skipped (hidden — not sent)")
+        self.assertEqual(M._row_values(row)[M.REPORT_HEADERS.index(
+            "AI Gate")], "hidden — not sent")
+
+    def test_the_worker_says_how_many_were_held_back(self):
+        tmp = tempfile.mkdtemp()
+        written = {}
+        real = (M.write_report, M.log, M.urllib.request.urlopen)
+        M.write_report = (lambda path, rows, pairs, rgb:
+                          written.update(rows=rows, pairs=dict(pairs)))
+        M.log = lambda *a, **k: None
+        M.urllib.request.urlopen = lambda *a, **k: None
+        try:
+            cfg = {"entries": [self._entry(tmp, dict(self.HIDDEN))],
+                   "dest": "beside", "concurrency": 1, "delay": 0,
+                   "out_dir": tmp, "run_stamp": "t", "source": "test",
+                   "max_dim": 2000, "retries": 0, "max_tokens": 8000,
+                   "skip": False, "endpoint": "G", "profile": "P",
+                   "have_pymupdf": False}
+            M.describe_worker({"branding": {}}, cfg, ep("gemini"),
+                              {"name": "P", "prompt": "p",
+                               "max_alt_chars": 125})
+            with M.LOCK:
+                summary = M.STATE.get("summary", "")
+        finally:
+            M.write_report, M.log, M.urllib.request.urlopen = real
+            shutil.rmtree(tmp, ignore_errors=True)
+        self.assertEqual(written["pairs"]["Images the gate held back"], 1)
+        self.assertIn("public images only", written["pairs"]["AI gate"])
+        self.assertIn("1 not sent (hidden or restricted)", summary)
+        self.assertNotIn("skipped", summary)
+
+    def test_an_image_it_would_skip_anyway_is_not_held_back(self):
+        tmp = tempfile.mkdtemp()
+        calls, said = [], []
+        real = (M.urllib.request.urlopen, M.log)
+        M.urllib.request.urlopen = lambda *a, **k: calls.append(1)
+        M.log = lambda m, *a, **k: said.append(str(m))
+        try:
+            img = os.path.join(tmp, "a.jpg")
+            Path(img).write_bytes(b"x")
+            Path(M.sidecar_for(img)).write_text("done", encoding="utf-8")
+            cfg = {"dest": "beside", "skip": True, "have_pymupdf": False,
+                   "max_dim": 2000, "retries": 0, "max_tokens": 300}
+            row = M.process_one(M._entry(img, "a.jpg", dict(self.HIDDEN)),
+                                1, cfg, ep("gemini"),
+                                {"name": "P", "prompt": "p",
+                                 "max_alt_chars": 125})
+        finally:
+            M.urllib.request.urlopen, M.log = real
+            shutil.rmtree(tmp, ignore_errors=True)
+        self.assertEqual(calls, [])
+        self.assertEqual(row["status"], "Skipped (sidecar exists)")
+        self.assertEqual(row["gate"], "")
+        self.assertEqual(said, [])
+
+    def test_a_held_back_image_is_logged_once_plainly(self):
+        tmp = tempfile.mkdtemp()
+        said = []
+        real = (M.urllib.request.urlopen, M.log)
+        M.urllib.request.urlopen = lambda *a, **k: None
+        M.log = lambda m, *a, **k: said.append(str(m))
+        try:
+            cfg = {"dest": "beside", "skip": False, "have_pymupdf": False,
+                   "max_dim": 2000, "retries": 0, "max_tokens": 300}
+            M.process_one(self._entry(tmp, dict(self.HIDDEN)), 1, cfg,
+                          ep("gemini"), {"name": "P", "prompt": "p",
+                                         "max_alt_chars": 125})
+        finally:
+            M.urllib.request.urlopen, M.log = real
+            shutil.rmtree(tmp, ignore_errors=True)
+        self.assertEqual(said, ["    AI gate: hidden — not sent"])
+
+    def test_preview_refuses_an_image_the_gate_holds_back(self):
+        import threading
+        import urllib.request as ur
+        from http.server import ThreadingHTTPServer
+        tmp = tempfile.mkdtemp()
+        entry = self._entry(tmp, dict(self.HIDDEN))
+        target = ep("gemini", name="G")
+        calls = []
+        saved = (M.load_ai_config, M.urllib.request.urlopen, M.MODEL,
+                 M.load_profiles)
+        M.load_ai_config = lambda: {"endpoints": [target], "default": "G"}
+        M.load_profiles = lambda: {"profiles": [
+            {"name": "P", "prompt": "p", "max_alt_chars": 125,
+             "description": ""}], "default": "P"}
+        M.MODEL = [entry]
+        session = M.load_session(Path("/nonexistent/session.json"))
+        srv = ThreadingHTTPServer(("127.0.0.1", 0),
+                                  M.make_handler(session,
+                                                 M.build_page(session)))
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        opener = ur.build_opener(ur.ProxyHandler({}))
+        M.urllib.request.urlopen = lambda *a, **k: calls.append(1)
+        try:
+            body = {"paths": [entry["path"]], "dest": "beside",
+                    "out_dir": tmp, "endpoint": "G", "profile": "P",
+                    "max_tokens": "8000"}
+            req = ur.Request(
+                "http://127.0.0.1:{}/api/preview".format(port),
+                data=json.dumps(body).encode("utf-8"),
+                headers={"Content-Type": "application/json",
+                         "Host": "127.0.0.1:{}".format(port)},
+                method="POST")
+            try:
+                with opener.open(req, timeout=10) as resp:
+                    out = json.loads(resp.read().decode("utf-8"))
+            except ur.HTTPError as e:
+                out = json.loads(e.read().decode("utf-8"))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            (M.load_ai_config, M.urllib.request.urlopen, M.MODEL,
+             M.load_profiles) = saved
+            shutil.rmtree(tmp, ignore_errors=True)
+        self.assertEqual(calls, [])
+        self.assertIn("The AI gate holds a.jpg back (hidden — not sent)",
+                      out.get("error", ""))
+
+    def test_the_page_sends_and_keeps_the_override(self):
+        """SOURCE check, said so: the body is built in runBody()."""
+        page = M.build_page({"branding": {}}).decode("utf-8")
+        self.assertIn('id="aioverride"', page)
+        self.assertIn("ai_override:$('aioverride').checked", page)
+        self.assertIn("aioverride", M.FORM_FIELDS)
 
 class ServedModelInTheEndpointTests(unittest.TestCase):
     """The three Test buttons: the shell's Settings page and each AI
