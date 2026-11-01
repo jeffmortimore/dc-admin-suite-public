@@ -10,7 +10,7 @@ Ten modules ship in this release. Each is one Python file and runs on its
 own local port. The modules that work through many records write a
 filterable Excel (`.xlsx`) report of what they did.
 
-**Version 1.0.6** — see [release notes](dc_admin_suite/docs/RELEASE-NOTES.md).
+**Version 1.0.7** — see [release notes](dc_admin_suite/docs/RELEASE-NOTES.md).
 **Install:** see [the install guide](dc_admin_suite/docs/INSTALL.md).
 **License:** MIT. Copyright (c) 2026 Jeffrey Mortimore.
 
@@ -31,7 +31,7 @@ act on your site, so try them on a small selection first.
 | Batch Revise Manager | `dc_batch_revise.py` | 1.6.0 | yes | **changes it** | Generates, downloads and uploads batch revise spreadsheets for the selected structures. Upload submits each revised spreadsheet through the structure's own form. |
 | Batch File Downloader | `dc_file_downloader.py` | 1.40.0 | yes | read only | Downloads primary, native, supplemental, hidden and earlier-version files for the selected structures, with a report of every file and its access state. A stopped run records what it never reached and can be resumed from its own report. See "Downloading files" below. Used through one whole collection of about 3,400 records and 18,000 files, in watched sessions. |
 | OCR & Accessibility Toolkit | `dc_ocr_toolkit.py` | 1.13.0 | no | local files only | Evaluates PDFs, images, Word and PowerPoint files against automated WCAG 2.1 AA checks — a walk of each PDF's structure tree, and veraPDF (PDF/UA-1) where it is installed — adds OCR text layers, and reports what still needs a person. Only files the downloader marks public go to an AI endpoint unless you turn on the override. **Known limits:** the tags it adds to an untagged PDF are paragraphs and figures only, so headings, lists, tables and reading order need a person; Excel and LaTeX files are listed but not processed. |
-| Image Description Generator | `dc_image_describer.py` | 1.11.0 | no | local files only | Writes reviewable alt-text and transcription sidecar files for folders of scanned images, using a Gemini, OpenAI-compatible or Claude endpoint with your own API key. Every description is a draft for a person to review. Only images the downloader marks public are sent unless you turn on the override. |
+| Image Description Generator | `dc_image_describer.py` | 1.12.3 | no | local files only | Writes reviewable alt-text and transcription sidecar files for folders of scanned images, using a Gemini, OpenAI-compatible or Claude endpoint with your own API key. Every description is a draft for a person to review, and every sidecar opens with an accessibility notice. Given a content inventory, it links each image to its public record and checks the description against the record. Only images the downloader marks public are sent unless you turn on the override. |
 
 "Local files only" modules read and write files on your computer. The two
 AI-assisted modules send each image or page to the AI endpoint **you**

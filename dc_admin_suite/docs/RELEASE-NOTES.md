@@ -1,5 +1,76 @@
 # Release notes
 
+## 1.0.7 — 2026-11-01
+
+Text equivalents now say where their record is, and can be checked against
+it. Every sidecar the Image Description Generator writes opens with an
+**accessibility notice** and, when the image's record is known, its
+**Record URL**. Give the module a content inventory (a workbook with
+`publication` and `manuscript_id` columns) and each image is first
+described on its own, then checked against its record in a second request:
+the record may settle a doubt or supply a name, place or date the image is
+consistent with, and a **RECORD** section says what the record said. The
+transcription is never changed. Upgrading changes none of your settings.
+
+### What is in it
+
+| Module | Version |
+|---|---|
+| Structure URL Generator | 1.5.0 |
+| Hierarchy Mapping Tool | 1.5.0 |
+| Structure Regenerator | 1.6.0 |
+| Configuration Manager | 1.5.0 |
+| DOI & XML Generator | 1.10.0 |
+| Structure HTML Drafting Tool | 1.6.3 |
+| Batch Revise Manager | 1.6.0 |
+| Batch File Downloader | 1.40.0 |
+| OCR & Accessibility Toolkit | 1.13.0 |
+| Image Description Generator | 1.12.3 |
+| Shell (start page, settings, Main Menu) | 1.13.0 |
+
+### Image Description Generator
+
+- **A new sidecar header.** The banner reads `TEXT EQUIVALENT     **AI
+  GENERATED**`; `Source:` replaces `Source image:`; the `Status:` line is
+  gone (the banner says it). `Record URL:` follows the Article ID when the
+  image's record is known, and `Record check:` says when, by which
+  endpoint, and with what verdict a record was consulted.
+- **An ACCESSIBILITY NOTICE** comes before the alt text in every sidecar.
+  Its wording is your institution's, from `branding.ai_notice` in your
+  profile (see `profiles/README.md`), usually ending with whom to ask for
+  more; without one, a neutral notice is written.
+- **Record metadata workbook (optional)** and **Check against the record**
+  (images whose description lists a doubt, or every image that has a
+  record). Images are joined to records by context and article ID, never by
+  the number in a record's URL. Only descriptive fields are sent (title,
+  creators' names, dates, places, keywords, abstract, comments, and the
+  like), never e-mail addresses, file data or existing alt text.
+- **What the check may change is fixed in code:** the alt text, the
+  description and the Uncertain line; a Reading line only by removing
+  `[?]` marks. The transcription is kept from the first reading whatever
+  the reply says. A check that fails leaves the first reading's sidecar,
+  and the row says why. Each check is a second request.
+- **Two report columns**, Record URL (a link) and Record Check, and a
+  Record metadata line on the Summary. Where the first description listed a
+  doubt, the check reads settled, partly or no help; where it listed none,
+  agrees; either way, conflict when the record disagrees with the image.
+  Otherwise the column says why no check ran, that the image has no record,
+  or that the check failed.
+- **The record's wording stays in the RECORD section.** The check may take
+  names, places and dates from the record into the alt text and
+  description, never its title or other wording; a reply that quotes the
+  record there is reported on the row. A person the record credits is
+  named in that role ("Creator (record)"), not as the photographer.
+- **A place from the record goes in the description, not the alt text.**
+  The collection already gives that context, and the alt text has 125
+  characters to spend on the subject. A reply that adds a record's city,
+  cemetery, church or location to the alt text is reported on the row.
+- **A check cannot clear doubts the text still marks.** If the reply says
+  there is no doubt ("None", "None remaining") while the Reading it keeps
+  (or, with no Reading, the transcription) still marks text `[illegible]`
+  or `[?]`, the first reading's Uncertain line is kept, and the row says
+  so.
+
 ## 1.0.6 — 2026-10-30
 
 The OCR & Accessibility Toolkit's report now measures what it says. A

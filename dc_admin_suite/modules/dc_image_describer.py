@@ -60,14 +60,17 @@ three differences that matter:
 SIDECAR FORMAT (factory profile "Archival"):
 
     ================================================================================
-    TEXT EQUIVALENT
+    TEXT EQUIVALENT     **AI GENERATED**
     ================================================================================
-    Source image:  <filename>
+    Source:        <filename>
     Generated:     <timestamp> · DC Admin Suite · Image Description Generator 1.0
     Endpoint:      <name> (<kind>)
     Model:         <model>
     Profile:       <profile>
-    Status:        AI-GENERATED — REVIEW PRIOR TO USE
+    Context ID / Article ID / Record URL / Record check, when known
+
+    --- ACCESSIBILITY NOTICE ---------------------------------------------------
+    (the profile's branding.ai_notice, else a neutral notice)
 
     --- ALT TEXT ---------------------------------------------------------------
     (under 125 characters; this is the text that goes in an alt attribute)
@@ -75,6 +78,9 @@ SIDECAR FORMAT (factory profile "Archival"):
     --- DESCRIPTION ------------------------------------------------------------
     --- TRANSCRIPTION ----------------------------------------------------------
     --- NOTES ------------------------------------------------------------------
+    --- RECORD -----------------------------------------------------------------
+    (only after a record check: the record's fields, its Agreement, and
+     what the record was allowed to change)
     ================================================================================
 
 The module writes the header itself — the model is only ever asked for the
@@ -109,14 +115,16 @@ MANIFEST = {
     "id": "image-describer",
     "name": "Image Description Generator",
     "description": "Generate reviewable alt-text and transcription sidecar files for folders of scanned images, using a Gemini, OpenAI, or Claude endpoint.",
-    "version": "1.11.0",
+    "version": "1.12.3",
     "requires": ["openpyxl", "pymupdf"],
 }
 
 import argparse
 import base64
 import concurrent.futures
+import datetime
 import glob
+import html
 import importlib.util
 import json
 import os
@@ -195,6 +203,25 @@ LINE_WIDTH = 80
 # convention; the reference copy is in _template_module.py.
 FALLBACK_BRAND = {"primary": "#1F4E79", "accent": "#946B2D",
                   "neutral": "#9AA5AD"}
+
+# The ACCESSIBILITY NOTICE every sidecar carries, under its own rule, before
+# the alt text (1.12.0). An institution's own wording, which names it and
+# says whom to ask for more, lives in its profile (branding.ai_notice) and
+# never in this file; this neutral text is what an install whose profile
+# says nothing writes.
+NEUTRAL_AI_NOTICE = (
+    "This text equivalent was generated using artificial intelligence (AI) "
+    "to support digital accessibility. AI tools can produce errors in "
+    "transcription, visual description, and translation. End users should "
+    "verify the content of this text equivalent against the source before "
+    "relying upon it.")
+
+
+def ai_notice(session) -> str:
+    """The notice text: the profile's own wording, else the neutral one."""
+    brand = (session or {}).get("branding") or {}
+    text = " ".join(str(brand.get("ai_notice") or "").split())
+    return text or NEUTRAL_AI_NOTICE
 
 
 def load_session(path: Path) -> dict:
@@ -1637,7 +1664,11 @@ def scan_paths(text: str):
             continue
         path = os.path.expanduser(line)
         if os.path.isfile(path) and is_image(path):
-            entries.append(_entry(path, os.path.basename(path)))
+            # The same inference a folder scan makes (1.12.0): without it a
+            # pasted image had no context or article, so it could never be
+            # joined to its record.
+            entries.append(_entry(path, os.path.basename(path),
+                                  infer_meta(path, os.path.dirname(path))))
         else:
             bad.append(line)
         if len(entries) >= SCAN_MAX_FILES:
@@ -1802,13 +1833,37 @@ def build_body(sections: dict) -> str:
     return "\n".join(out).rstrip() + "\n"
 
 
+RECORD_LABEL_WIDTH = 22
+SIDECAR_BANNER = "TEXT EQUIVALENT     **AI GENERATED**"
+
+
+def record_section(record, check, has_reading) -> str:
+    """The RECORD block: the record's fields as the workbook gives them
+    (written here, never by the model), the reply's Agreement, and what
+    the record was allowed to change."""
+    def line(label, value):
+        lab = label + ":"
+        return lab + " " * max(1, RECORD_LABEL_WIDTH - len(lab)) + value
+    out = [rule_line("RECORD")]
+    out += [line(label, val) for label, val in record["fields"]]
+    out.append(line("Agreement", check.get("agreement") or
+                    "(the reply gave its verdict without a sentence)"))
+    out.append("The record is a second, independent reading by the "
+               "cataloguer. The transcription above is unchanged; the "
+               "{}alt text, description and Uncertain line use the record "
+               "only where it agrees with the image.".format(
+                   "Reading, " if has_reading else ""))
+    return "\n".join(out) + "\n"
+
+
 def build_sidecar(entry, sections, ep, profile_name, generated,
-                  served=None):
-    """Full sidecar text: provenance header + canonical section blocks."""
+                  served=None, record=None, check=None, notice=None):
+    """Full sidecar text: provenance header, the accessibility notice, the
+    canonical section blocks, and the RECORD block after a record check."""
     bar = "=" * LINE_WIDTH
     head = [
-        bar, "TEXT EQUIVALENT", bar,
-        "Source image:  {}".format(entry["name"]),
+        bar, SIDECAR_BANNER, bar,
+        "Source:        {}".format(entry["name"]),
         "Generated:     {} · DC Admin Suite · {} {}".format(
             generated, MANIFEST["name"], MANIFEST["version"]),
         "Endpoint:      {} ({})".format(ep.get("name", "?"),
@@ -1818,14 +1873,27 @@ def build_sidecar(entry, sections, ep, profile_name, generated,
         # what was asked for (see served_model).
         "Served by:     {}".format(served or "not named by the provider"),
         "Profile:       {}".format(profile_name),
-        "Status:        AI-GENERATED — REVIEW PRIOR TO USE",
     ]
     if entry.get("ctx"):
         head.append("Context ID:    {}".format(entry["ctx"]))
     if entry.get("article"):
         head.append("Article ID:    {}".format(entry["article"]))
-    head.append("")
-    return "\n".join(head) + build_body(sections) + bar + "\n"
+    if record and record.get("url"):
+        head.append("Record URL:    {}".format(record["url"]))
+    checked = bool(record and check and check.get("verdict"))
+    if checked:
+        head.append("Record check:  {} · record reconciliation by {} "
+                    "({})".format(check.get("date", ""),
+                                  check.get("by", ""), check["verdict"]))
+    text = "\n".join(head) + "\n\n"
+    text += rule_line("ACCESSIBILITY NOTICE") + "\n"
+    text += (" ".join(str(notice or "").split()) or NEUTRAL_AI_NOTICE) + "\n\n"
+    text += build_body(sections)
+    if checked:
+        has_reading = any(_READING_RE.match(ln) for ln in
+                          (sections.get("TRANSCRIPTION") or "").splitlines())
+        text += "\n" + record_section(record, check, has_reading)
+    return text + bar + "\n"
 
 
 _UNCERTAIN_RE = re.compile(r"^\s*Uncertain\s*:\s*(.*)$", re.I | re.M)
@@ -1881,6 +1949,455 @@ def analyze_reply(raw: str):
     elif not sections.get("ALT TEXT"):
         warnings.append("reply had no ALT TEXT section")
     return sections, warnings
+
+
+# ---------------------------------------------------------------------------
+# Record metadata (1.12.0). A workbook with one row per record (a DC content
+# inventory, or any sheet with the same column names) joins each image to
+# its public record by context and article ID: the two things an image's
+# file name already carries. A record's URL number is NOT its article ID,
+# so the join never guesses one from the other. Columns are found by name.
+#
+# Only the descriptive fields in RECORD_FIELDS ever reach an endpoint or a
+# sidecar. An inventory also carries submitters' and authors' e-mail
+# addresses, file data, and the record's existing alt text; none of those
+# is the model's business, and none is read.
+# ---------------------------------------------------------------------------
+RECORD_CTX_COLS = ("publication",)
+RECORD_ARTICLE_COLS = ("manuscript_id",)
+RECORD_URL_COLS = ("front_end_url", "calc_url")
+RECORD_FIELDS = (   # (column, label in the request and the RECORD section)
+    ("title", "Record title"),
+    # "(record)": a creator is whom the record credits, not necessarily
+    # whoever took the photograph (1.12.1).
+    ("_creators", "Creator (record)"),
+    # Publication date means what each collection made it mean: the date a
+    # photograph was taken in one, the date its record was posted in
+    # another. The label says which field it is and claims no more.
+    ("publication_date", "Publication date (record)"),
+    ("date_range", "Date range (record)"),
+    ("approximate_creation_date", "Approximate date"),
+    ("creation_date_approximate", "Approximate date"),
+    ("birth_date_on_headstone", "Birth date (record)"),
+    ("death_date_on_headstone", "Death date (record)"),
+    ("cemetery_name", "Cemetery"),
+    ("church_name", "Church"),
+    ("mortuary", "Mortuary"),
+    ("funeral_home", "Funeral home"),
+    ("location", "Location"),
+    ("city", "City"),
+    ("keywords", "Keywords"),
+    ("subject_area", "Subject area"),
+    ("subject_heading", "Subject heading"),
+    ("abstract", "Abstract"),
+    ("text_description", "Description (record)"),
+    ("comments", "Comments"),
+    ("note", "Note"),
+    ("identifier", "Identifier"),
+)
+_TAG_RE = re.compile(r"<[^>]+>")
+_URL_OK_RE = re.compile(r"^https?://\S+$", re.I)
+
+
+def record_value(v) -> str:
+    """One cell as plain text: a date as a date, a whole float as an
+    integer, markup removed, whitespace collapsed."""
+    if v is None:
+        return ""
+    if isinstance(v, datetime.datetime):
+        if (v.hour, v.minute, v.second) == (0, 0, 0):
+            return v.date().isoformat()
+        return v.isoformat(sep=" ")
+    if isinstance(v, datetime.date):
+        return v.isoformat()
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return " ".join(html.unescape(_TAG_RE.sub(" ", str(v))).split())
+
+
+def record_creators(rec) -> str:
+    """Creators' names only, from the authors cell (JSON), else from the
+    numbered name columns. E-mail and institution are never read."""
+    names = []
+    try:
+        people = json.loads(rec.get("authors") or "[]")
+    except (TypeError, ValueError):
+        people = []
+    for p in people if isinstance(people, list) else []:
+        if not isinstance(p, dict):
+            continue
+        corp = record_value(p.get("CORPORATE_AUTHOR"))
+        if corp:
+            names.append(corp)
+            continue
+        name = " ".join(x for x in (record_value(p.get(k)) for k in
+                                    ("FNAME", "MNAME", "LNAME")) if x)
+        suffix = record_value(p.get("SUFFIX"))
+        if name:
+            names.append(name + (", " + suffix if suffix else ""))
+    if not names:
+        for n in range(1, 10):
+            name = " ".join(x for x in (
+                record_value(rec.get("author{}_{}".format(n, k)))
+                for k in ("fname", "mname", "lname")) if x)
+            if name:
+                names.append(name)
+    return "; ".join(names)
+
+
+def load_record_workbook(path):
+    """({(context, article): record}, duplicate rows skipped) from the first
+    sheet. A record is {"url", "fields": [(label, value)], "state"}.
+    Raises ValueError with a user-facing message."""
+    from openpyxl import load_workbook
+    try:
+        wb = load_workbook(path, read_only=True, data_only=True)
+    except Exception as e:
+        raise ValueError("The record metadata workbook could not be read "
+                         "({}: {}).".format(e.__class__.__name__, e))
+    try:
+        rows = wb.worksheets[0].iter_rows(values_only=True)
+        cols = [str(h).strip().lower() if h is not None else ""
+                for h in (next(rows, None) or ())]
+
+        def find(names):
+            for n in names:
+                if n in cols:
+                    return cols.index(n)
+            return None
+        ci, ai, ui = (find(RECORD_CTX_COLS), find(RECORD_ARTICLE_COLS),
+                      find(RECORD_URL_COLS))
+        if ci is None or ai is None:
+            raise ValueError(
+                "The record metadata workbook's first sheet needs a column "
+                "naming each record's context ({}) and one with its article "
+                "ID ({}); it has {}.".format(
+                    " or ".join(RECORD_CTX_COLS),
+                    " or ".join(RECORD_ARTICLE_COLS),
+                    "neither" if ci is None and ai is None else
+                    "only one of them"))
+        records, dupes = {}, 0
+        for raw in rows:
+            raw = tuple(raw or ())
+            rec = {cols[i]: raw[i] for i in range(min(len(cols), len(raw)))
+                   if cols[i]}
+            ctx = record_value(rec.get(cols[ci]))
+            art = record_value(rec.get(cols[ai]))
+            if not ctx or not art:
+                continue
+            if (ctx, art) in records:
+                dupes += 1
+                continue
+            fields, seen = [], set()
+            for col, label in RECORD_FIELDS:
+                val = (record_creators(rec) if col == "_creators"
+                       else record_value(rec.get(col)))
+                if val and label not in seen:
+                    fields.append((label, val))
+                    seen.add(label)
+            url = record_value(rec.get(cols[ui])) if ui is not None else ""
+            records[(ctx, art)] = {
+                "url": url if _URL_OK_RE.match(url) else "",
+                "fields": fields,
+                "state": record_value(rec.get("state"))}
+        if not records:
+            raise ValueError("The record metadata workbook has no row with "
+                             "both a context and an article ID.")
+        return records, dupes
+    finally:
+        wb.close()
+
+
+_RECORD_CACHE = {}
+_RECORD_CACHE_LOCK = threading.Lock()
+
+
+def record_lookup(path):
+    """load_record_workbook(), kept while the file is unchanged, so a
+    Preview followed by a Start reads a large inventory once."""
+    st = os.stat(path)
+    key = (os.path.abspath(path), st.st_mtime, st.st_size)
+    with _RECORD_CACHE_LOCK:
+        hit = _RECORD_CACHE.get(key)
+    if hit is None:
+        hit = load_record_workbook(path)
+        with _RECORD_CACHE_LOCK:
+            _RECORD_CACHE.clear()
+            _RECORD_CACHE[key] = hit
+    return hit
+
+
+def record_for(entry, records):
+    """The image's record, or None."""
+    if not records:
+        return None
+    return records.get((str(entry.get("ctx") or ""),
+                        str(entry.get("article") or "")))
+
+
+# The second pass. The image is first described on its own, so the record
+# is a second, independent reading rather than a hint the model starts
+# from; then the same image, the first answer and the record go out
+# together. What may change is fixed here in code, not left to the reply:
+# the transcription is the first reading's whatever the reply says, and a
+# revised Reading line may only drop [?] marks.
+RECORD_CHECK_MODES = ("doubts", "all")
+RECORD_VERDICTS = ("settled", "partly", "no help", "agrees", "conflict")
+_VERDICT_RE = re.compile(r"^\s*Verdict\s*:\s*(.*?)\s*$", re.I | re.M)
+RECORD_CHECK_PROMPT = """\
+Role: You are an archivist checking a draft text equivalent of the attached \
+image against the repository's catalog record for the same item.
+
+The draft below was written from the image alone. The record was written by \
+a cataloguer and is a second, independent source: it can be wrong, and it \
+can even describe a different image.
+
+Reply with ONLY the sections below, in this order, each introduced by its \
+rule line exactly as shown. Do not add any preamble, commentary, or closing \
+remark.
+
+--- ALT TEXT ---
+The draft's alt text, revised only where the record settles something the \
+draft left uncertain, or supplies a name or date that nothing in the image \
+contradicts. Do not add a place from the record (a city, cemetery, church, \
+street or region) to the alt text; the collection already gives that \
+context, and a place from the record belongs in the description. Keep the \
+draft's form, and keep it UNDER __ALTMAX__ CHARACTERS IN TOTAL.
+
+--- DESCRIPTION ---
+The draft's description, revised the same way, except that a place from the \
+record may be added here. Where you use a name, place or date that comes \
+only from the record, say so (for example "identified in the record as \
+...").
+
+--- READING ---
+Only if the draft's transcription ends with a line beginning "Reading:": \
+that line, with a [?] removed only where the record settles that reading \
+and the image is consistent with it, and nothing else changed. Otherwise \
+omit this section, rule line included.
+
+--- NOTES ---
+The draft's notes, unchanged except for the Uncertain line. Remove a doubt \
+from it only when the record settles that doubt and the image is consistent \
+with the record's reading, and say which part of the record settled it. \
+Keep every doubt the record does not settle.
+
+--- AGREEMENT ---
+A first line "Verdict: " followed by exactly one of: settled, partly, \
+no help, agrees, conflict.
+Then one to three sentences: what the record confirms, what it adds, and \
+where it disagrees with the image.
+When the draft's Uncertain line listed a doubt: settled means every doubt \
+it listed is resolved; partly, some are resolved, not all; no help, the \
+record resolves none of them. When the draft listed no doubt: agrees, the \
+record is consistent with the image (it may add names, places or dates). \
+In either case: conflict, the record disagrees with something the image \
+shows.
+
+Rules - these outrank completeness:
+- The transcription is not yours to change; it is kept exactly as the draft \
+has it. Never alter what the image shows to fit the record.
+- Where the record and the image disagree, the image wins: keep the draft's \
+reading, give the verdict conflict, and say what differs.
+- Write a name, place or date from the record exactly as the record gives \
+it, and only where nothing in the image contradicts it.
+- Do not take the record's terms for anyone's race, ethnicity, religion or \
+social class into your own words; the record is quoted as written elsewhere \
+in the text equivalent.
+- Name a person from the record only in the role the record gives them. A \
+creator is whom the record credits, not necessarily whoever took the \
+photograph.
+- In the ALT TEXT and DESCRIPTION, take only names, places and dates from \
+the record. Do not quote or repeat the record's title or other wording \
+there; the record is quoted as written in its own section. Text that is \
+in the image itself may be quoted as the draft quotes it.
+- Use only the image and the record, not what you may know about the people \
+or places from elsewhere."""
+_READING_RE = re.compile(r"^\s*Reading\s*:", re.I)
+
+
+def record_block(record) -> str:
+    """The record as the request shows it: label: value lines."""
+    lines = (["Record URL: {}".format(record["url"])]
+             if record.get("url") else [])
+    lines += ["{}: {}".format(label, val) for label, val in record["fields"]]
+    return "\n".join(lines)
+
+
+def _without_marks(text) -> str:
+    return " ".join((text or "").replace("[?]", "").split())
+
+
+_QUOTED_RE = re.compile(r'["\u201c]([^"\u201d]{8,})["\u201d]')
+
+
+def _plain(text) -> str:
+    return " ".join(re.sub(r"[^0-9a-z]+", " ", (text or "").lower()).split())
+
+
+def quoted_record_wording(sections, record) -> list:
+    """Quoted passages in the alt text and description that come from the
+    record and are not in the transcription: the record's wording repeated
+    where only names, places and dates may be taken (1.12.1). Reported on
+    the row, never rewritten."""
+    if not record:
+        return []
+    shown = _plain(sections.get("TRANSCRIPTION"))
+    values = [_plain(v) for _label, v in record.get("fields", [])]
+    found = []
+    for name in ("ALT TEXT", "DESCRIPTION"):
+        for m in _QUOTED_RE.finditer(sections.get(name) or ""):
+            q = _plain(m.group(1))
+            if (q and q not in shown and any(q in v for v in values)
+                    and q not in found):
+                found.append(q)
+    return found
+
+
+# The record's place fields (1.12.2): a place belongs in the description,
+# not the alt text, whose characters the collection's own context saves.
+RECORD_PLACE_LABELS = ("Location", "City", "Cemetery", "Church")
+
+
+def record_place_in_alt(first, merged, record) -> list:
+    """Parts of the record's place fields that the reply added to the alt
+    text: in the revised alt text, not in the draft's alt text and not in
+    the transcription. Reported on the row, never rewritten."""
+    if not record:
+        return []
+    before = _plain(first.get("ALT TEXT"))
+    after = _plain(merged.get("ALT TEXT"))
+    shown = _plain(merged.get("TRANSCRIPTION"))
+    found = []
+    for label, value in record.get("fields", []):
+        if label not in RECORD_PLACE_LABELS:
+            continue
+        for part in (_plain(p) for p in str(value).split(",")):
+            if (len(part) >= 4 and part in after and part not in before
+                    and part not in shown and part not in found):
+                found.append(part)
+    return found
+
+
+_MARKS = ("[illegible]", "[?]")
+_NO_DOUBT_RE = re.compile(r"^none\b", re.I)
+
+
+def claims_no_doubt(sections) -> bool:
+    """True when the Uncertain line begins with "None" — "None.", and also
+    "None remaining. The record settles …", which uncertain_state() counts
+    as a listed doubt because it is not the bare word."""
+    m = _UNCERTAIN_RE.search(sections.get("NOTES") or "")
+    return bool(m and _NO_DOUBT_RE.match(uncertain_said(m.group(1))))
+
+
+def keep_marked_doubts(first, merged):
+    """(merged, note). A reply may not say there is no doubt while the
+    Reading it keeps (or, with no Reading, the transcription) still marks
+    text [illegible] or [?] (1.12.3):
+    the first reading's Uncertain line is kept instead, and the row says
+    so. When the first reading itself claimed no doubt, nothing can be
+    restored, and the row still says so."""
+    # The Reading is where a settled doubt is resolved: the zone lines keep
+    # their marks as cut while the Reading drops them, so the Reading is
+    # what is judged when there is one, and the whole transcription only
+    # when there is not.
+    lines = (merged.get("TRANSCRIPTION") or "").splitlines()
+    readings = [ln for ln in lines if _READING_RE.match(ln)]
+    shown = readings[-1] if readings else "\n".join(lines)
+    if not any(m in shown for m in _MARKS) or not claims_no_doubt(merged):
+        return merged, ""
+    old = _UNCERTAIN_RE.search(first.get("NOTES") or "")
+    if not old or claims_no_doubt(first):
+        return merged, ("the Uncertain line says there is no doubt, but "
+                        "the transcription still marks text")
+    out = dict(merged)
+    notes_text = merged.get("NOTES") or ""
+    m = _UNCERTAIN_RE.search(notes_text)
+    out["NOTES"] = notes_text[:m.start()] + old.group(0).strip() + \
+        notes_text[m.end():]
+    return out, ("the record check said there was no doubt while the "
+                 "transcription still marks text; the first Uncertain line "
+                 "was kept")
+
+
+def merge_record_reply(first, raw, record=None):
+    """(sections, verdict, agreement, notes) from a record-check reply.
+    `first` is the draft's sections. Raises FileError when the reply is
+    unusable. notes are things the module refused to take from the reply,
+    or reports about it.
+
+    The verdict is fixed to the draft (1.12.1): where the draft listed no
+    doubt, only agrees or conflict can be true, and where it listed one,
+    agrees cannot be — two models read the same four words two ways."""
+    got = parse_sections(raw)
+    agreement = got.pop("AGREEMENT", "")
+    m = _VERDICT_RE.search(agreement or "")
+    verdict = " ".join((m.group(1) if m else "").replace("_", " ")
+                       .strip().rstrip(".").lower().split())
+    if verdict not in RECORD_VERDICTS:
+        raise FileError("record check reply gave no verdict")
+    doubts = uncertain_state(first) == "listed"
+    if not doubts and verdict in ("settled", "partly", "no help"):
+        verdict = "agrees"
+    elif doubts and verdict == "agrees":
+        verdict = "no help"
+    if not (got.get("ALT TEXT") or "").strip():
+        raise FileError("record check reply had no ALT TEXT section")
+    said = " ".join(_VERDICT_RE.sub("", agreement).split())
+    merged, notes = dict(first), []
+    for name in ("ALT TEXT", "DESCRIPTION", "NOTES"):
+        body = (got.get(name) or "").strip()
+        if body:
+            merged[name] = body
+    reading = " ".join((got.get("READING") or "").split())
+    lines = (first.get("TRANSCRIPTION") or "").splitlines()
+    at = [i for i, ln in enumerate(lines) if _READING_RE.match(ln)]
+    if reading and at:
+        if not _READING_RE.match(reading):
+            reading = "Reading: " + reading
+        old = lines[at[-1]]
+        if _without_marks(reading) == _without_marks(old):
+            lines[at[-1]] = reading
+            merged["TRANSCRIPTION"] = "\n".join(lines)
+        else:
+            notes.append("record check changed the Reading beyond its "
+                         "[?] marks; the first Reading was kept")
+    if any(k not in ("ALT TEXT", "DESCRIPTION", "NOTES", "READING")
+           for k in got):
+        notes.append("record check reply's other sections were ignored")
+    merged, marked = keep_marked_doubts(first, merged)
+    if marked:
+        notes.append(marked)
+    quoted = quoted_record_wording(merged, record)
+    if quoted:
+        notes.append("the alt text or description quotes the record's "
+                     "wording ({})".format(len(quoted)))
+    places = record_place_in_alt(first, merged, record)
+    if places:
+        notes.append("the alt text adds a place from the record "
+                     "({})".format(", ".join(places)))
+    return merged, verdict, said, notes
+
+
+def check_against_record(ep, first, record, data, mime, max_alt,
+                         max_retries, sleep_fn, log_fn, timeout,
+                         max_tokens):
+    """One record-check request. Returns (sections, verdict, agreement,
+    notes, usage, retries); a FileError or AIError carries .usage."""
+    prompt = (RECORD_CHECK_PROMPT.replace("__ALTMAX__", str(max_alt))
+              + "\n\n[DRAFT]\n" + build_body(first).rstrip()
+              + "\n\n[RECORD]\n" + record_block(record) + "\n")
+    raw, usage, retries = ai_generate_with_retry(
+        ep, prompt, data, mime, max_retries, sleep_fn, log_fn,
+        timeout=timeout, max_tokens=max_tokens)
+    try:
+        merged, verdict, said, notes = merge_record_reply(first, raw,
+                                                          record)
+    except FileError as e:
+        e.usage, e.retries = usage, retries
+        raise
+    return merged, verdict, said, notes, usage, retries
 
 
 def _atomic_write(path, text):
@@ -1966,10 +2483,10 @@ REPORT_HEADERS = ["Order", "Image File", "Folder", "Context ID",
                   "Retries", "Time", "Admin Record URL",
                   "In Tok", "Out Tok", "Think Tok", "Cached Tok",
                   "Transcription Chars", "Flags", "Served Model",
-                  "AI Gate"]
+                  "AI Gate", "Record URL", "Record Check"]
 REPORT_WIDTHS = [8, 44, 28, 26, 10, 36, 13, 11, 70, 11, 14, 34, 60, 44,
-                 30, 9, 9, 60, 10, 10, 11, 12, 20, 30, 26, 28]
-REPORT_LINK_COLS = (18,)
+                 30, 9, 9, 60, 10, 10, 11, 12, 20, 30, 26, 28, 60, 30]
+REPORT_LINK_COLS = (18, 27)
 
 # Under-transcription is judged against the run's OWN median, not a fixed
 # character count: a folder of blank endpapers is uniformly short and must
@@ -2244,6 +2761,7 @@ def outcome_tone(problems, succeeded=None):
 FORM_FIELDS = ("srcfolder", "srcrun", "srcpaths", "srcdir", "rptdir", "recursive",
     "pathbox", "profile", "endpoint", "dbeside", "dfolder", "skip", "outdir",
     "delay", "retries", "maxdim", "conc", "maxtok", "aioverride",
+    "recbook", "reccheck",
 )
 # The page's other controls, which are NOT kept, and why: the queue filter, the log copy box, and the profile dialog, which saves itself.
 # Every control on the page is in one list or the other (_verify_pages.py).
@@ -2519,9 +3037,12 @@ def _hms(seconds: float) -> str:
 # what Preview shows is exactly what a run would write.
 # ---------------------------------------------------------------------------
 def describe_one(entry, ep, profile, max_dim, max_retries, have_pymupdf,
-                 sleep_fn, log_fn, timeout=AI_TIMEOUT, max_tokens=None):
+                 sleep_fn, log_fn, timeout=AI_TIMEOUT, max_tokens=None,
+                 records=None, record_check="doubts", notice=None):
     """Returns (sidecar_text, sections, warnings, retries, prep_note,
-    usage)."""
+    usage, check). `check` says what the record pass did for this image:
+    {"url", "status", "verdict", "agreement", "by", "date"}; its status
+    is "" when the run had no record workbook."""
     data, mime, note = prepare_image(entry["path"], max_dim, have_pymupdf)
     if note:
         log_fn("    {}".format(note))
@@ -2530,10 +3051,47 @@ def describe_one(entry, ep, profile, max_dim, max_retries, have_pymupdf,
         ep, profile["prompt"], data, mime, max_retries, sleep_fn, log_fn,
         timeout=timeout, max_tokens=ceiling)
     sections, warnings = analyze_reply(raw)
+    record = record_for(entry, records)
+    check = {"url": (record or {}).get("url", ""), "status": "",
+             "verdict": "", "agreement": "", "by": ep.get("name", "?"),
+             "date": time.strftime("%Y-%m-%d")}
+    if records and record is None:
+        check["status"] = "no record"
+    elif record is not None:
+        if not record["fields"]:
+            check["status"] = "not run (the record has no descriptive fields)"
+        elif not sections.get("ALT TEXT"):
+            check["status"] = "not run (the first reply had no alt text)"
+        elif (record_check != "all"
+              and uncertain_state(sections) != "listed"):
+            check["status"] = "not run (no doubts listed)"
+        else:
+            log_fn("    Checking against the record…")
+            try:
+                (merged, verdict, said, notes, more,
+                 more_retries) = check_against_record(
+                    ep, sections, record, data, mime,
+                    profile.get("max_alt_chars", 125), max_retries,
+                    sleep_fn, log_fn, timeout, ceiling)
+            except (FileError, AIError) as e:
+                # A failed check never costs the first reading: its sidecar
+                # is written as if no record had been asked about.
+                usage = sum_usage(usage, getattr(e, "usage", None))
+                retries += getattr(e, "retries", 0) or 0
+                warnings.append("record check failed: {}".format(e))
+                check["status"] = "failed: {}".format(e)
+            else:
+                sections = merged
+                usage = sum_usage(usage, more)
+                retries += more_retries
+                warnings.extend(notes)
+                check.update(status=verdict, verdict=verdict,
+                             agreement=said)
     text = build_sidecar(entry, sections, ep, profile["name"],
                          time.strftime("%Y-%m-%d %H:%M"),
-                         served=usage.get("model"))
-    return text, sections, warnings, retries, note, usage
+                         served=usage.get("model"), record=record,
+                         check=check, notice=notice)
+    return text, sections, warnings, retries, note, usage, check
 
 
 def _sidecar_dest(entry, cfg):
@@ -2563,7 +3121,10 @@ def process_one(entry, idx, cfg, ep, profile):
            "in_tok": 0, "out_tok": 0, "think_tok": 0, "cache_tok": 0,
            "tchars": 0,
            "uncertain_state": "absent", "has_notes": False, "flags": "",
-           "served": "", "gate": ""}
+           "served": "", "gate": "",
+           "record_url": (record_for(entry, cfg.get("records"))
+                          or {}).get("url", ""),
+           "record_check": ""}
     dest = _sidecar_dest(entry, cfg)
     try:
         if entry["sidecar"] and cfg["dest"] == "beside" and cfg["skip"]:
@@ -2581,10 +3142,16 @@ def process_one(entry, idx, cfg, ep, profile):
             log("    AI gate: {}".format(row["gate"]))
             row["status"] = "Skipped ({})".format(row["gate"])
             return _finish_row(row, t_file)
-        text, sections, warnings, retries, _note, usage = describe_one(
+        (text, sections, warnings, retries, _note, usage,
+         check) = describe_one(
             entry, ep, profile, cfg["max_dim"], cfg["retries"],
             cfg["have_pymupdf"], sleep_interruptible, log,
-            max_tokens=cfg.get("max_tokens"))
+            max_tokens=cfg.get("max_tokens"),
+            records=cfg.get("records"),
+            record_check=cfg.get("record_check", "doubts"),
+            notice=cfg.get("notice"))
+        row["record_url"] = check["url"]
+        row["record_check"] = check["status"]
         _atomic_write(dest, text)
         alt = extract_alt(sections)
         row["alt"] = alt
@@ -2667,7 +3234,8 @@ def _row_values(row):
             row["in_tok"] or "", row["out_tok"] or "",
             row["think_tok"] or "", row["cache_tok"] or "",
             row["tchars"] or "", row["flags"], row.get("served") or "",
-            row.get("gate") or ""]
+            row.get("gate") or "", row.get("record_url") or "",
+            row.get("record_check") or ""]
 
 
 # ---------------------------------------------------------------------------
@@ -2747,6 +3315,28 @@ def run_pool(entries, cfg, ep, profile, rows, total, t0):
 
 
 
+def record_summary(cfg, rows) -> str:
+    """The Summary's Record metadata line."""
+    if not cfg.get("records"):
+        return "No record workbook — every image was described from the image alone."
+    got = [r for r in rows if r.get("record_url") or (
+        r.get("record_check") and r["record_check"] != "no record")]
+    counts = {}
+    for r in rows:
+        key = str(r.get("record_check") or "")
+        key = key.split(":")[0].split("(")[0].strip()
+        if key and key != "no record":
+            counts[key] = counts.get(key, 0) + 1
+    mode = ("every image with a record" if cfg.get("record_check") == "all"
+            else "images whose description listed a doubt")
+    return ("{} — {:,} records; {} of {} images in the run matched a record; "
+            "checked {}{}".format(
+                cfg.get("record_book", ""), len(cfg["records"]), len(got),
+                len(rows), mode,
+                "; " + ", ".join("{} {}".format(v, k) for k, v in
+                                 sorted(counts.items())) if counts else ""))
+
+
 def describe_worker(session, cfg, ep, profile):
     header_rgb = _primary_rgb(session)
     rows = []
@@ -2804,6 +3394,7 @@ def describe_worker(session, cfg, ep, profile):
             ("Images the gate held back", sum(
                 1 for r in rows
                 if str(r.get("gate", "")).endswith("not sent"))),
+            ("Record metadata", record_summary(cfg, rows)),
             ("Images in run", "{} of {} queued{}".format(
                 len(rows), total, " — " + note if note else "")),
             ("Alt text over the limit", over),
@@ -3340,7 +3931,7 @@ def request_allowed(handler) -> bool:
 # Returns (error_message_or_"", cfg_or_None, endpoint_or_None,
 #          profile_or_None).
 # ---------------------------------------------------------------------------
-def validate_start(req, model, tools, ai_cfg, profile_cfg):
+def validate_start(req, model, tools, ai_cfg, profile_cfg, session=None):
     if model is None:
         return "Scan a folder to queue images first.", None, None, None
     try:
@@ -3408,6 +3999,23 @@ def validate_start(req, model, tools, ai_cfg, profile_cfg):
     if not tools.get("openpyxl"):
         return ("openpyxl is missing — the run report cannot be written. "
                 "See section 5 for the install command.", None, None, None)
+    # 1.12.0: the record workbook and how it is used, checked here so Start
+    # and Preview refuse the same things (contract 11).
+    book = os.path.expanduser(str(req.get("record_book") or "").strip())
+    mode = str(req.get("record_check") or "doubts").strip()
+    if mode not in RECORD_CHECK_MODES:
+        return "Bad request.", None, None, None
+    cfg["record_book"], cfg["record_check"] = book, mode
+    cfg["records"], cfg["record_dupes"] = None, 0
+    if book:
+        if not book.lower().endswith(".xlsx") or not os.path.isfile(book):
+            return ("Record metadata workbook: there is no .xlsx file at "
+                    "{}.".format(book), None, None, None)
+        try:
+            cfg["records"], cfg["record_dupes"] = record_lookup(book)
+        except (OSError, ValueError) as e:
+            return str(e), None, None, None
+    cfg["notice"] = ai_notice(session)
     cfg["have_pymupdf"] = bool(tools.get("pymupdf"))
     if not cfg["have_pymupdf"]:
         bad = [e["name"] for e in entries if needs_conversion(e["path"])]
@@ -3650,6 +4258,28 @@ PAGE = r"""<!DOCTYPE html>
    and travel with the suite. A prompt must ask for an
    <code>--- ALT TEXT ---</code> section; everything else is yours to change.</p>
  </div>
+ <div class="row">
+  <div>
+   <label for="recbook" id="recbooklabel">Record metadata workbook (optional)</label>
+   <span class="browse-row"><input type="text" id="recbook" data-path="file" value="" autocomplete="off" spellcheck="false" aria-describedby="recbookhint"><button type="button" class="small secondary" data-browse="file" data-for="recbook" data-title="Record metadata workbook (optional)" aria-label="Browse for Record metadata workbook (optional)" hidden>Browse…</button></span><span class="browse-msg" id="recbook-browsemsg" role="status" aria-live="polite"></span>
+  </div>
+  <div>
+   <label for="reccheck">Check against the record</label>
+   <select id="reccheck" aria-describedby="recbookhint">
+    <option value="doubts" selected>Images whose description lists a doubt</option>
+    <option value="all">Every image that has a record</option>
+   </select>
+  </div>
+ </div>
+ <p class="hint" id="recbookhint">A content inventory (an .xlsx with
+  <code>publication</code> and <code>manuscript_id</code> columns) joins each
+  image to its public record by context and article ID. Each sidecar then
+  carries the Record URL. The image is described on its own first; a second
+  request then sends the same image, that description and the record's
+  descriptive fields (never e-mail addresses or file data). The second reply
+  may settle a doubt or add a name, place or date the image is consistent
+  with; the transcription is never changed, and a RECORD section says what
+  the record said. Every image checked costs two requests.</p>
 </fieldset>
 
 <fieldset><legend>3 · AI endpoint</legend>
@@ -4610,6 +5240,8 @@ function runBody(){
   concurrency:parseInt($('conc').value||'1',10),
   max_tokens:$('maxtok').value.trim(),
   ai_override:$('aioverride').checked,
+  record_book:$('recbook').value.trim(),
+  record_check:$('reccheck').value,
   endpoint:$('endpoint').value,profile:$('profile').value};
 }
 $('go').addEventListener('click',async()=>{
@@ -4869,7 +5501,8 @@ def make_handler(session: dict, page: bytes):
                 model = MODEL
                 tools = dict(STATE["tools"]) or tool_status()
             msg, cfg, ep, profile = validate_start(
-                req, model, tools, load_ai_config(), load_profiles())
+                req, model, tools, load_ai_config(), load_profiles(),
+                session=session)
             if msg:
                 return self._json({"error": msg}, 400)
             entry = cfg["entries"][0]
@@ -4885,11 +5518,14 @@ def make_handler(session: dict, page: bytes):
                                                   ep["model"]))
             try:
                 (text, _sections, warnings, retries, _note,
-                 usage) = describe_one(
+                 usage, _check) = describe_one(
                     entry, ep, profile, cfg["max_dim"], cfg["retries"],
                     cfg["have_pymupdf"], sleep_interruptible, log,
                     timeout=PREVIEW_TIMEOUT,
-                    max_tokens=cfg.get("max_tokens"))
+                    max_tokens=cfg.get("max_tokens"),
+                    records=cfg.get("records"),
+                    record_check=cfg.get("record_check", "doubts"),
+                    notice=cfg.get("notice"))
             except (FileError, AIError) as e:
                 log("Preview failed: {}".format(e))
                 return self._json({"error": str(e)}, 400)
@@ -4998,7 +5634,8 @@ def make_handler(session: dict, page: bytes):
                     model = MODEL
                     tools = dict(STATE["tools"]) or tool_status()
                 msg, cfg, ep, profile = validate_start(
-                    req, model, tools, load_ai_config(), load_profiles())
+                    req, model, tools, load_ai_config(), load_profiles(),
+                    session=session)
                 if msg:
                     return self._json({"error": msg}, 400)
                 with LOCK:

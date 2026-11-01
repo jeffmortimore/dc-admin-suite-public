@@ -32,6 +32,14 @@ Changing a profile does not touch an existing `config/settings.json`: saved
 settings win over defaults, which is what keeps an upgrade from disturbing a
 working install.
 
+## `branding.ai_notice`
+
+The ACCESSIBILITY NOTICE the Image Description Generator writes at the top
+of every text equivalent, in your institution's words; usually it ends by
+saying whom to ask for more description. Leave it out and a neutral notice
+is written. Like `download_statement`, it names you, so it lives here and
+nowhere in the code.
+
 ## `identity_markers`
 
 A profile may list the names and house conventions that identify its

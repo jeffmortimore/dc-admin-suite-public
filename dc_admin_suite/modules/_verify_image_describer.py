@@ -1753,6 +1753,677 @@ class ServedModelInTheEndpointTests(unittest.TestCase):
         self.assertIn('(r.note ? " · " + esc(r.note) : "")', ui)
 
 
+# ---------------------------------------------------------------------------
+# 1.12.0: the sidecar header, the accessibility notice, record metadata and
+# the record check. Fixtures name no real collection, person or institution.
+# ---------------------------------------------------------------------------
+from unittest import mock   # noqa: E402
+
+REC_EP = {"name": "Example Endpoint", "kind": "anthropic",
+          "model": "example-model-1"}
+REC_RECORD = {"url": "https://repository.example.edu/sample-gallery/94",
+              "fields": [("Record title", "Ada Example"),
+                         ("Birth date (record)", "July 15, 1950"),
+                         ("Death date (record)", "June 16, 1994")],
+              "state": "published"}
+REC_NOTICE = "Example notice for this install. Ask the example desk."
+REC_EXPECTED = """\
+================================================================================
+TEXT EQUIVALENT     **AI GENERATED**
+================================================================================
+Source:        sample-gallery_1008_native_public_current_X.jpeg
+Generated:     2026-10-17 14:52 · DC Admin Suite · {name} {version}
+Endpoint:      Example Endpoint (anthropic)
+Model:         example-model-1
+Served by:     example-model-1
+Profile:       Example profile
+Context ID:    sample-gallery
+Article ID:    1008
+Record URL:    https://repository.example.edu/sample-gallery/94
+Record check:  2026-10-26 · record reconciliation by Example Endpoint (settled)
+
+--- ACCESSIBILITY NOTICE -------------------------------------------------------
+Example notice for this install. Ask the example desk.
+
+--- ALT TEXT -------------------------------------------------------------------
+Headstone for Ada Example.
+
+--- TRANSCRIPTION --------------------------------------------------------------
+[Headstone face]
+ADA EXAMPLE[?]
+Reading: Ada Example.
+
+--- NOTES ----------------------------------------------------------------------
+Object type: headstone
+Uncertain: None remaining.
+
+--- RECORD ---------------------------------------------------------------------
+Record title:         Ada Example
+Birth date (record):  July 15, 1950
+Death date (record):  June 16, 1994
+Agreement:            The record agrees.
+The record is a second, independent reading by the cataloguer. The transcription above is unchanged; the Reading, alt text, description and Uncertain line use the record only where it agrees with the image.
+================================================================================
+"""
+
+
+class SidecarFormat112(unittest.TestCase):
+    def entry(self):
+        return {"name": "sample-gallery_1008_native_public_current_X.jpeg",
+                "ctx": "sample-gallery", "article": "1008"}
+
+    def sections(self):
+        return {"ALT TEXT": "Headstone for Ada Example.",
+                "TRANSCRIPTION": "[Headstone face]\nADA EXAMPLE[?]\n"
+                                 "Reading: Ada Example.",
+                "NOTES": "Object type: headstone\nUncertain: None remaining."}
+
+    def test_whole_sidecar_line_for_line(self):
+        text = M.build_sidecar(
+            self.entry(), self.sections(), REC_EP, "Example profile",
+            "2026-10-17 14:52", served="example-model-1", record=REC_RECORD,
+            check={"verdict": "settled", "agreement": "The record agrees.",
+                   "by": "Example Endpoint", "date": "2026-10-26"},
+            notice=REC_NOTICE)
+        want = REC_EXPECTED.format(name=M.MANIFEST["name"],
+                                   version=M.MANIFEST["version"])
+        self.assertEqual(text.splitlines(), want.splitlines())
+
+    def test_no_status_line_and_old_labels_gone(self):
+        text = M.build_sidecar(self.entry(), self.sections(), REC_EP, "P",
+                               "2026-01-01 00:00")
+        self.assertNotIn("Status:", text)
+        self.assertNotIn("Source image:", text)
+        self.assertIn("\nSource:        ", text)
+
+    def test_unchecked_record_gets_url_but_no_record_section(self):
+        text = M.build_sidecar(self.entry(), self.sections(), REC_EP, "P",
+                               "2026-01-01 00:00", record=REC_RECORD,
+                               check={"status": "not run (no doubts listed)",
+                                      "verdict": ""})
+        self.assertIn("Record URL:    https://repository.example.edu/", text)
+        self.assertNotIn("Record check:", text)
+        self.assertNotIn("--- RECORD ---", text)
+
+    def test_notice_falls_back_to_neutral(self):
+        self.assertEqual(M.ai_notice({}), M.NEUTRAL_AI_NOTICE)
+        self.assertEqual(M.ai_notice({"branding": {"ai_notice": "  "}}),
+                         M.NEUTRAL_AI_NOTICE)
+        self.assertEqual(M.ai_notice({"branding": {"ai_notice": "Ours.\n"}}),
+                         "Ours.")
+        text = M.build_sidecar(self.entry(), self.sections(), REC_EP, "P",
+                               "2026-01-01 00:00", notice=None)
+        lines = text.splitlines()
+        at = lines.index(M.rule_line("ACCESSIBILITY NOTICE"))
+        self.assertEqual(lines[at + 1], M.NEUTRAL_AI_NOTICE)
+        self.assertLess(at, lines.index(M.rule_line("ALT TEXT")))
+
+    def test_neutral_notice_names_no_one(self):
+        self.assertNotIn("@", M.NEUTRAL_AI_NOTICE)
+        self.assertNotIn("Librar", M.NEUTRAL_AI_NOTICE)
+
+
+def _workbook(path, header, rows):
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.append(header)
+    for r in rows:
+        ws.append(r)
+    wb.save(path)
+
+
+REC_HEADER = ["manuscript_id", "publication", "front_end_url", "title",
+              "submitted_by", "authors", "author1_fname", "author1_lname",
+              "author1_email", "abstract", "publication_date", "alt_text",
+              "native_filename", "keywords"]
+
+
+def _rec_row(article, ctx="sample-gallery", url=None):
+    import datetime as _dt
+    return [article, ctx,
+            url or "https://repository.example.edu/{}/{}".format(ctx, 7),
+            "Planting <b>peas</b> &amp; beans", "submitter@example.edu",
+            json.dumps([{"FNAME": "Pat", "MNAME": "Q.", "LNAME": "Example",
+                         "EMAIL": "pat@example.edu", "SUFFIX": "Jr."},
+                        {"CORPORATE_AUTHOR": "Example Class",
+                         "IS_CORPORATE_AUTHOR": 1}]),
+            "Pat", "Example", "pat@example.edu", "<p>An abstract.</p>",
+            _dt.datetime(1933, 4, 12), "Existing alt text", "f.gif",
+            "Book 1, Page 2"]
+
+
+class RecordWorkbook112(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="dcid-rec-")
+        self.path = os.path.join(self.tmp, "inv.xlsx")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_join_key_fields_and_what_is_never_read(self):
+        _workbook(self.path, REC_HEADER,
+                  [_rec_row(1046), _rec_row(1046), _rec_row(1047, url="x")])
+        recs, dupes = M.load_record_workbook(self.path)
+        self.assertEqual(dupes, 1)
+        rec = recs[("sample-gallery", "1046")]
+        self.assertEqual(rec["url"],
+                         "https://repository.example.edu/sample-gallery/7")
+        self.assertEqual(recs[("sample-gallery", "1047")]["url"], "")
+        got = dict(rec["fields"])
+        self.assertEqual(got["Record title"], "Planting peas & beans")
+        self.assertEqual(got["Creator (record)"],
+                         "Pat Q. Example, Jr.; Example Class")
+        self.assertEqual(got["Abstract"], "An abstract.")
+        self.assertEqual(got["Publication date (record)"], "1933-04-12")
+        self.assertEqual(got["Keywords"], "Book 1, Page 2")
+        flat = json.dumps(rec)
+        for never in ("@", "Existing alt text", "f.gif"):
+            self.assertNotIn(never, flat)
+
+    def test_missing_join_columns_refused_by_name(self):
+        _workbook(self.path, ["title", "front_end_url"], [["t", "u"]])
+        with self.assertRaises(ValueError) as cm:
+            M.load_record_workbook(self.path)
+        self.assertIn("manuscript_id", str(cm.exception))
+        self.assertIn("publication", str(cm.exception))
+
+    def test_unreadable_and_empty_workbooks_say_so(self):
+        bad = os.path.join(self.tmp, "bad.xlsx")
+        with open(bad, "w") as f:
+            f.write("not a workbook")
+        with self.assertRaises(ValueError):
+            M.load_record_workbook(bad)
+        _workbook(self.path, REC_HEADER, [])
+        with self.assertRaises(ValueError) as cm:
+            M.load_record_workbook(self.path)
+        self.assertIn("no row", str(cm.exception))
+
+
+class RecordReplyMerge112(unittest.TestCase):
+    FIRST = {"ALT TEXT": "Headstone for Ada Exampl[?].",
+             "DESCRIPTION": "A stone.",
+             "TRANSCRIPTION": "[Face]\nADA EXAMPL[?]\nReading: Ada Exampl[?].",
+             "NOTES": "Object type: headstone\nUncertain: last letter"}
+
+    def reply(self, reading="Reading: Ada Exampl.", verdict="settled",
+              extra=""):
+        return ("--- ALT TEXT ---\nHeadstone for Ada Example.\n"
+                "--- DESCRIPTION ---\nA stone, identified in the record.\n"
+                + ("--- READING ---\n" + reading + "\n" if reading else "")
+                + extra +
+                "--- NOTES ---\nObject type: headstone\nUncertain: None.\n"
+                "--- AGREEMENT ---\nVerdict: " + verdict +
+                "\nThe record settles the last letter.\n")
+
+    def test_transcription_is_the_first_readings_whatever_the_reply(self):
+        merged, verdict, said, notes = M.merge_record_reply(
+            self.FIRST, self.reply(
+                extra="--- TRANSCRIPTION ---\nADA EXAMPLE\n"))
+        self.assertTrue(merged["TRANSCRIPTION"].startswith(
+            "[Face]\nADA EXAMPL[?]\n"))
+        self.assertEqual(verdict, "settled")
+        self.assertEqual(said, "The record settles the last letter.")
+        self.assertEqual(merged["ALT TEXT"], "Headstone for Ada Example.")
+        self.assertTrue(any("ignored" in n for n in notes))
+        # And with no READING section, so nothing else rebuilds the text.
+        merged, _v, _s, _n = M.merge_record_reply(
+            self.FIRST, self.reply(
+                reading=None, extra="--- TRANSCRIPTION ---\nADA EXAMPLE\n"))
+        self.assertEqual(merged["TRANSCRIPTION"],
+                         self.FIRST["TRANSCRIPTION"])
+
+    def test_reading_may_only_lose_marks(self):
+        merged, _v, _s, notes = M.merge_record_reply(self.FIRST, self.reply())
+        self.assertTrue(merged["TRANSCRIPTION"].endswith(
+            "Reading: Ada Exampl."))
+        self.assertEqual(notes, [])
+        merged, _v, _s, notes = M.merge_record_reply(
+            self.FIRST, self.reply(reading="Reading: Ada Example."))
+        self.assertTrue(merged["TRANSCRIPTION"].endswith(
+            "Reading: Ada Exampl[?]."))
+        self.assertTrue(any("Reading" in n for n in notes))
+
+    def test_verdicts(self):
+        _m, v, _s, _n = M.merge_record_reply(self.FIRST,
+                                             self.reply(verdict="No_help."))
+        self.assertEqual(v, "no help")
+        # 1.12.1: the verdict is fixed to whether the draft listed a doubt.
+        _m, v, _s, _n = M.merge_record_reply(self.FIRST,
+                                             self.reply(verdict="agrees"))
+        self.assertEqual(v, "no help")
+        clean = dict(self.FIRST, NOTES="Object type: headstone\n"
+                                       "Uncertain: None.")
+        for said, want in (("settled", "agrees"), ("partly", "agrees"),
+                           ("no help", "agrees"), ("agrees", "agrees"),
+                           ("conflict", "conflict")):
+            _m, v, _s, _n = M.merge_record_reply(clean,
+                                                 self.reply(verdict=said))
+            self.assertEqual(v, want, said)
+        for bad in ("maybe", ""):
+            with self.assertRaises(M.FileError):
+                M.merge_record_reply(self.FIRST, self.reply(verdict=bad))
+        with self.assertRaises(M.FileError):
+            M.merge_record_reply(self.FIRST, "--- AGREEMENT ---\n"
+                                             "Verdict: settled\n")
+
+
+class RecordRules1121(unittest.TestCase):
+    """1.12.1, from the first live test: a creator promoted to
+    photographer, and record titles quoted in the description."""
+    REC = {"url": "", "fields": [
+        ("Record title", "Example House, Example Road"),
+        ("Creator (record)", "Pat Example")], "state": ""}
+
+    def test_the_prompt_carries_both_rules(self):
+        p = M.RECORD_CHECK_PROMPT
+        self.assertIn("only in the role the record gives them", p)
+        self.assertIn("Do not quote or repeat the record's title", p)
+        self.assertIn("agrees", p)
+
+    def test_quoting_the_record_is_reported(self):
+        sec = {"ALT TEXT": "A house.",
+               "DESCRIPTION": 'Identified in the record as "Example House, '
+                              'Example Road".'}
+        self.assertEqual(M.quoted_record_wording(sec, self.REC),
+                         ["example house example road"])
+
+    def test_quoting_the_image_is_not(self):
+        sec = {"ALT TEXT": 'A house, captioned "Example House, Example '
+                           'Road".',
+               "TRANSCRIPTION": "[Caption below photograph]\n"
+                                "Example House - Example Road"}
+        self.assertEqual(M.quoted_record_wording(sec, self.REC), [])
+        self.assertEqual(M.quoted_record_wording(
+            {"DESCRIPTION": '"a phrase of our own"'}, self.REC), [])
+        self.assertEqual(M.quoted_record_wording(sec, None), [])
+
+    def test_the_merge_reports_it(self):
+        first = {"ALT TEXT": "A house.", "NOTES": "Uncertain: None."}
+        raw = ('--- ALT TEXT ---\nA house.\n--- DESCRIPTION ---\nThe '
+               'record calls it "Example House, Example Road".\n'
+               '--- AGREEMENT ---\nVerdict: agrees\nIt agrees.\n')
+        _m, v, _s, notes = M.merge_record_reply(first, raw, self.REC)
+        self.assertEqual(v, "agrees")
+        self.assertTrue(any("quotes the record" in n for n in notes))
+
+
+class RecordPlaces1122(unittest.TestCase):
+    """1.12.2: a check against known answers found the record's place
+    added to most alt texts, where the collection already gives it."""
+    REC = {"url": "", "fields": [
+        ("Record title", "Ada Example"),
+        ("Cemetery", "Example Chapel Cemetery"),
+        ("Location", "Sampletown, Georgia")], "state": ""}
+
+    def test_the_prompt_keeps_places_out_of_the_alt_text(self):
+        p = M.RECORD_CHECK_PROMPT
+        self.assertIn("Do not add a place from the record", p)
+        self.assertNotIn("supplies a name, place or date", p)
+
+    def test_a_place_added_to_the_alt_text_is_reported(self):
+        first = {"ALT TEXT": "Headstone for Ada Example."}
+        merged = {"ALT TEXT": "Headstone for Ada Example, Sampletown, "
+                              "Georgia."}
+        self.assertEqual(M.record_place_in_alt(first, merged, self.REC),
+                         ["sampletown", "georgia"])
+
+    def test_a_place_already_there_or_on_the_stone_is_not(self):
+        rec = self.REC
+        same = {"ALT TEXT": "Headstone for Ada Example, Sampletown."}
+        self.assertEqual(M.record_place_in_alt(same, dict(same), rec), [])
+        cut = {"ALT TEXT": "Marker from Example Chapel Cemetery.",
+               "TRANSCRIPTION": "[Face]\nEXAMPLE CHAPEL CEMETERY"}
+        self.assertEqual(M.record_place_in_alt({"ALT TEXT": "Marker."},
+                                               cut, rec), [])
+        self.assertEqual(M.record_place_in_alt({}, same, None), [])
+        desc = {"ALT TEXT": "Headstone.", "DESCRIPTION": "In Sampletown."}
+        self.assertEqual(M.record_place_in_alt({"ALT TEXT": "Headstone."},
+                                               desc, rec), [])
+
+    def test_a_name_or_date_from_the_record_is_not_a_place(self):
+        rec = {"url": "", "fields": [
+            ("Record title", "Ada Example"),
+            ("Death date (record)", "June 16, 1994"),
+            ("Location", "Sampletown, Georgia")], "state": ""}
+        first = {"ALT TEXT": "Headstone for Ada Exampl[?]."}
+        merged = {"ALT TEXT": "Headstone for Ada Example, died June 16, "
+                              "1994."}
+        self.assertEqual(M.record_place_in_alt(first, merged, rec), [])
+
+    def test_the_merge_reports_it(self):
+        first = {"ALT TEXT": "Headstone for Ada Example.",
+                 "NOTES": "Uncertain: None."}
+        raw = ("--- ALT TEXT ---\nHeadstone for Ada Example, Sampletown, "
+               "Georgia.\n--- AGREEMENT ---\nVerdict: agrees\nIt agrees.\n")
+        _m, _v, _s, notes = M.merge_record_reply(first, raw, self.REC)
+        self.assertTrue(any("adds a place from the record" in n
+                            for n in notes))
+
+
+class MarkedDoubts1123(unittest.TestCase):
+    """1.12.3: a reply said "None remaining" while the transcription it
+    kept still marked text hidden and a digit unsure."""
+    FIRST = {"ALT TEXT": "Headstone for Ada.",
+             "TRANSCRIPTION": "[Face]\n[illegible]EY\nADA 193[?]\n"
+                              "Reading: [illegible]ey. Ada 193[?].",
+             "NOTES": "Object type: headstone\nUncertain: text hidden by "
+                      "flowers; last digit of the year"}
+
+    def reply(self, unc, reading=None):
+        return ("--- ALT TEXT ---\nHeadstone for Ada Example.\n"
+                + ("--- READING ---\n" + reading + "\n" if reading else "")
+                + "--- NOTES ---\nObject type: headstone\nUncertain: "
+                + unc + "\n--- AGREEMENT ---\nVerdict: partly\nSome.\n")
+
+    def test_none_remaining_counts_as_a_claim_of_no_doubt(self):
+        for unc in ("None.", "None remaining. The record settles it.",
+                    "none"):
+            self.assertTrue(M.claims_no_doubt({"NOTES": "Uncertain: " + unc}),
+                            unc)
+        self.assertFalse(M.claims_no_doubt(
+            {"NOTES": "Uncertain: Nonetheless the year is worn"}))
+        self.assertFalse(M.claims_no_doubt({"NOTES": "Object type: x"}))
+
+    def test_the_first_uncertain_line_is_kept_while_text_is_marked(self):
+        merged, _v, _s, notes = M.merge_record_reply(
+            self.FIRST, self.reply("None remaining. The record settles it."))
+        self.assertIn("Uncertain: text hidden by flowers; last digit of the "
+                      "year", merged["NOTES"])
+        self.assertNotIn("None remaining", merged["NOTES"])
+        self.assertIn("Object type: headstone", merged["NOTES"])
+        self.assertTrue(any("first Uncertain line was kept" in n
+                            for n in notes))
+
+    def test_a_mark_settled_in_the_reading_is_not_a_remaining_doubt(self):
+        # The adopted sidecar format: the zone line keeps its [?] as cut,
+        # the Reading drops it once the record settles it, and the
+        # Uncertain line says none remain.
+        first = {"ALT TEXT": "Headstone for Ada Exampl[?].",
+                 "TRANSCRIPTION": "[Face]\nADA EXAMPL[?]\n"
+                                  "Reading: Ada Exampl[?].",
+                 "NOTES": "Object type: headstone\nUncertain: last letter"}
+        merged, _v, _s, notes = M.merge_record_reply(
+            first, self.reply("None remaining. The record settles it.",
+                              reading="Reading: Ada Exampl."))
+        self.assertIn("Uncertain: None remaining.", merged["NOTES"])
+        self.assertTrue(merged["TRANSCRIPTION"].startswith(
+            "[Face]\nADA EXAMPL[?]"))
+        self.assertFalse(any("Uncertain" in n for n in notes))
+
+    def test_a_clean_transcription_keeps_the_replys_line(self):
+        first = dict(self.FIRST, TRANSCRIPTION="[Face]\nADA 1935\n"
+                                               "Reading: Ada 1935.")
+        merged, _v, _s, notes = M.merge_record_reply(
+            first, self.reply("None remaining."))
+        self.assertIn("Uncertain: None remaining.", merged["NOTES"])
+        self.assertFalse(any("Uncertain" in n for n in notes))
+
+    def test_a_reply_that_keeps_a_doubt_is_left_alone(self):
+        merged, _v, _s, notes = M.merge_record_reply(
+            self.FIRST, self.reply("text hidden by flowers"))
+        self.assertIn("Uncertain: text hidden by flowers", merged["NOTES"])
+        self.assertFalse(any("Uncertain" in n for n in notes))
+
+    def test_nothing_to_restore_is_still_reported(self):
+        first = dict(self.FIRST, NOTES="Object type: headstone\n"
+                                       "Uncertain: None.")
+        merged, _v, _s, notes = M.merge_record_reply(first,
+                                                     self.reply("None."))
+        self.assertTrue(any("still marks text" in n for n in notes))
+
+    def test_the_guard_runs_in_describe_one(self):
+        first = ("--- ALT TEXT ---\nHeadstone for Ada.\n--- TRANSCRIPTION "
+                 "---\n[Face]\nADA 193[?]\n--- NOTES ---\nObject type: "
+                 "headstone\nUncertain: last digit of the year\n")
+        calls = []
+
+        def fake(ep, prompt, data, mime, *a, **k):
+            calls.append(prompt)
+            u = {"in": 1, "out": 1, "think": 0, "cache_read": 0}
+            return (first if len(calls) == 1 else
+                    self.reply("None remaining.")), u, 0
+        rec = {("g", "1"): {"url": "", "fields": [("Record title", "Ada")],
+                            "state": ""}}
+        with mock.patch.object(M, "prepare_image",
+                               lambda *a: (b"x", "image/jpeg", "")), \
+                mock.patch.object(M, "ai_generate_with_retry", fake):
+            (_t, sec, warnings, _r, _n, _u, _c) = M.describe_one(
+                {"path": "/x/g_article_1.jpg", "name": "g_article_1.jpg",
+                 "ctx": "g", "article": "1"}, REC_EP,
+                {"name": "P", "prompt": "D", "max_alt_chars": 125}, 2000, 0,
+                False, lambda s: None, lambda m: None, records=rec,
+                record_check="all", notice="N.")
+        self.assertIn("Uncertain: last digit of the year", sec["NOTES"])
+        self.assertTrue(any("first Uncertain line was kept" in w
+                            for w in warnings))
+
+
+class RecordCheckInDescribeOne112(unittest.TestCase):
+    """describe_one() is what a run AND Preview call, so the record pass is
+    driven here, with the image preparation and the endpoint faked."""
+    PROFILE = {"name": "Example", "prompt": "Describe.", "max_alt_chars": 125}
+    ENTRY = {"path": "/nowhere/sample-gallery_article_1046.jpg",
+             "name": "sample-gallery_article_1046.jpg",
+             "ctx": "sample-gallery", "article": "1046"}
+    RECORDS = {("sample-gallery", "1046"): {
+        "url": "https://repository.example.edu/sample-gallery/7",
+        "fields": [("Record title", "Planting peas"),
+                   ("Creator", "Pat Example")], "state": "published"}}
+
+    def run_one(self, first_uncertain="None.", mode="doubts", records=None,
+                fail_second=False, check_reply=None):
+        prompts = []
+
+        def fake(ep, prompt, data, mime, *a, **k):
+            prompts.append(prompt)
+            u = {"in": 10, "out": 5, "think": 0, "cache_read": 0,
+                 "model": "example-model-1"}
+            if len(prompts) == 1:
+                return ("--- ALT TEXT ---\nTwo people plant a field.\n"
+                        "--- NOTES ---\nObject type: photograph\n"
+                        "Uncertain: " + first_uncertain + "\n"), u, 0
+            if fail_second:
+                e = M.AIError("HTTP 500 from the endpoint")
+                e.usage = u
+                raise e
+            return (check_reply or
+                    "--- ALT TEXT ---\nPat Example plants peas.\n"
+                    "--- NOTES ---\nObject type: photograph\n"
+                    "Uncertain: None.\n--- AGREEMENT ---\nVerdict: partly\n"
+                    "Names from the record.\n"), u, 0
+        with mock.patch.object(M, "prepare_image",
+                               lambda *a: (b"img", "image/jpeg", "")), \
+                mock.patch.object(M, "ai_generate_with_retry", fake):
+            out = M.describe_one(
+                self.ENTRY, REC_EP, self.PROFILE, 2000, 0, False,
+                lambda s: None, lambda m: None,
+                records=self.RECORDS if records is None else records,
+                record_check=mode, notice="N.")
+        return out, prompts
+
+    def test_doubts_mode_skips_a_clean_first_reading(self):
+        (text, _s, _w, _r, _n, usage, check), prompts = self.run_one()
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(check["status"], "not run (no doubts listed)")
+        self.assertIn("Record URL:    https://repository.example.edu/", text)
+        self.assertNotIn("--- RECORD ---", text)
+
+    def test_doubts_mode_checks_a_listed_doubt(self):
+        (text, sec, _w, _r, _n, usage, check), prompts = self.run_one(
+            first_uncertain="second word of the caption")
+        self.assertEqual(len(prompts), 2)
+        self.assertEqual(check["status"], "partly")
+        self.assertIn("(partly)", text)
+        self.assertIn("Record title:         Planting peas", text)
+        self.assertEqual(sec["ALT TEXT"], "Pat Example plants peas.")
+        self.assertEqual(usage["in"], 20)
+        self.assertIn("[RECORD]\nRecord URL: https://repository.example.edu/",
+                      prompts[1])
+        self.assertIn("Two people plant a field.", prompts[1])
+        self.assertIn("UNDER 125 CHARACTERS", prompts[1])
+
+    def test_all_mode_checks_every_image_with_a_record(self):
+        (_t, _s, _w, _r, _n, _u, check), prompts = self.run_one(mode="all")
+        self.assertEqual(len(prompts), 2)
+        # The first reading listed no doubt, so "partly" cannot be true
+        # of it: 1.12.1 records the reply's verdict as agrees.
+        self.assertEqual(check["verdict"], "agrees")
+
+    def test_a_quoted_record_title_is_reported_on_the_row(self):
+        reply = ("--- ALT TEXT ---\nTwo people plant a field.\n"
+                 "--- DESCRIPTION ---\nThe record calls it \"Planting "
+                 "peas\".\n--- AGREEMENT ---\nVerdict: agrees\nIt agrees.\n")
+        (_t, _s, warnings, _r, _n, _u, check), _p = self.run_one(
+            mode="all", check_reply=reply)
+        self.assertEqual(check["verdict"], "agrees")
+        self.assertTrue(any("quotes the record" in w for w in warnings))
+
+    def test_no_record_and_no_workbook(self):
+        (text, _s, _w, _r, _n, _u, check), prompts = self.run_one(
+            mode="all", records={("other", "1"): self.RECORDS[
+                ("sample-gallery", "1046")]})
+        self.assertEqual((len(prompts), check["status"]), (1, "no record"))
+        self.assertNotIn("Record URL:", text)
+        (text, _s, _w, _r, _n, _u, check), prompts = self.run_one(
+            mode="all", records={})
+        self.assertEqual((len(prompts), check["status"]), (1, ""))
+
+    def test_a_failed_check_keeps_the_first_reading(self):
+        (text, sec, warnings, _r, _n, usage, check), prompts = self.run_one(
+            mode="all", fail_second=True)
+        self.assertEqual(len(prompts), 2)
+        self.assertTrue(check["status"].startswith("failed:"))
+        self.assertEqual(sec["ALT TEXT"], "Two people plant a field.")
+        self.assertNotIn("--- RECORD ---", text)
+        self.assertIn("Record URL:", text)
+        self.assertTrue(any("record check failed" in w for w in warnings))
+        self.assertEqual(usage["in"], 20)    # the failed request was billed
+        (_t, sec, warnings, _r, _n, _u, check), _p = self.run_one(
+            mode="all", check_reply="no sections at all")
+        self.assertTrue(check["status"].startswith("failed:"))
+        self.assertEqual(sec["ALT TEXT"], "Two people plant a field.")
+
+
+class RecordWiring112(unittest.TestCase):
+    """Count the group: every describe_one() call and every validate_start()
+    call in the module, found by ast, passes what 1.12.0 added."""
+    def calls(self, name):
+        import ast
+        tree = ast.parse(Path(M.__file__).read_text(encoding="utf-8"))
+        return [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Name) and n.func.id == name]
+
+    def test_every_describe_one_call_passes_the_record_settings(self):
+        found = self.calls("describe_one")
+        self.assertGreaterEqual(len(found), 2)    # the run and Preview
+        for c in found:
+            self.assertEqual({k.arg for k in c.keywords} &
+                             {"records", "record_check", "notice"},
+                             {"records", "record_check", "notice"},
+                             "line {}".format(c.lineno))
+
+    def test_every_validate_start_call_passes_the_session(self):
+        found = self.calls("validate_start")
+        self.assertGreaterEqual(len(found), 2)    # Start and Preview
+        for c in found:
+            self.assertIn("session", {k.arg for k in c.keywords},
+                          "line {}".format(c.lineno))
+
+    def test_report_columns_appended_and_linked(self):
+        self.assertEqual(M.REPORT_HEADERS[-2:], ["Record URL",
+                                                 "Record Check"])
+        self.assertIn(M.REPORT_HEADERS.index("Record URL") + 1,
+                      M.REPORT_LINK_COLS)
+        self.assertEqual(M.REPORT_HEADERS[17], "Admin Record URL")
+
+    def test_a_failed_row_still_names_its_record(self):
+        cfg = {"dest": "folder", "out_dir": tempfile.mkdtemp(),
+               "run_stamp": "x", "skip": False, "max_dim": 2000,
+               "retries": 0, "have_pymupdf": False,
+               "records": RecordCheckInDescribeOne112.RECORDS,
+               "record_check": "all", "notice": "N."}
+        entry = dict(RecordCheckInDescribeOne112.ENTRY, rel="a.jpg", size=0,
+                     sidecar=False, record=False, reported=False,
+                     visibility="", access="", title="", admin_url="")
+
+        def boom(*a):
+            raise M.FileError("cannot read the image")
+        with mock.patch.object(M, "prepare_image", boom):
+            row = M.process_one(entry, 1, cfg, REC_EP,
+                                RecordCheckInDescribeOne112.PROFILE)
+        self.assertTrue(row["status"].startswith("Failed"))
+        self.assertEqual(row["record_url"],
+                         "https://repository.example.edu/sample-gallery/7")
+
+
+class PastedPathsJoinRecords112(unittest.TestCase):
+    """A folder scan and pasted paths are a pair: both infer the context
+    and article an image's record is joined by."""
+    def test_both_sources_infer_context_and_article(self):
+        tmp = tempfile.mkdtemp(prefix="dcid-paths-")
+        try:
+            d = os.path.join(tmp, "sample-gallery")
+            os.makedirs(d)
+            img = os.path.join(d, "sample-gallery_article_1046.jpg")
+            open(img, "wb").close()
+            pasted, bad = M.scan_paths(img + "\n")
+            self.assertEqual(bad, [])
+            folder = M.scan_folder(tmp, True)
+            folder = folder[0] if isinstance(folder, tuple) else folder
+            for e in (pasted[0], folder[0]):
+                self.assertEqual((e["ctx"], e["article"]),
+                                 ("sample-gallery", "1046"))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class ValidateStartRecords112(unittest.TestCase):
+    def base(self, **kw):
+        img = os.path.join(self.tmp, "a.jpg")
+        open(img, "wb").close()
+        entry = {"path": img, "name": "a.jpg"}
+        req = {"paths": [img], "endpoint": "e", "profile": "p",
+               "out_dir": self.tmp}
+        req.update(kw)
+        ai = {"endpoints": [{"name": "e", "kind": "gemini", "model": "m",
+                             "api_key": "k"}]}
+        prof = {"profiles": [{"name": "p", "prompt": "x" * 50,
+                              "max_alt_chars": 125}], "default": "p"}
+        return M.validate_start(req, [entry], {"openpyxl": True,
+                                               "pymupdf": True}, ai, prof,
+                                session={"branding": {"ai_notice": "Ours."}})
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="dcid-vs-")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_defaults_and_notice(self):
+        msg, cfg, _e, _p = self.base()
+        self.assertEqual(msg, "")
+        self.assertEqual((cfg["records"], cfg["record_check"],
+                          cfg["notice"]), (None, "doubts", "Ours."))
+
+    def test_refusals(self):
+        self.assertEqual(self.base(record_check="sometimes")[0],
+                         "Bad request.")
+        self.assertIn("no .xlsx file",
+                      self.base(record_book=os.path.join(
+                          self.tmp, "none.xlsx"))[0])
+        bad = os.path.join(self.tmp, "cols.xlsx")
+        _workbook(bad, ["title"], [["t"]])
+        self.assertIn("manuscript_id", self.base(record_book=bad)[0])
+
+    def test_a_good_workbook_is_loaded(self):
+        good = os.path.join(self.tmp, "inv.xlsx")
+        _workbook(good, REC_HEADER, [_rec_row(1046)])
+        msg, cfg, _e, _p = self.base(record_book=good, record_check="all")
+        self.assertEqual(msg, "")
+        self.assertIn(("sample-gallery", "1046"), cfg["records"])
+
+
 if __name__ == "__main__":
     # Say which version is under test, read from the module rather than from
     # this file's name. Nothing here hard-codes a version.

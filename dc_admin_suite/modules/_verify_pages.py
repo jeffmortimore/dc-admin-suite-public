@@ -1388,6 +1388,7 @@ BROWSE_BTN_RE = re.compile(r"<button\b([^>]*\bdata-browse=[^>]*)>(.*?)</button>"
 # every page by markup, never from a list.
 PATH_LABEL_RE = re.compile(r"\bfolders?\b|\bpaths?\b|\bsave\b.*\bto\b", re.I)
 BROWSE_WANT = {"folder": {"folder"}, "files": {"files"},
+               "file": {"file"},     # one file (1.12.0: a record workbook)
                "file-or-folder": {"file", "folder"}}
 
 

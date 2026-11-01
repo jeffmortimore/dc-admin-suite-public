@@ -86,6 +86,11 @@ NEUTRAL_PROFILE = {
         # Empty here: a statement names an institution and a vendor, so it
         # belongs in that institution's profile and nowhere in source.
         "download_statement": "",
+        # The ACCESSIBILITY NOTICE the image describer writes at the top of
+        # every text equivalent (1.12.0), in this institution's words —
+        # usually naming whom to ask for more. Empty here for the same
+        # reason; the describer then writes a neutral notice.
+        "ai_notice": "",
     },
 }
 
