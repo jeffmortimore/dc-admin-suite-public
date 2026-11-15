@@ -460,6 +460,396 @@ def check_poll_reports_state(group, problems):
                             "Clear is never enabled or disabled".format(label))
 
 
+# ---------------------------------------------------------------------------
+# The status line, driven (1.0.8). Each page's own poll() runs in node with
+# the helpers it calls taken from the page; any other name it reaches for
+# is a recording stub. A staff test found two pages whose status line kept
+# saying what a run had been doing after it ended ("Harvesting…", and an
+# idle line that never noticed a hierarchy had loaded): the idle branch
+# wrote only when the line was empty, which it never is after a run.
+# ---------------------------------------------------------------------------
+STATUS_NODE = r"""
+const LOG_NL = String.fromCharCode(10);
+function esc(t){ return String(t).split('&').join('&amp;').split('<').join('&lt;')
+  .split('>').join('&gt;'); }
+function mkel(id){
+  const props = {textContent:'', innerHTML:'', className:'', value:'',
+    checked:false, disabled:false, hidden:false, length:0};
+  let writes = 0;
+  const target = function(){ return mkel(id + '()'); };
+  return new Proxy(target, {
+    get(t, k){
+      if (k === '__writes') return writes;
+      if (typeof k === 'symbol') return k === Symbol.toPrimitive ? (() => '[' + id + ']') : undefined;
+      if (k === 'then') return undefined;
+      if (k in props) return props[k];
+      if (k === 'classList') return {add(){}, remove(){}, toggle(){}, contains(){ return false; }};
+      if (k === 'style' || k === 'dataset') return (props[k] = {});
+      if (k === 'options' || k === 'children' || k === 'childNodes') return (props[k] = []);
+      return (props[k] = mkel(id + '.' + String(k)));
+    },
+    set(t, k, v){
+      if (k === 'textContent' || k === 'innerHTML') writes += 1;
+      props[k] = v;
+      if (k === 'innerHTML') props.textContent = String(v).replace(/<[^>]*>/g, '')
+        .split('&lt;').join('<').split('&gt;').join('>').split('&quot;').join('"')
+        .split('&amp;').join('&');
+      return true;
+    },
+    apply(){ return mkel(id + '()'); }
+  });
+}
+const ELS = {};
+const document = {getElementById(id){ return ELS[id] || (ELS[id] = mkel(id)); },
+  createElement(t){ return mkel('<' + t + '>'); }, querySelectorAll(){ return []; },
+  querySelector(){ return null; }, title: ''};
+let STATE = null;
+async function fetch(url){ return {ok: true, json: async () => STATE, text: async () => ''}; }
+function setInterval(){} function setTimeout(){}
+const status = document.getElementById('status');
+"""
+
+STATUS_DRIVE = r"""
+const OUT = [];
+(async () => {
+  for (const st of STATES) {
+    STATE = st;
+    let err = null;
+    for (let tries = 0; tries < 80; tries++) {
+      try { await poll(); err = null; break; }
+      catch (e) {
+        const m = /^(\S+) is not defined/.exec(e.message || '');
+        if (e instanceof ReferenceError && m) { globalThis[m[1]] = mkel(m[1]); err = e; continue; }
+        err = e; break;
+      }
+    }
+    OUT.push({text: String(status.textContent), html: String(status.innerHTML),
+              cls: String(status.className), writes: status.__writes,
+              error: err ? String(err) : ''});
+  }
+  console.log(JSON.stringify(OUT));
+})();
+"""
+
+STATUS_SKIP = {"poll", "renderLog", "formSeen", "logStateSeen", "refreshHierarchy",
+               "renderList", "renderUploads", "noteLoaded", "saveForm", "esc",
+               "refetchFiles", "renderTools", "applyVerifyTitle", "syncGo",
+               "renderEndpoints", "refreshTargets"}
+
+
+def _status_script(html):
+    """poll() and the page functions it reaches, for STATUS_NODE."""
+    src = "\n".join(SCRIPT_RE.findall(html or ""))
+    poll = _js_function(src, "poll")
+    if poll is None:
+        return None
+    # A poll that swallows its own errors would hide what the stub lacks.
+    poll = poll.replace("catch(e){/* transient poll errors are fine */}",
+                        "catch(e){throw e;}")
+    defined = set(re.findall(r"function ([A-Za-z_$][\w$]*)\(", src))
+    take, todo, seen = [], [poll], set()
+    while todo:
+        body = todo.pop()
+        for name in sorted(defined - seen - STATUS_SKIP):
+            if re.search(r"(?<![\w$.])" + re.escape(name) + r"\(", body):
+                seen.add(name)
+                fn = _js_function(src, name)
+                if fn:
+                    at = src.find("function {}(".format(name))
+                    if src[max(0, at - 6):at] == "async ":
+                        fn = "async " + fn
+                    take.append(fn)
+                    todo.append(fn)
+    consts = re.findall(r"^\s*const (?:cap|\$)=.*$", src, re.M)
+    return "\n".join(consts) + "\n" + "\n".join(take) + "\nasync " + poll
+
+
+def _status_base(**kw):
+    base = {"log": [], "paused": False, "summary": "",
+            "progress": {"current": 1, "total": 2, "msg": "m"},
+            "hier": {"loaded": True, "count": 3, "max_level": 2,
+                     "source": "s", "version": 1},
+            "queue": {"loaded": False, "count": 0, "generated": "",
+                      "source": "", "version": 0},
+            "targets": {"loaded": False, "version": 0, "count": 0,
+                        "source": "", "path": ""},
+            "report": {"loaded": False, "version": 0, "count": 0,
+                       "source": "", "path": ""},
+            "plan": {"ready": False, "changes": 0, "structures": 0},
+            "verify": {"holding": False, "left": 0, "prompts": 0},
+            "files": [], "tools": {}, "types": {}, "inventory": False,
+            "fetching": False}
+    base.update(kw)
+    return base
+
+
+def _drive_status(node_bin, html, states):
+    script = _status_script(html)
+    if script is None:
+        return None, "no poll()"
+    code = (STATUS_NODE + script + "\nconst STATES = " + json.dumps(states)
+            + ";\n" + STATUS_DRIVE)
+    with tempfile.NamedTemporaryFile("w", suffix=".js", encoding="utf-8",
+                                     delete=False) as fh:
+        fh.write(code)
+        tmp = fh.name
+    try:
+        done = subprocess.run([node_bin, tmp], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=30)
+    finally:
+        Path(tmp).unlink()
+    try:
+        return json.loads(done.stdout.strip().splitlines()[-1]), ""
+    except Exception:
+        return None, _node_error(done) or done.stdout[-300:]
+
+
+STATUS_FILES = {"last_file": "/r/a&b \"q\".xlsx", "report_file": "/r/h.xlsx",
+                "plan_file": "/r/p.xlsx"}
+STATUS_HREF = {"/download": "last_file", "/download-report": "report_file",
+               "/download-plan": "plan_file"}
+
+
+def check_status_lines(node_bin, group, problems):
+    """Every page with a log, its poll() driven: after a run the idle line
+    replaces what the run was doing; an idle poll that changes nothing
+    writes nothing (the line is a live region); a finished run is colored
+    by logTone(s); and every download link in the line carries the path of
+    the file it downloads (data-path, for Copy status and log)."""
+    checked = 0
+    for label, html in group:
+        states = [_status_base(phase="scraping"),
+                  _status_base(phase="idle"),
+                  _status_base(phase="idle"),
+                  _status_base(phase="done", summary="S", outcome="amber",
+                               **STATUS_FILES)]
+        out, why = _drive_status(node_bin, html, states)
+        if out is None:
+            problems.append("{}: its poll() could not be driven ({})"
+                            .format(label, why))
+            continue
+        checked += 1
+        errs = [o["error"] for o in out if o["error"]]
+        if errs:
+            problems.append("{}: poll() raised {}".format(label, errs[0][:160]))
+            continue
+        run, idle, again, done = out
+        if not idle["text"].startswith("Idle"):
+            problems.append("{}: after a run its status line still says {!r}"
+                            .format(label, idle["text"][:80]))
+        if again["writes"] != idle["writes"]:
+            problems.append("{}: an idle poll that changed nothing rewrote "
+                            "the status line".format(label))
+        if done["cls"] != "amber":
+            problems.append("{}: a finished run with problems is colored {!r}"
+                            .format(label, done["cls"]))
+        for href, tail in re.findall(r'<a [^>]*href="([^"]+)"([^>]*)>',
+                                     done["html"]):
+            field = STATUS_HREF.get(href)
+            if field is None:
+                continue
+            want = ('data-path="' + STATUS_FILES[field].replace("&", "&amp;")
+                    .replace('"', "&quot;") + '"')
+            if want not in tail:
+                problems.append("{}: its {} link does not carry the file's "
+                                "path ({!r})".format(label, href, tail[:80]))
+    return checked
+
+
+def check_download_phase_word(node_bin, group, problems):
+    """The downloader says Planning until its first file request, then
+    Downloading; an inventory says Inventorying."""
+    html = dict(group).get("modules/dc_file_downloader.py")
+    if html is None:
+        problems.append("downloader: page not found for the phase word")
+        return
+    out, why = _drive_status(node_bin, html, [
+        _status_base(phase="downloading", fetching=False),
+        _status_base(phase="downloading", fetching=True),
+        _status_base(phase="downloading", inventory=True)])
+    if out is None:
+        problems.append("downloader: phase word not driven ({})".format(why))
+        return
+    got = [o["text"].split("…")[0] for o in out]
+    if got != ["Planning", "Downloading", "Inventorying"]:
+        problems.append("downloader: the status line words a download run "
+                        "{!r}".format(got))
+
+
+def check_log_spacing(group, problems):
+    """DC-LOG 2: the log bar keeps the same space above the log box as the
+    status line keeps above the bar (1rem), read from the styles."""
+    for label, html in group:
+        m = LOG_CSS_RE.search(html)
+        bar = re.search(r"\.logbar\{[^}]*margin-bottom:([^;}]+)", m.group(0)
+                        if m else "")
+        st = re.search(r"#status\{margin:([^ ;}]+)", html)
+        if not bar or not st or bar.group(1).strip() != st.group(1).strip():
+            problems.append("{}: the log bar's bottom margin ({}) is not the "
+                            "status line's ({})".format(
+                                label, bar.group(1) if bar else None,
+                                st.group(1) if st else None))
+
+
+LOG_COPY_PRE = r"""
+function node(tag, kids, attrs, text){
+  if (tag === '#text') return {nodeType: 3, nodeValue: text, childNodes: []};
+  return {nodeType: 1, nodeName: tag, childNodes: kids || [],
+    getAttribute(a){ return (attrs || {})[a] || null; },
+    get textContent(){ return this.childNodes.map(c => c.nodeType === 3 ? c.nodeValue : c.textContent).join(''); }};
+}
+const els = {};
+function el(id){ return els[id] || (els[id] = {id:id, hidden:true, disabled:false,
+  value:'', className:'', _html:'', writes:0, childNodes:[],
+  get innerHTML(){ return this._html; }, set innerHTML(v){ this._html = v; this.writes += 1; },
+  listeners:{}, addEventListener(t,f){ this.listeners[t]=f; }, focus(){}, select(){},
+  classList:{contains(){ return false; }}}); }
+const document = {getElementById: el};
+let SAID = '', CLIP = null, REJECT = false, LOG = '';
+const navigator = {clipboard: {writeText(t){ CLIP = t; return REJECT ? Promise.reject(1) : Promise.resolve(); }}};
+async function fetch(u){ return {ok: true, text: async () => LOG}; }
+function clearErr(){}
+function logSelectAll(){}
+"""
+
+LOG_COPY_DRIVE = r"""
+logSay = function(m){ SAID = m; };
+const tick = () => new Promise(r => setTimeout(r, 20));
+const out = [];
+(async () => {
+  el('status').childNodes = [node('#text', null, null, 'Done: S '),
+    node('BR'), node('A', [node('#text', null, null, 'Download workbook')], {'data-path': '/r/a.xlsx'}),
+    node('BR'), node('A', [node('#text', null, null, 'Other')], {})];
+  LOG = 'l1' + LOG_NL + 'l2' + LOG_NL;
+  logStateSeen({phase: 'done'}); copyLog(); await tick();
+  out.push(JSON.stringify(CLIP)); out.push(SAID);
+  logStateSeen({phase: 'idle'}); CLIP = null; copyLog(); await tick();
+  out.push(JSON.stringify(CLIP)); out.push(SAID);
+  LOG = ''; CLIP = null; copyLog(); await tick(); out.push(String(CLIP) + '|' + SAID);
+  logStateSeen({phase: 'done'}); copyLog(); await tick(); out.push(JSON.stringify(CLIP)); out.push(SAID);
+  LOG = 'l1' + LOG_NL; REJECT = true; copyLog(); await tick();
+  out.push(el('logfull').hidden + '|' + JSON.stringify(el('logfull').value)); out.push(SAID);
+  logShow('', 'A'); logShow('', 'A'); logShow('amber', 'A');
+  out.push(el('status').writes + '|' + el('status').className);
+  out.push(logAttr('a&"<>'));
+  console.log(out.join(LOG_NL));
+})();
+"""
+
+
+def check_log_copy_in_node(node_bin, group, problems):
+    """DC-LOG 2, driven: Copy status and log copies the status line (a link
+    with a path as its label and path) and then the whole run; an idle line
+    is not copied as a result; a page with no log yet copies the status
+    alone and says so; the fallback box gets the same text; logShow()
+    writes only what changed; logAttr() escapes for an attribute."""
+    if not group:
+        return
+    block = LOG_JS_RE.search(group[0][1]).group(0)
+    with tempfile.NamedTemporaryFile("w", suffix=".js", encoding="utf-8",
+                                     delete=False) as fh:
+        fh.write(LOG_COPY_PRE + block + "\n" + LOG_COPY_DRIVE)
+        tmp = fh.name
+    try:
+        done = subprocess.run([node_bin, tmp], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=30)
+    finally:
+        Path(tmp).unlink()
+    got = done.stdout.rstrip("\n").split("\n")
+    status = "Done: S" + "\n" + "Download workbook: /r/a.xlsx" + "\n" + "Other"
+    want = [
+        json.dumps("Status:\n" + status + "\n\nLog:\nl1\nl2\n"),
+        "The status and the whole current run, 2 lines, copied to the clipboard.",
+        json.dumps("l1\nl2\n"),
+        "The whole current run, 2 lines, copied to the clipboard.",
+        "null|Nothing has been logged since the last clean start.",
+        json.dumps("Status:\n" + status + "\n"),
+        "The status line copied to the clipboard. Nothing has been logged "
+        "since the last clean start.",
+        "false|" + json.dumps("Status:\n" + status + "\n\nLog:\nl1\n"),
+        "The status and the whole current run (1 line) are selected below. "
+        "Press Ctrl+C (Cmd+C) to copy.",
+        "1|amber",
+        "a&amp;&quot;&lt;&gt;"]
+    if done.returncode != 0 or got != want:
+        bad = [(i, g, w) for i, (g, w) in enumerate(zip(got, want)) if g != w]
+        problems.append("DC-LOG copy: behaved as {!r}{}".format(
+            bad[:2] or got[len(want):], " — " + _node_error(done)
+            if done.returncode else ""))
+
+
+SHELL_CMD_DRIVE = r"""
+const ELS = {};
+function $(id){ return ELS[id] || (ELS[id] = {innerHTML: ''}); }
+const document = {querySelectorAll(){ return []; }};
+const esc = t => String(t).split('&').join('&amp;').split('<').join('&lt;')
+  .split('>').join('&gt;').split('"').join('&quot;');
+"""
+
+
+def check_chrome_commands(node_bin, problems):
+    """The start page gives Windows staff a PowerShell command (where
+    %LOCALAPPDATA% does not expand) and a Command Prompt one, each labeled
+    with its own Copy button; macOS keeps its one."""
+    sys.path.insert(0, str(SUITE))
+    try:
+        from app import chrome_bridge
+    finally:
+        sys.path.pop(0)
+    ins = chrome_bridge.chrome_instructions(9222)
+    cmds = {c["label"]: c["command"] for c in ins["windows"].get("commands", [])}
+    ps, cmd = cmds.get("PowerShell", ""), cmds.get("Command Prompt", "")
+    if not (ps.startswith('& "') and "$env:LOCALAPPDATA" in ps and "%" not in ps):
+        problems.append("shell: the PowerShell command is {!r}".format(ps))
+    if "%LOCALAPPDATA%" not in cmd or cmd.startswith("&"):
+        problems.append("shell: the Command Prompt command is {!r}".format(cmd))
+    html = page_html("app/ui.py", "APP_HTML")
+    src = "\n".join(SCRIPT_RE.findall(html or ""))
+    fn = _js_function(src, "renderInstructions")
+    if fn is None:
+        problems.append("shell: renderInstructions not found")
+        return
+    code = (SHELL_CMD_DRIVE + "const STATE = {instructions: " + json.dumps(ins)
+            + "};\n" + fn + "\nrenderInstructions();\nconsole.log(JSON.stringify("
+            "[ELS.winInstructions.innerHTML, ELS.macInstructions.innerHTML]));")
+    done = subprocess.run([node_bin, "-e", code], capture_output=True,
+                          text=True, encoding="utf-8", timeout=20)
+    try:
+        win, mac = json.loads(done.stdout.strip())
+    except Exception:
+        problems.append("shell: renderInstructions not driven ({})"
+                        .format(_node_error(done)))
+        return
+    for want in ("PowerShell:", "Command Prompt:", "$env:LOCALAPPDATA",
+                 "%LOCALAPPDATA%", ">Copy PowerShell command<",
+                 ">Copy Command Prompt command<"):
+        if want not in win:
+            problems.append("shell: the Windows steps lack {!r}".format(want))
+    if ">Copy command<" not in mac or "$HOME/DCAdminSuiteChrome" not in mac:
+        problems.append("shell: the macOS command is not shown as before")
+
+
+# Counts said as "N structures" where N can be 1. Site-wide counts (a whole
+# hierarchy or listing) are left as they are.
+COUNT_OK = ("Found {} structures", "{} structures mapped",
+            "Harvested {} structures", "{} structures across {} type(s) harvested",
+            "{} structures across {} sheet(s)", "' structures · deepest level",
+            "===1?' structure · ':' structures · '")
+
+
+def check_counts_of_one(problems):
+    """No message says "1 structures": a count that can be one is written
+    "structure(s)", or chooses its word. Found in every module's source."""
+    for path in sorted((SUITE / "modules").glob("dc_*.py")):
+        for no, line in enumerate(path.read_text(encoding="utf-8")
+                                  .splitlines(), 1):
+            for hit in re.findall(r"\{\} structures\b|' structures\b", line):
+                if not any(ok in line for ok in COUNT_OK):
+                    problems.append("{}:{}: a count that can be 1 says "
+                                    "'structures': {}".format(
+                                        path.name, no, line.strip()[:90]))
+
+
 def check_log_block_in_node(node_bin, group, problems):
     """Behavioral: the DC-LOG script against a stub page. Clear is
     disabled during every running phase and enabled otherwise; a clear
@@ -932,7 +1322,8 @@ def check_tones(node_bin, group, problems):
                 problems.append("{}: its DC-TONE script contains a "
                                 "backslash".format(label))
         script = _strip_js_comments("\n".join(SCRIPT_RE.findall(html)))
-        if "className=logTone(s)" not in script:
+        if ("className=logTone(s)" not in script
+                and "logShow(logTone(s)" not in script):
             problems.append("{}: its status line is not colored by "
                             "logTone(s)".format(label))
         if re.search(r"className\s*=\s*'done'|\?\s*'done'\s*:", script):
@@ -2016,6 +2407,1258 @@ def check_pick_in_node(node_bin, group, problems):
                                     if done.returncode else ""))
 
 
+INDEX_RE = re.compile(r"# ---- DC-INDEX (\d+) -+\n.*?# ---- /DC-INDEX -+\n",
+                      re.S)
+
+
+def _index_page(rows, caption="Site index", title="Configuration Tools"):
+    """A listing page in the markup Digital Commons serves: one
+    <table class="cttypes">, a <th> per row, links in spans with an
+    aria-hidden separator. Slugs are invented."""
+    body = []
+    for header, slugs in rows:
+        items = "".join(
+            '<span class="context-index-item"><a href="/cgi/user_config.cgi'
+            '?context={0}">{0}</a><span class="context-index-separator" '
+            'aria-hidden="true">|</span></span>\n'.format(s) for s in slugs)
+        body.append("<tr>\n<th>{}</th>\n<td>\n{}</td>\n</tr>".format(header,
+                                                                    items))
+    return ('<html><head><title>{}</title></head><body>'
+            '<table class="cttypes search"><tr><td>Jump to publication'
+            '</td></tr></table>'
+            '<table class="cttypes">\n<caption role="heading" aria-level="3">'
+            '{}</caption>\n<tbody>{}</tbody></table></body></html>'
+            .format(title, caption, "\n".join(body)))
+
+
+# Each row: the newer heading, the older code, its slugs. The ETD row also
+# carries a sub-document, the platform itself and a repeat, all skipped.
+INDEX_ROWS = [
+    ("Communities", "ir_community", ["example-community"]),
+    ("Journals", "ir_journal", ["example-journal-a", "example-journal-b"]),
+    ("ETDs", "ir_etd", ["example-etd", "example-etd/sub",
+                        "https://dc.example.edu", "example-etd"]),
+    ("Galleries", "ir_gallery", ["example-gallery"]),
+    ("Series", "ir_series", ["example-series"]),
+    ("Books", "ir_book", ["example-book"]),
+    ("Conferences", "ir_event_community", ["example-event"]),
+]
+INDEX_WANT = {"example-community": "ir_community",
+              "example-journal-a": "ir_journal",
+              "example-journal-b": "ir_journal", "example-etd": "ir_etd",
+              "example-gallery": "ir_gallery", "example-series": "ir_series",
+              "example-book": "ir_book", "example-event": "ir_event_community"}
+
+# How each listing reader is driven through its worker. A module that
+# reads the listing and is not here is reported, never skipped.
+INDEX_WORKERS = {
+    "modules/dc_hierarchy_mapper.py": ("crawl_worker", ("session", "tmp")),
+    "modules/dc_regenerator.py": ("map_worker", ("session", "tmp")),
+    "modules/dc_batch_revise.py": ("map_worker", ("session", "tmp")),
+    "modules/dc_config_manager.py": ("harvest_worker", ("session",)),
+    "modules/dc_url_scraper.py": ("scrape_worker",
+                                  ("session", "codes", "reports", "tmp")),
+    "modules/dc_file_downloader.py": ("map_worker", ("session", "tmp")),
+}
+
+
+class _IndexHalt(Exception):
+    """Raised by the fake driver past the listing: the check is about the
+    listing, so the worker is stopped at its next page."""
+
+
+class _IndexDriver:
+    def __init__(self, html):
+        self.page_source, self.gets = html, 0
+        self.current_url = ("https://dc.example.edu/cgi/user_config.cgi"
+                            "?context=https://dc.example.edu&x_showall=1")
+        self.title = "Configuration Tools"
+
+    def get(self, url):
+        self.gets += 1
+        if self.gets > 1:
+            raise _IndexHalt(url)
+
+    def __getattr__(self, name):
+        raise _IndexHalt(name)
+
+
+def _index_import(label):
+    import importlib.util
+    path = SUITE / label
+    name = "_dcindex_" + path.stem
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _index_by_code(M, label, html):
+    """{slug: code} from one module's extract_contexts, whatever its shape."""
+    to_code = {lab: code for lab, code in M.STRUCTURE_TYPES}
+    if label.endswith("dc_url_scraper.py"):
+        r = M.extract_contexts(html, [c for _l, c in M.STRUCTURE_TYPES])
+        return None if r is None else {s: c for c, v in r.items() for s in v}
+    r = M.extract_contexts(html)
+    if r is None:
+        return None
+    if label.endswith("dc_config_manager.py"):
+        return {s: to_code.get(lab, lab) for lab, v in r.items() for s in v}
+    return {s: to_code.get(lab, lab) for s, lab in r.items()}
+
+
+def check_index(problems):
+    """DC-INDEX 1 (1.0.8). Every module that reads the site-wide listing,
+    found by ast, carries the one DC-INDEX block; each reads the newer
+    "Site index" layout and the older "Contents of this site" one to the
+    same structures and types; and each worker, driven with a fake
+    driver, names what it saw when the table is absent and reports a row
+    whose heading it does not know."""
+    group = []
+    for path in sorted((SUITE / "modules").glob("dc_*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        if any(isinstance(n, ast.FunctionDef) and n.name == "extract_contexts"
+               for n in tree.body):
+            group.append("modules/" + path.name)
+    if not group:
+        problems.append("DC-INDEX: no module reads the listing, so nothing "
+                        "was checked")
+        return group
+    blocks = {}
+    for label in group:
+        b = _one_block(label, (SUITE / label).read_text(encoding="utf-8"),
+                       INDEX_RE, "DC-INDEX", problems)
+        if b is not None:
+            blocks[label] = b
+    _agree(blocks, "DC-INDEX", problems)
+
+    newer = _index_page([(h, s) for h, _c, s in INDEX_ROWS])
+    older = _index_page([(c, s) for _h, c, s in INDEX_ROWS],
+                        caption="Contents of this site")
+    unknown = _index_page([(h, s) for h, _c, s in INDEX_ROWS]
+                          + [("Widgets", ["example-widget"])])
+    absent = ('<html><head><title>Fixture page</title></head><body><table '
+              'class="cttypes"><caption>Something else</caption></table>'
+              '</body></html>')
+    real_sleep = time.sleep
+    for label in group:
+        if label not in INDEX_WORKERS:
+            problems.append("{}: reads the listing and has no driven check "
+                            "in INDEX_WORKERS".format(label))
+            continue
+        try:
+            M = _index_import(label)
+        except Exception as e:                       # pragma: no cover
+            problems.append("{}: could not be imported: {}".format(label, e))
+            continue
+        for name, html in (("newer layout", newer), ("older layout", older)):
+            got = _index_by_code(M, label, html)
+            if got != INDEX_WANT:
+                problems.append("{}: the {} read as {!r}".format(label, name,
+                                                                 got))
+        if _index_by_code(M, label, absent) is not None:
+            problems.append("{}: a page without the listing read as one"
+                            .format(label))
+        if label not in blocks:
+            continue        # reported above; its worker cannot be driven
+        if M.index_unknown_headers(unknown) != [("Widgets", 1)]:
+            problems.append("{}: the unknown heading was reported as {!r}"
+                            .format(label, M.index_unknown_headers(unknown)))
+        if M.index_unknown_headers(newer):
+            problems.append("{}: a known heading was reported as unknown"
+                            .format(label))
+
+        fn_name, args = INDEX_WORKERS[label]
+        for case, html in (("absent", absent), ("unknown", unknown)):
+            lines = []
+            M.log = lambda msg, *_a, **_k: lines.append(str(msg))
+            M.get_driver = lambda _s, _h=html: _IndexDriver(_h)
+            session = M.load_session(Path("/nonexistent/session.json"))
+            session["base_url"] = "https://dc.example.edu"
+            tmp = tempfile.mkdtemp(prefix="dcindex-")
+            vals = {"session": session, "tmp": tmp,
+                    "codes": [c for _l, c in M.STRUCTURE_TYPES],
+                    "reports": list(getattr(M, "REPORT_LABELS", {}))[:1]}
+            time.sleep = lambda *_a: None
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    getattr(M, fn_name)(*[vals[a] for a in args])
+            except Exception as e:
+                problems.append("{} ({}): the worker raised {}: {}".format(
+                    label, case, e.__class__.__name__, e))
+            finally:
+                time.sleep = real_sleep
+                shutil.rmtree(tmp, ignore_errors=True)
+            summary = str(M.STATE.get("summary", ""))
+            if case == "absent":
+                if (M.STATE.get("phase") != "error"
+                        or 'titled "Fixture page"' not in summary
+                        or '"Something else"' not in summary):
+                    problems.append("{}: with no listing it ended {!r}: {!r}"
+                                    .format(label, M.STATE.get("phase"),
+                                            summary))
+            elif not any('headed "Widgets"' in ln for ln in lines):
+                problems.append("{}: the worker did not report the unknown "
+                                "heading".format(label))
+    return group
+
+
+def check_batch_history(problems):
+    """Batch revise 1.6.2. The Spreadsheet History is read in both layouts:
+    the older <table id="batch-history"> and the late-2026 <div
+    id="batch-history"> around a table.manage-results (markup copied from a
+    saved page; numbers invented). A page with neither is None."""
+    M = _index_import("modules/dc_batch_revise.py")
+    link = ('<a href="editor.cgi?context=example&amp;window=batch_revise_'
+            'retrieve_spreadsheet&amp;exportitem={0}&amp;part={1}">Download '
+            '{1}/1</a>')
+    rows = "".join(
+        "<tr><td>Generated</td><td>Fri Aug 07 06:43:21 2026 PT</td><td>{}"
+        "</td><td><a href=\"#\">Delete</a></td></tr>".format(link.format(n, 1))
+        for n in (1786110201, 1786100000))
+    newer = ('<html><body><div class="batch-revise-section" id="batch-'
+             'history"><table class="manage-results"><thead><tr><th>Source'
+             '</th><th>Date Generated</th><th>Download</th><th>Delete</th>'
+             '</tr></thead><tbody>' + rows + '</tbody></table><a href="#">'
+             'Next</a> of 2</div></body></html>')
+    older = ('<html><body><table id="batch-history"><tbody>' + rows +
+             '</tbody></table></body></html>')
+    for name, html in (("newer", newer), ("older", older)):
+        got = M.parse_history(html)
+        items = [e["exportitem"] for e in (got or [])]
+        if items != [1786110201, 1786100000]:
+            problems.append("dc_batch_revise: the {} history read as {!r}"
+                            .format(name, items))
+        elif got[0]["parts"] and got[0]["parts"][0][0] != 1:
+            problems.append("dc_batch_revise: the {} history's part read "
+                            "as {!r}".format(name, got[0]["parts"]))
+    if M.parse_history("<html><body><table class='manage-results'>"
+                       "</table></body></html>") is not None:
+        problems.append("dc_batch_revise: a page with no history read as one")
+
+
+# ---- The Configuration Manager's Apply (1.0.8) ------------------------------
+# Driven through _apply_one, apply_worker, dryrun_worker and scrape_worker
+# with a fake browser that behaves like the configuration pages where it
+# matters:
+#   * text typed into a field is keypresses (a tab moves focus to the next
+#     field; a line break in a one-line field submits the form as it
+#     stands), and a one-line field drops line breaks set in it;
+#   * the page finishes itself with scripts after it loads: until one has
+#     run, the disciplines list holds only an empty-valued placeholder
+#     (SETTLE_JS reads that); another marks the Save Changes bar ready, which
+#     never happens while the window is covered by other windows, and until
+#     then the bar's button is not drawn and ignores a mouse click (a script
+#     click still submits the form);
+#   * Save Changes stores the form and loads a new page (the old page's
+#     elements go stale), and a hidden Save Changes button cannot be
+#     clicked.
+#   * a script click returns before the form's request is answered: the
+#     old page answers once more, then nothing answers while the request
+#     is out, then the new page is loading, then loaded; a page requested
+#     meanwhile is served first, and the save is written after it.
+# Typing a value that holds a tab once saved half of it, and the log then
+# said no structure had been updated; a dry run read before the scripts had
+# run listed the placeholder as a change on structures nobody edited; and a
+# mouse click while the window was covered saved nothing; and a page read
+# back before the request was answered reported a save as NOT SAVED.
+
+class _CMStale(Exception):
+    """Like Selenium's StaleElementReferenceException."""
+
+
+class _CMNotInteractable(Exception):
+    """Like Selenium's ElementNotInteractableException."""
+
+
+_CM_TRACE = ("Message: element not interactable\n"
+             "  (Session info: chrome=0.0)\nStacktrace:\n0 0x1 <unknown>")
+
+
+class _CMServer:
+    """One structure's configuration, and how its page behaves."""
+
+    def __init__(self, fields, keep=None, buttons=((True, True),),
+                 unreadable_after_save=False, settle_polls=3, never="",
+                 disciplines=(), ignore_clicks=0, saves_in_place=False,
+                 covered=False, answer_polls=2, never_answers=False,
+                 stale_reads=0, fail_get_at=0):
+        self.stored = dict(fields)          # name -> (tag, value)
+        self.keep = keep                    # what a save keeps, if not all
+        self.buttons = buttons              # (shown, in the Save bar) each
+        self.unreadable_after_save = unreadable_after_save
+        self.settle_polls = settle_polls    # SETTLE_JS calls until settled
+        self.never = never                  # "list": never settles
+        self.covered = covered              # the bar is never marked ready
+        self.answer_polls = answer_polls    # looks while the request is out
+        self.never_answers = never_answers  # the request is never answered
+        self.disciplines = disciplines      # items listed once settled
+        self.ignore_clicks = ignore_clicks  # clicks that do nothing
+        self.saves_in_place = saves_in_place
+        self.stale_reads = stale_reads      # reads after a save that show
+        self.stale_left = 0                 #   what was there before it
+        self.before = None
+        self.fail_get_at = fail_get_at      # this config GET raises
+        self.config_gets = 0
+        self.saves = 0
+        self.regens = 0
+        self.clicks = 0
+
+
+class _CMElement:
+    def __init__(self, page, tag, name, value="", itype="",
+                 displayed=True, button=False, multiple=False, in_bar=False):
+        self.page, self.tag_name, self.name = page, tag, name
+        self.value, self.itype = value, itype
+        self.displayed, self.button = displayed, button
+        self.multiple, self.in_bar = multiple, in_bar
+
+    def _alive(self):
+        if self.page.gone:
+            raise _CMStale("Message: stale element reference\n"
+                           "Stacktrace:\n0 0x1 <unknown>")
+
+    def one_line(self):
+        return self.tag_name == "input"
+
+    def set_value(self, v):
+        self._alive()
+        if self.one_line():                 # the browser's sanitization
+            v = v.replace("\r", "").replace("\n", "")
+        self.value = v
+
+    def get_attribute(self, name):
+        self._alive()
+        if name == "multiple":
+            return "true" if self.multiple else None
+        return {"type": self.itype, "value": self.value,
+                "name": self.name}.get(name)
+
+    def is_displayed(self):
+        self._alive()
+        if self.in_bar and not self.page.bar_ready:
+            return False                   # the bar is not drawn yet
+        return self.displayed
+
+    def is_enabled(self):
+        self._alive()
+        return True
+
+    def is_selected(self):
+        self._alive()
+        return False
+
+    def clear(self):
+        self._alive()
+        self.value = ""
+
+    def send_keys(self, text):
+        focus = self
+        for ch in text:
+            if self.page.gone:
+                return                     # keystrokes land nowhere
+            if ch == "\t":
+                focus = self.page.after(focus)
+            elif ch in "\r\n" and focus.one_line():
+                self.page.submit()
+            else:
+                focus.value += ch
+
+    def click(self):
+        self._alive()
+        if not self.button:
+            return
+        if not self.is_displayed():
+            raise _CMNotInteractable(_CM_TRACE)
+        server = self.page.driver.server
+        server.clicks += 1
+        if self.in_bar and not self.page.bar_ready:
+            return                         # the bar is not ready yet
+        self.script_click()
+
+    def script_click(self):
+        """element.click() run in the page: the form is submitted as the
+        button would submit it, whatever has been drawn, and the call
+        returns before the request is answered."""
+        self._alive()
+        server = self.page.driver.server
+        if server.ignore_clicks:
+            server.ignore_clicks -= 1
+            return
+        if server.saves_in_place:
+            self.page.submit()
+            return
+        self.page.driver.pending = {"page": self.page, "first": True,
+                                    "polls": server.answer_polls}
+
+
+class _CMPage:
+    def __init__(self, driver, read=False):
+        self.driver, self.gone = driver, False
+        self.polls, self.ready, self.bar_ready = 0, False, False
+        driver.origins += 1
+        self.origin, self.loading = driver.origins, 0
+        server = driver.server
+        values = server.stored
+        if read and server.stale_left > 0:
+            values = server.before          # a read that lags the save
+            server.stale_left -= 1
+        self.fields = [
+            _CMElement(self, tag, name, value,
+                       itype="" if tag == "textarea" else "text")
+            for name, (tag, value) in values.items()]
+        self.listing = (None if server.disciplines is None else
+                        _CMElement(self, "select", "disciplines",
+                                   multiple=True))
+        self.buttons = [_CMElement(self, "input", "x_process_changes",
+                                   "Save Changes", itype="submit",
+                                   displayed=shown, button=True,
+                                   in_bar=bar)
+                        for shown, bar in server.buttons]
+
+    def settle_state(self):
+        server = self.driver.server
+        self.polls += 1
+        if server.never == "list":
+            return [True, 1]
+        self.ready = self.polls >= server.settle_polls
+        self.bar_ready = self.ready and not server.covered
+        return [True, 0] if self.ready else [True, 1]
+
+    def after(self, el):
+        order = self.fields + self.buttons
+        return order[min(order.index(el) + 1, len(order) - 1)]
+
+    def store(self):
+        """What the server writes when the form's request arrives."""
+        server = self.driver.server
+        form = {e.name: e.value for e in self.fields}
+        if server.keep:
+            form = server.keep(form)
+        server.before = dict(server.stored)
+        for name, value in form.items():
+            server.stored[name] = (server.stored[name][0], value)
+        server.stale_left = server.stale_reads
+        server.saves += 1
+
+    def submit(self):
+        server = self.driver.server
+        form = {e.name: e.value for e in self.fields}
+        if server.keep:
+            form = server.keep(form)
+        server.before = dict(server.stored)
+        for name, value in form.items():
+            server.stored[name] = (server.stored[name][0], value)
+        server.stale_left = server.stale_reads
+        server.saves += 1
+        if server.saves_in_place:
+            return                         # stored, but no new page
+        self.gone = True
+        self.driver.page = _CMPage(self.driver)
+        if server.unreadable_after_save:
+            self.driver.broken = True
+
+    def html(self):
+        import html as _h
+        if self.driver.broken:
+            return "<html><body><p>Something went wrong.</p></body></html>"
+        parts = []
+        for e in self.fields:
+            if e.tag_name == "textarea":
+                parts.append('<textarea name="{}">{}</textarea>'.format(
+                    e.name, _h.escape(e.value, quote=False)))
+            else:
+                parts.append('<input type="text" name="{}" value="{}">'
+                             .format(e.name, _h.escape(e.value)))
+        if self.listing is not None:
+            if self.ready:     # the placeholder stays, its text emptied
+                opts = '<option value=""></option>' + "".join(
+                    '<option value="{}">{}</option>'.format(i + 1,
+                                                            _h.escape(d))
+                    for i, d in enumerate(self.driver.server.disciplines))
+            else:
+                opts = '<option value="">Placeholder text</option>'
+            parts.append('<select id="disciplines" class="selectedMultiSelect'
+                         'Options" name="disciplines" multiple="multiple">'
+                         '{}</select>'.format(opts))
+        for b in self.buttons:
+            parts.append('<input type="submit" name="x_process_changes" '
+                         'value="Save Changes">')
+        return ('<html><body><div id="user-config"><form name="config_form">'
+                '{}</form></div></body></html>'.format("".join(parts)))
+
+    def find_elements(self, by, value):
+        if by == "name":
+            found = [e for e in self.fields if e.name == value]
+            if self.listing is not None and value == "disciplines":
+                found.append(self.listing)
+            return found
+        if by == "xpath" and "x_process_changes" in value:
+            return list(self.buttons)
+        raise AssertionError("fixture: unexpected lookup {} {}"
+                             .format(by, value))
+
+
+class _CMDriver:
+    """One fake browser. `servers` is one _CMServer, or {context: server}
+    for a run over several structures."""
+
+    def __init__(self, M, servers):
+        self.M, self.broken = M, False
+        self.origins, self.pending = 0, None
+        self.servers = servers if isinstance(servers, dict) else None
+        self.server = None if self.servers else servers
+        self.page, self.current_url, self.gets = None, "", []
+
+    def get(self, url):
+        self.gets.append(url)
+        self.current_url = url
+        late = self.pending
+        if late:
+            # A page requested while the form's request is out is served
+            # first; the save is written after it.
+            late["page"].gone = True
+            self.pending = None
+        if self.servers:
+            ctx = url.split("context=", 1)[1].split("&", 1)[0]
+            self.server = self.servers[ctx]
+            self.broken = False
+        if "x_regenerate=1" in url:
+            self.server.regens += 1
+            return
+        if getattr(self.server, "raise_on_get", False):
+            raise RuntimeError(_CM_TRACE)
+        self.server.config_gets += 1
+        if self.server.config_gets == self.server.fail_get_at:
+            raise RuntimeError(_CM_TRACE)
+        self.page = _CMPage(self, read=True)
+        if late and not self.server.never_answers:
+            late["page"].store()
+
+    @property
+    def page_source(self):
+        return self.page.html() if self.page else ""
+
+    @property
+    def title(self):
+        return "Configuration Tools"
+
+    def find_element(self, by, value):
+        if by == "id" and value == "user-config" and not self.broken:
+            return self.page
+        raise AssertionError("fixture: no element {} {}".format(by, value))
+
+    def find_elements(self, by, value):
+        return self.page.find_elements(by, value)
+
+    def execute_script(self, script, *args):
+        M = self.M
+        if script == M.SET_VALUE_JS:
+            args[0].set_value(args[1])
+            return None
+        if script == M.READ_VALUE_JS:
+            args[0]._alive()
+            return args[0].value
+        if script == M.CLICK_JS:
+            args[0].script_click()
+            self.server.clicks += 1
+            return None
+        if script == M.DOC_JS:
+            late = self.pending
+            if late:
+                if late["first"]:          # the click has not navigated yet
+                    late["first"] = False
+                    return ["complete", late["page"].origin]
+                late["page"].gone = True
+                if self.server.never_answers or late["polls"] > 0:
+                    late["polls"] -= 1
+                    raise _CMStale("Message: no such execution context")
+                self.pending = None        # the request is answered
+                late["page"].store()
+                self.page = _CMPage(self)
+                self.page.loading = 1
+                if self.server.unreadable_after_save:
+                    self.broken = True
+            if self.page.loading:
+                self.page.loading -= 1
+                return ["loading", self.page.origin]
+            return ["complete", self.page.origin]
+        if script == M.IN_BAR_JS:
+            args[0]._alive()
+            return args[0].in_bar
+        if script == M.SETTLE_JS:
+            if self.broken or self.page is None:
+                return [True, 0]
+            return self.page.settle_state()
+        raise AssertionError("fixture: unexpected script " + script[:40])
+
+
+def _cm_selenium_stub():
+    """Stand-in Selenium modules for the names the module imports. Returns
+    the previous sys.modules entries, for _cm_selenium_restore()."""
+    import types
+    names = ["selenium", "selenium.webdriver", "selenium.webdriver.common",
+             "selenium.webdriver.common.by", "selenium.webdriver.support",
+             "selenium.webdriver.support.ui",
+             "selenium.webdriver.support.expected_conditions"]
+    saved = {n: sys.modules.get(n) for n in names}
+    mods = {n: types.ModuleType(n) for n in names}
+
+    class By:
+        ID, NAME, XPATH = "id", "name", "xpath"
+
+    class WebDriverWait:
+        def __init__(self, driver, timeout):
+            self.driver = driver
+
+        def until(self, cond):
+            return cond(self.driver)
+
+    class Select:
+        def __init__(self, el):
+            raise AssertionError("fixture: no single select here")
+
+    ec = mods["selenium.webdriver.support.expected_conditions"]
+    ec.presence_of_element_located = (
+        lambda loc: (lambda d: d.find_element(*loc)))
+    mods["selenium.webdriver.common.by"].By = By
+    mods["selenium.webdriver.support.ui"].WebDriverWait = WebDriverWait
+    mods["selenium.webdriver.support.ui"].Select = Select
+    mods["selenium.webdriver.support"].expected_conditions = ec
+    sys.modules.update(mods)
+    return saved
+
+
+def _cm_selenium_restore(saved):
+    for n, m in saved.items():
+        if m is None:
+            sys.modules.pop(n, None)
+        else:
+            sys.modules[n] = m
+
+
+# A value shaped like an HTML field's: a comment first, then markup, one
+# line holding only a tab, and more markup after it. The field after it on
+# the page is a one-line input.
+_CM_OLD = "<div><h2>About</h2>\n<p>Text.</p>\n\t\n<h3>Help</h3></div>"
+_CM_NEW = "<!-- a note -->\n" + _CM_OLD
+_CM_BASE = "https://dc.example.edu"
+
+
+def _cm_fields():
+    return {"intro": ("textarea", _CM_OLD), "title": ("input", "A title")}
+
+
+def _cm_module(problems):
+    label = "modules/dc_config_manager.py"
+    try:
+        return _index_import(label)
+    except Exception as e:                           # pragma: no cover
+        problems.append("{}: could not be imported: {}".format(label, e))
+        return None
+
+
+class _CMClock:
+    """The module's clock in these checks: time passes only when the
+    module sleeps, so how a wait ends never depends on how fast the machine
+    running the checks is. (With the real clock and 50 ms waits, a loaded
+    machine could run out of time between two looks and turn a clean save
+    into UNKNOWN.)"""
+
+    def __init__(self):
+        self.now = 1.0e9
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += max(0.0, seconds)
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+class _cm_fast:
+    """Selenium stubbed and the module's clock replaced (_CMClock), for
+    the length of a check; the module's own wait limits are kept."""
+
+    def __init__(self, M):
+        self.M = M
+
+    def __enter__(self):
+        self.saved = _cm_selenium_stub()
+        self.sleep = time.sleep
+        time.sleep = lambda s: None
+        self.clock = self.M.time
+        self.M.time = _CMClock()
+        return self
+
+    def __exit__(self, *exc):
+        time.sleep = self.sleep
+        self.M.time = self.clock
+        _cm_selenium_restore(self.saved)
+        return False
+
+
+def _cm_one(M, server, diffs, regen=True):
+    driver = _CMDriver(M, server)
+    with contextlib.redirect_stdout(io.StringIO()):
+        M.begin_run_log()
+        status, back = M._apply_one(driver, _CM_BASE, "example-etd",
+                                    diffs, regen)
+    return status, back, M.run_log_text()
+
+
+def check_config_apply(problems):
+    """The Configuration Manager's Apply, driven (see the note above)."""
+    M = _cm_module(problems)
+    if M is None:
+        return 0
+    cases = 0
+    with _cm_fast(M):
+        # 1. A value holding a tab and line breaks, the hidden Save Changes
+        #    button first, a page that settles on the third look: saved
+        #    whole, the next field untouched, regenerated.
+        server = _CMServer(_cm_fields(), buttons=((False, False),
+                                                  (True, True)))
+        status, back, _l = _cm_one(M, server, [("intro", _CM_OLD, _CM_NEW)])
+        cases += 1
+        if server.stored["intro"][1] != _CM_NEW:
+            problems.append("config apply: after a value holding a tab and "
+                            "line breaks was applied, the field holds {} "
+                            "character(s), not the planned {}".format(
+                                len(server.stored["intro"][1]), len(_CM_NEW)))
+        if server.stored["title"][1] != "A title":
+            problems.append("config apply: the field after the one changed "
+                            "was changed too")
+        if server.saves != 1 or status != "Saved + regenerated":
+            problems.append("config apply: a clean save gave {} save(s) and "
+                            "status {!r}".format(server.saves, status))
+        if "intro: saved as planned" not in back:
+            problems.append("config apply: the Read Back for a clean save "
+                            "was {!r}".format(back))
+
+        # 2. A line break planned for a one-line field: the form drops it,
+        #    the read-back sees that, and nothing is saved.
+        server = _CMServer(_cm_fields())
+        status, back, _l = _cm_one(M, server,
+                                   [("title", "A title", "Two\nlines")])
+        cases += 1
+        if server.saves or not status.startswith("NOT SAVED"):
+            problems.append("config apply: a value the form cannot hold gave "
+                            "{} save(s) and status {!r}".format(server.saves,
+                                                               status))
+        if "cannot hold a line break" not in back:
+            problems.append("config apply: the Read Back did not say why: "
+                            "{!r}".format(back))
+
+        # 3. The server keeps something other than what was sent: the page
+        #    read back says so, and the structure is not regenerated.
+        server = _CMServer(_cm_fields(), keep=lambda form: dict(
+            form, intro="<p>Text.</p><magic ignore></magic>"))
+        status, back, _l = _cm_one(M, server, [("intro", _CM_OLD, _CM_NEW)])
+        cases += 1
+        if status != "NOT AS PLANNED (not regenerated)" or server.regens:
+            problems.append("config apply: a save the server changed gave "
+                            "status {!r} and {} regeneration(s)".format(
+                                status, server.regens))
+        if "changed, NOT as planned" not in back:
+            problems.append("config apply: the Read Back for a changed save "
+                            "was {!r}".format(back))
+
+        # 4. Only a hidden Save Changes button: nothing pressed or saved.
+        server = _CMServer(_cm_fields(), buttons=((False, False),))
+        status, back, _l = _cm_one(M, server, [("intro", _CM_OLD, _CM_NEW)])
+        cases += 1
+        if server.saves or not status.startswith("NOT SAVED (no Save "
+                                                 "Changes button shown"):
+            problems.append("config apply: with no Save Changes button shown "
+                            "it gave {} save(s) and status {!r}".format(
+                                server.saves, status))
+
+        # 5. Saved, then the page cannot be read back: unknown, never "not
+        #    saved", and not regenerated.
+        server = _CMServer(_cm_fields(), unreadable_after_save=True)
+        status, back, _l = _cm_one(M, server, [("intro", _CM_OLD, _CM_NEW)])
+        cases += 1
+        if not status.startswith("UNKNOWN") or server.regens:
+            problems.append("config apply: a page unreadable after saving "
+                            "gave status {!r} and {} regeneration(s)".format(
+                                status, server.regens))
+
+        # 6. The worker, two structures: one the server changes, one whose
+        #    page raises a Selenium-style message. The summary counts what
+        #    the pages hold, the log carries no stack trace, and the update
+        #    log has its Read Back column.
+        server = _CMServer(_cm_fields(), keep=lambda form: dict(
+            form, intro="<p>Text.</p>"))
+        bad = _CMServer(_cm_fields())
+        bad.raise_on_get = True
+        driver = _CMDriver(M, {"example-etd": server, "example-bad": bad})
+        M._attach_or_fail = lambda session: driver
+        M.PLAN = {"items": [
+            ("example-etd", "ETD", [("intro", _CM_OLD, _CM_NEW)]),
+            ("example-bad", "ETD", [("intro", _CM_OLD, _CM_NEW)])],
+            "report_version": M.STATE["report"]["version"]}
+        with tempfile.TemporaryDirectory() as tmp:
+            with contextlib.redirect_stdout(io.StringIO()):
+                M.begin_run_log()
+                M.apply_worker({"base_url": _CM_BASE}, tmp, True)
+            cases += 1
+            summary = M.STATE.get("summary", "")
+            logged = M.run_log_text()
+            if ("0 of 2 structure(s) saved as planned" not in summary
+                    or "1 changed NOT as planned" not in summary
+                    or "updated" in summary.split("→")[0]):
+                problems.append("config apply: the worker's summary was {!r}"
+                                .format(summary))
+            if "Stacktrace" in logged or "Session info" in logged:
+                problems.append("config apply: a stack trace reached the log")
+            if M.STATE.get("outcome") == "green":
+                problems.append("config apply: a run that saved nothing as "
+                                "planned finished green")
+            books = [f for f in os.listdir(tmp)
+                     if f.startswith("DC_Config_UpdateLog_")]
+            if len(books) != 1:
+                problems.append("config apply: {} update log(s) written"
+                                .format(len(books)))
+            else:
+                from openpyxl import load_workbook
+                wb = load_workbook(os.path.join(tmp, books[0]))
+                rows = [list(r) for r in wb.active.iter_rows(
+                    values_only=True)]
+                head = rows[0]
+                if "Read Back" not in head or "Status" not in head:
+                    problems.append("config apply: the update log's columns "
+                                    "are {!r}".format(head))
+                else:
+                    s, r = head.index("Status"), head.index("Read Back")
+                    got = [(row[s], row[r] or "") for row in rows[1:]]
+                    if (len(got) != 2
+                            or not got[0][0].startswith("NOT AS PLANNED")
+                            or "changed, NOT as planned" not in got[0][1]
+                            or not got[1][0].startswith(
+                                "ERROR before Save Changes")):
+                        problems.append("config apply: the update log rows "
+                                        "were {!r}".format(got))
+    return cases
+
+
+def check_config_settle(problems):
+    """The Configuration Manager waits for each page's scripts, reads a
+    multiple-choice list as its items, never applies one, and presses Save
+    Changes a second time only when the first changed nothing (see the
+    note above check_config_apply)."""
+    M = _cm_module(problems)
+    if M is None:
+        return 0
+    cases = 0
+    with _cm_fast(M):
+        # 7. Reading: the placeholder is never a value; the widget's listed
+        #    items are; another multiple list is its selected options.
+        def page(sel):
+            return ('<div id="user-config"><form>{}</form></div>'
+                    .format(sel))
+        widget = ('<select class="selectedMultiSelectOptions" name="d" '
+                  'multiple="multiple">{}</select>')
+        plain = ('<select name="p" multiple="multiple"><option value="1">'
+                 'One</option><option value="2" selected>Two</option>'
+                 '</select>')
+        before = M.extract_fields(page(widget.format(
+            '<option value="">Placeholder text</option>')))[0]
+        emptied = M.extract_fields(page(widget.format(
+            '<option value=""></option>')))[0]
+        after = M.extract_fields(page(widget.format(
+            '<option value="7">Alpha</option><option value="9">Beta'
+            '</option>') + plain))[0]
+        cases += 1
+        if before.get("d") != "" or emptied.get("d") != "":
+            problems.append("config settle: an unloaded list read as {!r}, "
+                            "a loaded empty one as {!r}".format(
+                                before.get("d"), emptied.get("d")))
+        if after.get("d") != "Alpha; Beta" or after.get("p") != "Two":
+            problems.append("config settle: multiple lists read as {!r} and "
+                            "{!r}".format(after.get("d"), after.get("p")))
+        if M.multi_fields(page(widget.format("") + plain)) != {"d", "p"}:
+            problems.append("config settle: multi_fields found {!r}".format(
+                M.multi_fields(page(widget.format("") + plain))))
+
+        # 8. A covered window: the Save bar is never marked ready and its
+        #    button never drawn, and the press still saves, once.
+        server = _CMServer(_cm_fields(), covered=True,
+                           buttons=((False, False), (True, True)))
+        status, back, _l = _cm_one(M, server, [("intro", _CM_OLD, _CM_NEW)])
+        cases += 1
+        if (status != "Saved + regenerated" or server.saves != 1
+                or server.clicks != 1):
+            problems.append("config settle: in a covered window the status "
+                            "was {!r}, {} click(s), {} save(s)".format(
+                                status, server.clicks, server.saves))
+
+        # 8c. A slow answer to the press: waited for, and saved as planned.
+        server = _CMServer(_cm_fields(), answer_polls=6)
+        status, back, _l = _cm_one(M, server, [("intro", _CM_OLD, _CM_NEW)])
+        cases += 1
+        if status != "Saved + regenerated" or server.saves != 1:
+            problems.append("config settle: a slow answer to Save Changes "
+                            "gave status {!r}, {} save(s)".format(
+                                status, server.saves))
+
+        # 8d. No answer at all: UNKNOWN, one press, no read-back as NOT SAVED.
+        server = _CMServer(_cm_fields(), never_answers=True)
+        status, back, _l = _cm_one(M, server, [("intro", _CM_OLD, _CM_NEW)])
+        cases += 1
+        if not status.startswith("UNKNOWN") or server.clicks != 1:
+            problems.append("config settle: an unanswered Save Changes gave "
+                            "status {!r}, {} click(s)".format(status,
+                                                             server.clicks))
+
+        # 8a. An older page: one Save Changes button, shown, no Save bar.
+        server = _CMServer(_cm_fields(), buttons=((True, False),))
+        status, back, _l = _cm_one(M, server, [("intro", _CM_OLD, _CM_NEW)])
+        cases += 1
+        if status != "Saved + regenerated" or server.saves != 1:
+            problems.append("config settle: a page without a Save bar gave "
+                            "status {!r}, {} save(s)".format(status,
+                                                             server.saves))
+
+        # 8b. A page whose disciplines list never loads: nothing set,
+        #     nothing pressed, nothing saved, and it says why.
+        server = _CMServer(_cm_fields(), never="list")
+        status, back, _l = _cm_one(M, server, [("intro", _CM_OLD, _CM_NEW)])
+        cases += 1
+        if (status != "NOT SAVED (the page did not finish loading)"
+                or server.saves or server.clicks):
+            problems.append("config settle: a page that never settled gave "
+                            "status {!r}, {} click(s), {} save(s)".format(
+                                status, server.clicks, server.saves))
+
+        # 9. A press that changes nothing, with every field unchanged: one
+        #    more try, which saves; both presses on the record.
+        server = _CMServer(_cm_fields(), ignore_clicks=1)
+        status, back, logged = _cm_one(M, server,
+                                       [("intro", _CM_OLD, _CM_NEW)])
+        cases += 1
+        if (status != "Saved + regenerated" or server.saves != 1
+                or server.clicks != 2):
+            problems.append("config settle: after a press that did nothing "
+                            "the status was {!r}, {} click(s), {} save(s)"
+                            .format(status, server.clicks, server.saves))
+        if "trying once more" not in logged or "pressed twice" not in back:
+            problems.append("config settle: the second press is not on the "
+                            "record ({!r})".format(back))
+
+        # 10. A press that saved something without a new page: no second
+        #     press, whatever the page held.
+        server = _CMServer(_cm_fields(), saves_in_place=True,
+                           keep=lambda form: dict(form, intro="<p>X</p>"))
+        status, back, _l = _cm_one(M, server, [("intro", _CM_OLD, _CM_NEW)])
+        cases += 1
+        if server.clicks != 1 or server.saves != 1 or not status.startswith(
+                "NOT AS PLANNED"):
+            problems.append("config settle: a save without a new page gave "
+                            "{} click(s), {} save(s), status {!r}".format(
+                                server.clicks, server.saves, status))
+
+        # 11a. A press that brought a new page but changed nothing: no
+        #      second press — the server answered.
+        server = _CMServer(_cm_fields(), keep=lambda form: dict(
+            form, intro=_CM_OLD))
+        status, back, _l = _cm_one(M, server, [("intro", _CM_OLD, _CM_NEW)])
+        cases += 1
+        if server.clicks != 1 or status != "NOT SAVED (not regenerated)":
+            problems.append("config settle: a press answered with no change "
+                            "gave {} click(s), status {!r}".format(
+                                server.clicks, status))
+
+        # 11. A plan holding only a multiple-choice list: never changed.
+        server = _CMServer(_cm_fields(), disciplines=["Alpha"])
+        status, back, _l = _cm_one(M, server,
+                                   [("disciplines", "Alpha", "")])
+        cases += 1
+        if (server.saves or server.clicks
+                or not status.startswith("NOT SAVED (no field could be set")
+                or "multiple-choice" not in back):
+            problems.append("config settle: a multiple-choice change gave "
+                            "status {!r}, {!r}, {} save(s)".format(
+                                status, back, server.saves))
+
+        # 12. The dry run over three structures: one with a real change, one
+        #     whose disciplines never load, one whose disciplines differ.
+        site = {"example-a": _CMServer(_cm_fields(), covered=True),
+                "example-b": _CMServer(_cm_fields(), never="list"),
+                "example-c": _CMServer(_cm_fields(),
+                                       disciplines=["Physical Science"])}
+        driver = _CMDriver(M, site)
+        M._attach_or_fail = lambda session: driver
+        sheet = {"title": "A title", "disciplines": ""}
+        M.UPD_MODEL = {
+            "types": {"ETD": ["example-a", "example-b", "example-c"]},
+            "rows": {"ETD": {"example-a": dict(sheet, intro=_CM_NEW),
+                             "example-b": dict(sheet, intro=_CM_OLD),
+                             "example-c": dict(sheet, intro=_CM_OLD)}},
+            "fields": {"ETD": ["intro", "title", "disciplines"]},
+            "source": "fixture"}
+        with tempfile.TemporaryDirectory() as tmp:
+            with contextlib.redirect_stdout(io.StringIO()):
+                M.begin_run_log()
+                M.dryrun_worker({"base_url": _CM_BASE}, tmp, ["ETD"])
+            cases += 1
+            summary = M.STATE.get("summary", "")
+            logged = M.run_log_text()
+            planned = {c: d for c, _l, d in (M.PLAN or {}).get("items", [])}
+            if (set(planned) != {"example-a", "example-c"}
+                    or [f for f, _o, _n in planned["example-a"]] != ["intro"]
+                    or planned["example-c"]):
+                problems.append("config settle: the dry run planned {!r}"
+                                .format(planned))
+            for want in ("1 proposed change(s)", "1 structure(s) not checked",
+                         "1 difference(s) in multiple-choice lists"):
+                if want not in summary:
+                    problems.append("config settle: the dry run's summary "
+                                    "lacks {!r}: {!r}".format(want, summary))
+            if "WARNING: 'example-b'" not in logged:
+                problems.append("config settle: no warning for the page that "
+                                "never settled")
+            if M.STATE.get("outcome") != "amber":
+                problems.append("config settle: the dry run finished {!r}"
+                                .format(M.STATE.get("outcome")))
+
+        # 13. The scrape over two structures in a covered window: one whose
+        #     disciplines list two items, one whose list never loads.
+        site = {"example-a": _CMServer(_cm_fields(), covered=True,
+                                       disciplines=["Physical Science",
+                                                    "Life Science"]),
+                "example-b": _CMServer(_cm_fields(), covered=True,
+                                       never="list")}
+        driver = _CMDriver(M, site)
+        M._attach_or_fail = lambda session: driver
+        M.SCRAPE_MODEL = {"types": {"ETD": ["example-a", "example-b"]},
+                          "source": "fixture"}
+        with tempfile.TemporaryDirectory() as tmp:
+            with contextlib.redirect_stdout(io.StringIO()):
+                M.begin_run_log()
+                M.scrape_worker({"base_url": _CM_BASE}, tmp, ["ETD"])
+            cases += 1
+            summary = M.STATE.get("summary", "")
+            if ("1 of 2 structure(s) scraped" not in summary
+                    or "1 not recorded" not in summary):
+                problems.append("config settle: the scrape's summary was {!r}"
+                                .format(summary))
+            if M.STATE.get("outcome") != "amber":
+                problems.append("config settle: the scrape finished {!r}"
+                                .format(M.STATE.get("outcome")))
+            books = [f for f in os.listdir(tmp)
+                     if f.startswith("DC_Config_Report_")]
+            if len(books) != 1:
+                problems.append("config settle: {} report(s) written"
+                                .format(len(books)))
+            else:
+                from openpyxl import load_workbook
+                wb = load_workbook(os.path.join(tmp, books[0]))
+                rows = [list(r) for r in wb["ETD"].iter_rows(
+                    values_only=True)]
+                head = rows[0]
+                got = [(r[0], r[head.index("disciplines")]
+                        if "disciplines" in head else None)
+                       for r in rows[1:]]
+                if got != [("example-a", "Physical Science; Life Science")]:
+                    problems.append("config settle: the report's rows were "
+                                    "{!r}".format(got))
+    return cases
+
+
+
+def check_config_readback(problems):
+    """Apply describes the page that answered Save Changes and, after a
+    press that brought a new page, reads a page that does not yet show the
+    save again, logging each read (see the note above check_config_apply).
+    """
+    M = _cm_module(problems)
+    if M is None:
+        return 0
+    cases = 0
+    diffs = [("intro", _CM_OLD, _CM_NEW)]
+    with _cm_fast(M):
+        # 19. The first read after the save lags it; the second shows it:
+        #     Saved, one press, the reads stop there, regenerated, and the
+        #     answering page and the regeneration are in the log.
+        server = _CMServer(_cm_fields(), stale_reads=1)
+        status, back, logged = _cm_one(M, server, diffs)
+        cases += 1
+        if (status != "Saved + regenerated" or server.saves != 1
+                or server.clicks != 1 or server.regens != 1):
+            problems.append("config readback: a save the first read lagged "
+                            "gave status {!r}, {} save(s), {} click(s), {} "
+                            "regeneration(s)".format(status, server.saves,
+                                                     server.clicks,
+                                                     server.regens))
+        for want in ("read 1 of the page shows intro unchanged — reading "
+                     "it again in 2 s",
+                     "read 2, after waiting 2 s, shows intro saved as "
+                     "planned",
+                     'Save Changes was answered with the page "Configuration '
+                     'Tools"', "whose form shows intro saved as planned",
+                     "'example-etd': regeneration requested."):
+            if want not in logged:
+                problems.append("config readback: the log lacks {!r}"
+                                .format(want))
+        if "read 3" in logged:
+            problems.append("config readback: it read again after a read "
+                            "showed the save")
+        if "saved as planned only at read 2, after waiting 2 s" not in back:
+            problems.append("config readback: the Read Back was {!r}"
+                            .format(back))
+
+        # 20. Every read lags: four reads, NOT SAVED, one press, not
+        #     regenerated.
+        server = _CMServer(_cm_fields(), stale_reads=99)
+        status, back, logged = _cm_one(M, server, diffs)
+        cases += 1
+        if (status != "NOT SAVED (not regenerated)" or server.clicks != 1
+                or server.regens or server.config_gets != 5):
+            problems.append("config readback: a save no read showed gave "
+                            "status {!r}, {} click(s), {} regeneration(s), "
+                            "{} page load(s)".format(status, server.clicks,
+                                                     server.regens,
+                                                     server.config_gets))
+        if ("read 4, after waiting 10 s, shows intro unchanged" not in logged
+                or "read 5" in logged):
+            problems.append("config readback: the reads logged were not "
+                            "four: {!r}".format(logged[-400:]))
+
+        # 21. A press that brought no new page is not read again (the one
+        #     second press covers that).
+        server = _CMServer(_cm_fields(), saves_in_place=True, stale_reads=1)
+        status, back, logged = _cm_one(M, server, diffs)
+        cases += 1
+        if "reading it again" in logged:
+            problems.append("config readback: a press that brought no new "
+                            "page was read again")
+
+        # 22. A further read that cannot be made: the status stays the one
+        #     read before it, and the log says so.
+        server = _CMServer(_cm_fields(), stale_reads=99, fail_get_at=3)
+        try:
+            status, back, logged = _cm_one(M, server, diffs)
+        except Exception as e:
+            status, back, logged = "raised " + repr(e)[:80], "", ""
+        cases += 1
+        if (status != "NOT SAVED (not regenerated)"
+                or "read 2 could not be made" not in logged
+                or "the status is from read 1" not in logged
+                or "Stacktrace" in logged):
+            problems.append("config readback: a further read that failed "
+                            "gave status {!r}; log {!r}".format(
+                                status, logged[-300:]))
+    return cases
+
+
+CM_SCAN_NODE = r"""
+const loadedPath={inventory:'',report:''};
+let RESP=null, MSG='';
+async function api(u,b){ return RESP; }
+function flashErr(m){ MSG='ERR:'+m; }
+function flash(m){ MSG='OK:'+m; }
+function Option(t,v){ return {text:t,value:v}; }
+function mkSel(){ return {opts:[],_v:null,disabled:false,
+  set innerHTML(x){ this.opts=[]; this._v=null; },
+  append(o){ this.opts.push(o); },
+  get value(){ return this._v!==null ? this._v : (this.opts[0]?this.opts[0].value:''); },
+  set value(v){ this._v=v; }}; }
+const load={disabled:false};
+"""
+
+CM_SCAN_DRIVE = r"""
+(async ()=>{
+  const out=[];
+  const sel=mkSel();
+  RESP={ok:true,j:{files:[],pattern:'DC_URL_Inventory_*.xlsx'}};
+  await doScan('inventory','/x',sel,load,'inventories');
+  out.push('empty='+MSG);
+  RESP={ok:true,j:{files:[{name:'new.xlsx',path:'/x/new.xlsx',modified:'2'},
+                          {name:'old.xlsx',path:'/x/old.xlsx',modified:'1'}]}};
+  noteLoaded({targets:{path:''},report:{path:'/x/old.xlsx'}});
+  await doScan('report','/x',sel,load,'config reports');
+  out.push('kept='+sel.value);
+  noteLoaded({targets:{},report:{loaded:false}});
+  await doScan('report','/x',sel,load,'config reports');
+  out.push('none='+sel.value);
+  console.log(out.join(' | '));
+})();
+"""
+
+
+def check_config_scan(node_bin, problems):
+    """The Configuration Manager's Scan names what it looked for, and keeps
+    the loaded workbook selected (doScan and noteLoaded driven in node,
+    poll() checked to call noteLoaded); /api/load puts the workbook's path
+    in the state the page polls (driven over the module's own server)."""
+    label = "modules/dc_config_manager.py"
+    html = page_html(label, "PAGE")
+    src = SCRIPT_RE.findall(html or "")
+    src = "\n".join(src)
+    fns = [_js_function(src, "noteLoaded"), _js_function(src, "doScan"),
+           _js_function(src, "poll")]
+    if None in fns:
+        problems.append("config scan: noteLoaded, doScan or poll not found "
+                        "in the page")
+        return 0
+    if "noteLoaded(s)" not in fns[2]:
+        # Text, not behavior: poll() needs the whole page to run.
+        problems.append("config scan: poll() does not call noteLoaded(s)")
+    code = CM_SCAN_NODE + fns[0] + "\nasync " + fns[1] + "\n" + CM_SCAN_DRIVE
+    try:
+        out = subprocess.run([node_bin, "-e", code], capture_output=True,
+                             text=True, encoding="utf-8", timeout=20)
+        got = out.stdout.strip()
+    except Exception as e:                           # pragma: no cover
+        problems.append("config scan: node failed: {}".format(e))
+        return 0
+    want = ("empty=ERR:No DC_URL_Inventory_*.xlsx workbooks in that folder. "
+            "To load a config report, choose Update configurations first. | "
+            "kept=/x/old.xlsx | none=/x/new.xlsx")
+    if got != want:
+        problems.append("config scan: the page gave {!r} ({})".format(
+            got, out.stderr.strip()[-200:]))
+
+    from http.server import ThreadingHTTPServer
+    import threading
+    M = _cm_module(problems)
+    if M is None:
+        return 1
+    session = M.load_session(Path("/nonexistent/session.json"))
+    session["hub_url"] = "http://127.0.0.1:8750"
+    with tempfile.TemporaryDirectory() as tmp:
+        book = os.path.join(tmp, "DC_Config_Report_fixture.xlsx")
+        M.write_config_workbook(book, {"ETD": [("example-a", {"intro": "x"})]},
+                                _CM_BASE, "333333")
+        srv = ThreadingHTTPServer(("127.0.0.1", 0),
+                                  M.make_handler(session,
+                                                 M.build_page(session)))
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            port = srv.server_address[1]
+            with contextlib.redirect_stdout(io.StringIO()):
+                code1, _b = _http(port, "/api/load",
+                                  {"kind": "report", "path": book})
+            code2, body = _http(port, "/api/state")
+            state = json.loads(body) if code2 == 200 else {}
+            code3, body3 = _http(port, "/api/scan",
+                                 {"kind": "inventory", "folder": tmp})
+            scan = json.loads(body3) if code3 == 200 else {}
+        finally:
+            srv.shutdown()
+    if code1 != 200 or state.get("report", {}).get("path") != book:
+        problems.append("config scan: after /api/load the state's report "
+                        "path was {!r} (load {})".format(
+                            state.get("report", {}).get("path"), code1))
+    if scan.get("pattern") != "DC_URL_Inventory_*.xlsx":
+        problems.append("config scan: /api/scan answered {!r}".format(scan))
+    return 2
+
+
 def main():
     node_bin = shutil.which("node")
     if not node_bin:
@@ -2042,6 +3685,12 @@ def main():
     group = check_log_blocks(served, problems)
     check_poll_reports_state(group, problems)
     check_log_block_in_node(node_bin, group, problems)
+    check_log_copy_in_node(node_bin, group, problems)
+    check_log_spacing(group, problems)
+    statused = check_status_lines(node_bin, group, problems)
+    check_download_phase_word(node_bin, group, problems)
+    check_chrome_commands(node_bin, problems)
+    check_counts_of_one(problems)
     check_tones(node_bin, group, problems)
     with contextlib.redirect_stdout(io.StringIO()):
         check_forms(node_bin, group, problems)
@@ -2061,9 +3710,17 @@ def main():
     win_csharp = check_browse_windows_compile(browsers, problems)
     pickers = check_pick_blocks(served, problems)
     check_pick_in_node(node_bin, pickers, problems)
+    readers = check_index(problems)
+    check_batch_history(problems)
+    applied = check_config_apply(problems)
+    applied += check_config_settle(problems)
+    applied += check_config_readback(problems)
+    scanned = check_config_scan(node_bin, problems)
 
     print("Served pages — verification")
     print("  pages checked: {}".format(len(PAGE_SOURCES)))
+    print("  status lines driven through each page's own poll(): {}"
+          .format(statused))
     print("  problems: {}".format(len(problems)))
     for p in problems:
         print("  FAIL  " + p)
@@ -2095,6 +3752,23 @@ def main():
               .format(len(pickers)))
         print("  block; each page's own list was driven in node: the")
         print("  checked parents by name, Remove, and Clear all.")
+        print("  {} module(s) that read the site-wide listing carry the one"
+              .format(len(readers)))
+        print("  DC-INDEX block; each read the Site index and the older")
+        print("  Contents of this site layout alike, and each worker named")
+        print("  what it saw with no listing and reported an unknown heading.")
+        print("  Batch revise reads its Spreadsheet History in both layouts.")
+        print("  The Configuration Manager's Apply was driven through {} cases"
+              .format(applied))
+        print("  with a browser that types like one and finishes its pages")
+        print("  with scripts: pages are read and clicked only once settled;")
+        print("  values are set, never typed, and read back before saving;")
+        print("  a multiple-choice list is read, never applied; and what the")
+        print("  page holds after saving is what the status and log say.")
+        print("  Its Scan names what it looked for and keeps the loaded")
+        print("  workbook selected ({} checks, in node and over its own"
+              .format(scanned))
+        print("  server).")
         print("  {} module(s) with a log carry the one DC-LOG block; each was".format(len(group)))
         print("  driven: Copy log is the whole run, Clear is refused during")
         print("  a run and keeps what is loaded, and one start of many wins.")

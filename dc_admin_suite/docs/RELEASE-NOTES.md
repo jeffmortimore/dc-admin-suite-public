@@ -1,5 +1,142 @@
 # Release notes
 
+## 1.0.8 — 2026-11-15
+
+Digital Commons changed its administrator pages, and the site-wide
+structure listing that six modules start from changed with them: the
+table is now captioned **Site index**, and its rows are headed by plural
+names (Communities, Journals, ETDs, Galleries, Series, Books,
+Conferences) where they were headed by type codes. Every run that began
+from the listing stopped at once with "Couldn't find the 'Contents of
+this site' table", though nothing was wrong with the login or the
+settings. Nothing was changed or downloaded by those runs.
+
+- **Both layouts are read**, by one shared block in every module that
+  reads the listing. Conferences are event communities, as before.
+- **A row heading the module does not know is reported** in the log, with
+  the number of structures under it, instead of being passed through as a
+  type no filter can select.
+- **When the listing is not on the page, the message says what was**: the
+  page's title and its table captions, then the possible causes. It no
+  longer asserts a login or settings problem it cannot see.
+
+The same change reached the pages the Batch File Downloader and the Batch
+Revise Manager read for each record and structure:
+
+- **Record listings** (series, ETDs, events, books) now sit inside an outer
+  layout table, which the downloader took for the listing: every such
+  structure read as having **no records**, without an error. Fixed; the
+  listing's "Next" link (which was ">") is followed too.
+- **The release option is no longer in the listing.** The downloader now
+  reads it from each record's Submission details page, where the structure
+  has one ("Release Option", or "Document Type and Release Option"): one
+  more administrator page per record, and the embargo date comes from the
+  same page. Structures without one (galleries, most series) are not asked
+  and their rows are marked n/a, as before. A record whose page will not
+  load is reported with unknown access; its files are unaffected.
+- **View revisions** puts the user, date and comment in one cell, and
+  "Show Previous" is now a menu. Both are read; revision dates read as
+  they did.
+- **Batch revise's Spreadsheet History** moved its identifier from the
+  table to a box around it, so generated spreadsheets could not be found
+  for download. Fixed.
+
+**The Configuration Manager's Apply no longer types values.** It entered
+each changed value one key at a time, so a tab character in a value moved
+to the next field, and a line break after it, in a one-line field, saved
+the form with the value half entered — while the run reported the
+structure as not updated. Now:
+
+- **Values are set in the form directly** and read back before anything is
+  saved; nothing is saved for a structure whose form will not hold a value
+  (a one-line field cannot hold a line break).
+- **After Save Changes the page is read again**, and the update log says
+  what it holds, field by field, in a new **Read Back** column. Each
+  structure's Status is Saved, PARTLY SAVED, NOT SAVED, NOT AS PLANNED or
+  UNKNOWN; "Fields Changed" is now "Fields Planned".
+- **A structure is regenerated only when every field was saved as
+  planned.**
+- **Each configuration page is read, set and saved only once its own
+  scripts have finished.** Before, a dry run could list a placeholder in
+  the disciplines list as a change on structures no one had edited. A
+  page that does not finish within 15 seconds is skipped and named in the
+  log.
+- **Save Changes is pressed by a script click on its button**, which
+  submits the form as the button does, and Apply waits for the page that
+  follows to finish loading before it reads the field back. Before, a press while the browser
+  window was covered by other windows could save nothing.
+- **A save that does not show at once is read again.** The page read
+  back right after Save Changes can still show the value from before the
+  save; Apply then reads it again after about 2, 5 and 10 seconds, logs
+  each read, and reports what the last read shows. The log also describes
+  the page that answered Save Changes, and says when a regeneration was
+  requested.
+- **The disciplines list is recorded as the disciplines it holds** and
+  compared by a dry run, but Apply never changes it: a difference is named
+  in the log and left out of the plan.
+- **A Save Changes press that changes nothing is tried once more**, and
+  only when every planned field reads back unchanged.
+- **Scan says what it looked for** when it finds nothing, and the
+  workbook list keeps the loaded workbook selected after a Scan.
+- **If you have applied changes to fields holding tab characters with an
+  earlier version,** run a dry run against the report you scraped before
+  to check them.
+
+**The status line and the log, in every module with a log:**
+
+- **Copy log is now Copy status and log.** It copies the status line
+  first, with each download link as its name and the file's full path,
+  then the whole log of the run. While a page is idle the status line is
+  only an instruction, so the log alone is copied.
+- **The status line moves on when a run ends.** In the Configuration
+  Manager it stayed on "Harvesting…" after a harvest; in the Batch Revise
+  Manager and the Structure Regenerator the idle line kept its first words
+  after a hierarchy, a queue or a folder was loaded. Each now shows what
+  to do next, and the Configuration Manager shows the harvest's summary.
+- **The status line is written only when it changes.** It is announced to
+  screen readers, and pages that rewrote it every second and a half could
+  have it read out again each time.
+- **A little more space between the log's buttons and the log.**
+
+**The Batch File Downloader:**
+
+- **It says Planning, not Downloading,** until the first file is
+  requested.
+- **Every record state's listing says how many records it holds,** or
+  that it holds none. Before, a count was logged only when a listing ran
+  to a second page.
+- **A re-run with nothing left to do finishes green,** saying why, instead
+  of showing a red error.
+- **A re-run pointed at a run folder names the folders inside it that hold
+  the plans and reports.** Each structure keeps its own in its own folder.
+- **The Chrome bridge line no longer lists Selenium's internals** when the
+  timeout is as asked.
+
+**The start page** gives Windows a **PowerShell** command beside the
+Command Prompt one, each with its own Copy button. The Command Prompt
+command's `%LOCALAPPDATA%` does not work in PowerShell.
+
+**Small:** "Regenerating 1 structure(s)", and a loaded workbook of one
+structure says "1 structure".
+
+Upgrading changes none of your settings.
+
+### What is in it
+
+| Module | Version |
+|---|---|
+| Structure URL Generator | 1.5.2 |
+| Hierarchy Mapping Tool | 1.5.2 |
+| Structure Regenerator | 1.6.2 |
+| Configuration Manager | 1.5.8 |
+| DOI & XML Generator | 1.10.1 |
+| Structure HTML Drafting Tool | 1.6.3 |
+| Batch Revise Manager | 1.6.3 |
+| Batch File Downloader | 1.41.1 |
+| OCR & Accessibility Toolkit | 1.13.1 |
+| Image Description Generator | 1.12.4 |
+| Shell (start page, settings, Main Menu) | 1.13.1 |
+
 ## 1.0.7 — 2026-11-01
 
 Text equivalents now say where their record is, and can be checked against

@@ -196,6 +196,16 @@ GENERIC_PROFILES_DIR = "profiles"
 GENERIC_KEEP_IN_PROFILES = ("README.md",)
 
 
+# The longest path a built copy may hold, counted from the copy's own root
+# (`dc_admin_suite/...`). Windows' built-in unzip stops with "Path too long"
+# once a full path passes 260 characters, and that count includes the
+# folder the zip is unzipped into and the zip's own top folder. A field
+# template whose name lists every structure type it applies to went over
+# it inside a OneDrive folder. 110 here leaves room for a top folder of
+# about 30 characters and an unzip folder of about 120.
+MAX_PATH_IN_COPY = 110
+
+
 def _skip(path: Path) -> bool:
     name = path.name
     if path.is_dir():
@@ -691,6 +701,7 @@ def _verify(folder: Path, generic: bool = False) -> list:
         problems.extend(_identity_problems(folder))
         problems.extend(_private_problems(folder))
     problems.extend(_stray_problems(folder, generic))
+    problems.extend(_long_path_problems(folder))
 
     # A copy that is not shaped like the repository is not shippable, however
     # clean its contents. Checked before anything else about the contents.
@@ -754,6 +765,28 @@ def _stray_problems(folder: Path, generic: bool = False) -> list:
             problems.append(
                 "{} is in the copy but not in the source — a stray {}{}"
                 .format(rel, kind, empty))
+    return problems
+
+
+def _long_path_problems(folder: Path) -> list:
+    """Every path in the copy longer than MAX_PATH_IN_COPY characters.
+
+    Counted as the path the copy's zip will hold, below its top folder,
+    with forward slashes. The destination's own `.git/` is not shipped
+    and is not counted.
+    """
+    problems = []
+    for path in sorted(folder.rglob("*")):
+        rel = path.relative_to(folder)
+        if rel.parts and rel.parts[0] == ".git":
+            continue
+        name = rel.as_posix()
+        if len(name) > MAX_PATH_IN_COPY:
+            problems.append(
+                "{} is {} characters long, over {} — Windows' built-in "
+                "unzip stops on a path over 260 characters, counting the "
+                "folder it unzips into; shorten the name".format(
+                    name, len(name), MAX_PATH_IN_COPY))
     return problems
 
 

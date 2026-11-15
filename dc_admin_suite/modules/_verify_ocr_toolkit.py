@@ -3019,9 +3019,12 @@ class _Drafts(object):
 class FigureRegions(_Quiet):
     """Where a Figure's content is drawn, from the content it marks."""
 
-    def regions(self, content, xobjects=None):
+    def regions(self, content, xobjects=None, pdf=None):
+        """The page is made in `pdf` when one is given: an XObject made in
+        one Pdf cannot go on a page of another (newer pikepdf raises
+        ForeignObjectError; older ones allowed it)."""
         P = _pikepdf
-        pdf = P.new()
+        pdf = pdf if pdf is not None else P.new()
         page = pdf.add_blank_page(page_size=(612, 792))
         page.Resources = P.Dictionary(XObject=P.Dictionary(xobjects or {}))
         page.Contents = pdf.make_stream(content)
@@ -3032,7 +3035,7 @@ class FigureRegions(_Quiet):
         pdf = P.new()
         r = self.regions(b"q 2 0 0 2 10 10 cm /F <</MCID 0>> BDC q 50 0 0 "
                          b"40 0 0 cm /Im0 Do Q EMC Q",
-                         {"/Im0": _image(pdf)})
+                         {"/Im0": _image(pdf)}, pdf=pdf)
         self.assertEqual([round(v) for v in r["box"]], [10, 10, 110, 90])
         self.assertEqual(r["kinds"], {"image"})
 
@@ -3044,7 +3047,7 @@ class FigureRegions(_Quiet):
         form.BBox = P.Array([0, 0, 10, 10])
         form.Matrix = P.Array([1, 0, 0, 1, 5, 5])
         r = self.regions(b"q 3 0 0 3 0 0 cm /F <</MCID 0>> BDC /Fm0 Do EMC Q",
-                         {"/Fm0": pdf.make_indirect(form)})
+                         {"/Fm0": pdf.make_indirect(form)}, pdf=pdf)
         self.assertEqual([round(v) for v in r["box"]], [15, 15, 45, 45])
 
     def test_a_painted_path_and_an_inline_image(self):

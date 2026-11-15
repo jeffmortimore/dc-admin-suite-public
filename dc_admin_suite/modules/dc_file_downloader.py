@@ -97,7 +97,7 @@ MANIFEST = {
     "id": "file-downloader",
     "name": "Batch File Downloader",
     "description": "Download primary, native, supplemental, hidden, and versioned files for selected structures, with per-structure reports.",
-    "version": "1.40.0",
+    "version": "1.41.1",
     "requires": ["selenium", "beautifulsoup4", "openpyxl"],
 }
 
@@ -185,7 +185,8 @@ FILE_TIMEOUT = 300
 # port=56920) ... read timeout=120" is chromedriver, not Digital Commons.
 DRIVER_COMMAND_TIMEOUT = 300
 MAX_LISTING_PAGES = 400            # hard cap per state crawl (safety)
-LISTING_PAGE_SIZE = 25             # rows Digital Commons serves per page
+LISTING_PAGE_SIZE = 15             # rows an EdiKit listing serves per page
+                                   # (25 until the late-2026 admin pages)
 
 # Rate limiting. Digital Commons throttles a sustained run: in one run
 # a 38-record gallery ran clean for 25 records and then answered HTTP 429
@@ -756,6 +757,10 @@ def timeout_report(actual, asked, levers: str, page_set) -> str:
                    "page may end the run at {:g}s".format(got, asked, got))
     page = ("page-load timeout set" if page_set is True
             else "page-load timeout " + str(page_set))
+    if got is not None and got >= asked and page_set is True:
+        # Which of Selenium's levers took is a detail for a fault, not for
+        # a connection that has what it asked for.
+        return "{}; {}".format(verdict, page)
     return "{}; {} (levers: {})".format(verdict, page, levers or "none")
 
 
@@ -813,13 +818,111 @@ def _soup(html: str):
         return BeautifulSoup(html, "html.parser")
 
 
-def find_cttypes_table(html: str):
-    """Return the <table class="cttypes"> captioned 'Contents of this site'."""
-    for tbl in _soup(html).find_all("table", class_="cttypes"):
+# ---- DC-INDEX 1 ------------------------------------------------------------
+# The site-wide structure listing (user_config.cgi?...&x_showall=1) is one
+# <table class="cttypes"> in both layouts Digital Commons has served: one
+# captioned "Contents of this site" whose row headers are structure codes
+# (ir_series, ...), and one captioned "Site index" whose row headers are
+# plural headings (Series, ...). Both are read. A row whose header is
+# neither is reported by index_unknown_headers(), never guessed at, and a
+# page without the table is described by what it showed.
+INDEX_CAPTIONS = ("site index", "contents of this site")
+INDEX_HEADINGS = {
+    "communities": "ir_community",
+    "journals": "ir_journal",
+    "etds": "ir_etd",
+    "galleries": "ir_gallery",
+    "series": "ir_series",
+    "books": "ir_book",
+    "conferences": "ir_event_community",
+}
+
+
+def _index_soup(html):
+    from bs4 import BeautifulSoup
+    try:
+        return BeautifulSoup(html, "lxml")
+    except Exception:
+        return BeautifulSoup(html, "html.parser")
+
+
+def find_cttypes_table(html):
+    """Return the site-wide listing table (either caption), or None."""
+    for tbl in _index_soup(html).find_all("table", class_="cttypes"):
         cap = tbl.find("caption")
-        if cap and "contents of this site" in cap.get_text(strip=True).lower():
+        text = " ".join(cap.get_text(" ", strip=True).split()).lower() \
+            if cap else ""
+        if any(c in text for c in INDEX_CAPTIONS):
             return tbl
     return None
+
+
+def index_row_code(header):
+    """The structure code a row header names: the code itself (the older
+    layout) or a plural heading (the newer). None when it is neither."""
+    h = " ".join(header.split())
+    if h.startswith("ir_"):
+        return h
+    return INDEX_HEADINGS.get(h.lower())
+
+
+def index_rows(table):
+    """[(code or None, header, [context, ...])] for each row of the table.
+    Sub-documents (a context with "/") and the platform itself (a context
+    starting "http") are skipped, per Digital Commons conventions."""
+    rows = []
+    for tr in table.find_all("tr"):
+        th, td = tr.find("th"), tr.find("td")
+        if not th or not td:
+            continue
+        header = " ".join(th.get_text(" ", strip=True).split())
+        ctxs = []
+        for a in td.find_all("a", href=True):
+            qs = parse_qs(urlparse(a["href"]).query)
+            for ctx in qs.get("context", []):
+                ctx = ctx.strip()
+                if (ctx and "/" not in ctx and not ctx.startswith("http")
+                        and ctx not in ctxs):
+                    ctxs.append(ctx)
+        rows.append((index_row_code(header), header, ctxs))
+    return rows
+
+
+def index_unknown_headers(html):
+    """[(header, count)] for rows with structures whose header names no
+    known structure type; [] when there are none or no table at all."""
+    table = find_cttypes_table(html)
+    if table is None:
+        return []
+    return [(h, len(c)) for code, h, c in index_rows(table)
+            if code is None and c]
+
+
+def index_unknown_note(header, count):
+    return ('A row of the site index is headed "{}", which is not a '
+            "structure type this module knows, so its {} structure(s) "
+            "cannot be chosen by type.".format(header, count))
+
+
+def index_missing_message(html):
+    """What to say when the listing table is not on the page: what the
+    page showed, then the possible causes, none of them asserted."""
+    soup = _index_soup(html)
+    title = " ".join(soup.title.get_text(" ", strip=True).split()) \
+        if soup.title else ""
+    caps = [" ".join(c.get_text(" ", strip=True).split())[:60]
+            for c in soup.find_all("caption")]
+    seen = ('The page served was titled "{}"'.format(title) if title
+            else "The page served had no title")
+    seen += ("; its table captions were " + ", ".join(
+        '"{}"'.format(c) for c in caps) if caps
+        else "; it had no captioned table")
+    return ("Couldn't find the structure listing (the site index) on the "
+            "listing page. {}. Check that you are logged in as an "
+            "administrator in the debug Chrome window and that the base URL "
+            "in Settings is correct; if both are, Digital Commons may have "
+            "changed this page.".format(seen))
+# ---- /DC-INDEX ---------------------------------------------------------------
 
 
 def session_still_open(driver, base_url, log=None):
@@ -864,24 +967,16 @@ def looks_like_login_page(html: str, current_url: str) -> bool:
 
 def extract_contexts(html: str):
     """Return {context: type_label} from the site-wide listing page, or None
-    if the 'Contents of this site' table is missing."""
+    if the site index table (DC-INDEX) is missing."""
     table = find_cttypes_table(html)
     if table is None:
         return None
 
     found = {}
-    for tr in table.find_all("tr"):
-        th, td = tr.find("th"), tr.find("td")
-        if not th or not td:
-            continue
-        code = th.get_text(strip=True)
-        label = CODE_TO_LABEL.get(code, code)
-        for a in td.find_all("a", href=True):
-            qs = parse_qs(urlparse(a["href"]).query)
-            for ctx in qs.get("context", []):
-                ctx = ctx.strip()
-                if ctx and "/" not in ctx and not ctx.startswith("http"):
-                    found.setdefault(ctx, label)
+    for code, header, ctxs in index_rows(table):
+        label = CODE_TO_LABEL.get(code, header)
+        for ctx in ctxs:
+            found.setdefault(ctx, label)
     return found
 
 
@@ -1027,8 +1122,17 @@ def _header_map(tr):
 
 def _find_listing_table(soup, required=("id", "title")):
     """Return (table, header_map) for the first table whose first row
-    carries the required header names, else (None, None)."""
+    carries the required header names, else (None, None).
+
+    A table that holds another table is skipped. Since the late-2026 admin
+    pages the whole EdiKit page sits inside an outer layout table, and that
+    table's first row holds every cell on the page — the listing's header
+    among them, at the wrong positions — so it was taken for the listing
+    and every row was skipped as not starting with an ID: zero records,
+    and a structure that has records reported as having none."""
     for tbl in soup.find_all("table"):
+        if tbl.find("table") is not None:
+            continue                     # a layout table, not the listing
         tr = tbl.find("tr")
         if tr is None:
             continue
@@ -1110,7 +1214,8 @@ def parse_edikit_listing(html: str):
         return None
     nxt = None
     for a in soup.find_all("a", href=True):
-        if a.get_text(strip=True) == ">":
+        text = a.get_text(strip=True)
+        if text == ">" or text.lower() == "next":   # ">" before late 2026
             nxt = a["href"]
             break
     return {"rows": _listing_rows(table, hmap), "next": nxt}
@@ -1124,7 +1229,11 @@ def parse_edikit_listing(html: str):
 # (an empty list = table present but no revision rows), or None when the
 # page has no #revision table (unexpected page / login bounce upstream).
 # "current" = this row's editor-selected "Select" radio is checked.
-# "show_prev" = this row's previous-version "Show" box is checked.
+# "show_prev" = this row's previous-version "Show" box is checked, or (the
+# late-2026 layout) its "Show Previous" select has Show selected.
+# Two layouts: the older puts user, comment and date in the first three
+# cells; the newer puts all three in one td.revision-details, as labelled
+# lines, and the file links from the second cell on.
 # ---------------------------------------------------------------------------
 _SKIP_ROW_RE = re.compile(
     r"^(user$|editor selected|note:|pdf versions listed)", re.IGNORECASE)
@@ -1185,11 +1294,15 @@ def parse_pickvers(html: str):
         cells = tr.find_all("td")
         if len(cells) < 3:
             continue
-        user = cells[0].get_text(strip=True)
-        if _SKIP_ROW_RE.match(user or ""):
-            continue
-        comment = cells[1].get_text(strip=True)
-        date = cells[2].get_text(strip=True)
+        details = tr.find("td", class_="revision-details")
+        if details is not None:
+            user, comment, date = _revision_details(details)
+        else:
+            user = cells[0].get_text(strip=True)
+            if _SKIP_ROW_RE.match(user or ""):
+                continue
+            comment = cells[1].get_text(strip=True)
+            date = cells[2].get_text(strip=True)
 
         files = []
         for a in tr.find_all("a", href=True):
@@ -1217,14 +1330,48 @@ def parse_pickvers(html: str):
 
         current = any(inp.has_attr("checked")
                       for inp in tr.find_all("input", {"type": "radio"}))
-        show_prev = any(inp.has_attr("checked")
-                        for inp in tr.find_all("input", {"type": "checkbox"}))
+        show_prev = (any(inp.has_attr("checked")
+                         for inp in tr.find_all("input", {"type": "checkbox"}))
+                     or _shows_previous(tr))
         if not (user or date or files):
             continue
         revs.append({"user": user, "comment": comment, "date": date,
                      "current": current, "show_prev": show_prev,
                      "files": files})
     return revs
+
+
+def _revision_details(td):
+    """(user, comment, date) from a late-2026 td.revision-details. The date
+    is its first span alone ("Sat Nov  7 15:15:00 2026"), the time zone
+    being a second span, so it reads as the older layout's date did."""
+    def line(cls):
+        return td.find(class_=cls)
+    user = date = comment = ""
+    el = line("revision-detail-user")
+    if el is not None and el.find("span") is not None:
+        user = el.find("span").get_text(strip=True)
+    el = line("revision-detail-date")
+    if el is not None and el.find("span") is not None:
+        date = el.find("span").get_text(strip=True)
+    el = line("revision-detail-comment")
+    if el is not None:
+        body = el.find("div")
+        comment = " ".join((body or el).get_text(" ", strip=True).split())
+        if body is None and comment.lower().startswith("comment:"):
+            comment = comment[len("comment:"):].strip()
+    return user, comment, date
+
+
+def _shows_previous(tr):
+    """True when the row's "Show Previous" select has Show selected."""
+    for sel in tr.find_all("select"):
+        if not str(sel.get("name") or "").startswith("x.show_previous"):
+            continue
+        for opt in sel.find_all("option"):
+            if opt.has_attr("selected"):
+                return str(opt.get("value") or "").upper() == "SHOW"
+    return False
 
 
 def label_versions(revs):
@@ -1375,6 +1522,52 @@ def parse_record_metadata(html: str):
             value = ""
         out.setdefault(label, value)
     return out
+
+
+def release_from_metadata(meta: dict):
+    """(present, value) for the row whose label names a release option,
+    case-insensitively: "Release Option" on one structure, "Document Type
+    and Release Option" on another (an ETD collection, where the value
+    reads as the old listing's Type column did: "Thesis (open access)").
+    `present` says the page HAS such a row, which is a fact about the
+    structure; `value` may still be ""."""
+    for label, value in (meta or {}).items():
+        if "release option" in " ".join(label.lower().split()):
+            return True, value
+    return False, ""
+
+
+def release_source(base_url, ctx, items, gallery, cookie, warn):
+    """Where a structure's release options come from, settled once per
+    structure: "listing", "details", "none" or "unread".
+
+    Before the late-2026 admin pages an ETD listing's Type column carried
+    "Thesis (open access)" and the like; that column is gone. The release
+    option is still on each record's Submission details page, so when no
+    listing row carries one, the FIRST record's details page is read: if it
+    has a Release Option row, every record's is read there ("details", one
+    more admin page per record); if not, the structure has none ("none",
+    rows n/a — a plain series, a gallery). A page that will not load is
+    "unread", and access stays unknown: not knowing is not the same as n/a.
+    `items` is [(item, state), ...]."""
+    if any((it.get("release") or "").strip() for it, _s in items):
+        return "listing"
+    if gallery or not items:
+        return "none"
+    art = items[0][0]["article"]
+    _throttle("page")
+    try:
+        meta = parse_record_metadata(
+            fetch_html(admin_record_url(base_url, ctx, art, gallery), cookie))
+    except LoginRequired:
+        raise
+    except Exception as e:
+        warn("could not read record {}'s Submission details page to learn "
+             "whether this structure has release options — {}; access is "
+             "reported unknown".format(art, describe_error(e)))
+        return "unread"
+    present, _value = release_from_metadata(meta)
+    return "details" if present else "none"
 
 
 def embargo_from_metadata(meta: dict) -> str:
@@ -2877,6 +3070,9 @@ STATE = {
     # phase says "running" and a second request sails straight through —
     # see _claim_run() for what that cost.
     "claimed": False,
+    # True once this run has made its first file request: until then the
+    # page words a download run as planning, not downloading.
+    "fetching": False,
     # Which process this is, for the cross-process run lock: a copy is
     # believed to hold a run only if it answers with this token.
     "run_lock_token": "",
@@ -3103,7 +3299,7 @@ CLEAR_RESETS = {"last_file": None, "report_file": None, "run_dir": None,
                 "verify": {"holding": False, "left": 0, "prompts": 0}}
 
 
-# ---- DC-LOG 1 -------------------------------------------------------------
+# ---- DC-LOG 2 -------------------------------------------------------------
 # The whole log of the current run, and Clear for a new run. Shared by
 # every module with a log and duplicated verbatim, because modules are
 # standalone: modules/_verify_pages.py fails if any copy differs.
@@ -3448,6 +3644,13 @@ _LAST_PROGRESS = [0, 0]
 def fail(msg: str):
     log("ERROR: " + msg)
     set_state(phase="error", summary=msg, paused=False)
+
+
+def finished(msg: str):
+    """A run that had nothing left to do: the state the operator asked
+    for, so done and green, never an error."""
+    log(msg)
+    set_state(phase="done", summary=msg, paused=False, outcome="green")
 
 
 def set_model(model):
@@ -5620,14 +5823,16 @@ def fetch_says(ctx):
     return lambda msg: log("'{}' — {}".format(ctx, msg))
 
 
-def showall_note(n_rows, page_size=None):
+def showall_note(n_rows, page_size=None, state=None):
     """The log line for a listing x_showall served in one page.
 
     v1.34.2: it said "saving about 1 page requests".
     """
     saved = n_rows // (page_size or LISTING_PAGE_SIZE)
-    return ("listing: {} record(s) in one page — x_showall worked, saving "
-            "about {} page request{}".format(n_rows, saved,
+    where = (" in the '{}' state".format(STATE_LABELS.get(state, state))
+             if state else "")
+    return ("listing: {} record(s){} in one page — x_showall worked, saving "
+            "about {} page request{}".format(n_rows, where, saved,
                                              "" if saved == 1 else "s"))
 
 
@@ -5670,6 +5875,7 @@ def fetch_one(fetcher, verify, url, native_url="", order=0, announce=None,
     — and otherwise raises exactly what the fetcher raised.
     """
     holds = 0
+    set_state(fetching=True)
     # v1.34: a long transfer reports its progress where the hold reports
     # its countdown — the same log, the same cadence (see Ticker).
     if hasattr(fetcher, "say"):
@@ -5870,10 +6076,9 @@ def map_worker(session, out_dir, report_dir=""):
         set_progress(0, 0, "Parsing structure table…")
         ctx_types = extract_contexts(html)
         if ctx_types is None:
-            return fail(
-                "Couldn't find the 'Contents of this site' table. Confirm "
-                "you're logged in as an administrator in the debug Chrome "
-                "window and that the base URL in Settings is correct.")
+            return fail(index_missing_message(html))
+        for header, count in index_unknown_headers(html):
+            log(index_unknown_note(header, count))
         if not ctx_types:
             return fail("No structures found on the listing page.")
 
@@ -6089,13 +6294,22 @@ def crawl_listing(base_url, ctx, gallery, state, cookie, first_html=None,
             # and a gallery would be credited with x_showall, which appears
             # only in the EdiKit URL. Neither is true, and a log line that
             # is not true is the defect this module spent a day removing.
+            #
+            # Every state that holds records says how many, one page or
+            # several: a count logged only for listings that ran to a second
+            # page left one-page states silent, and a staff test read the
+            # silence as records missing.
             if not gallery and pages == 1 and len(rows) > LISTING_PAGE_SIZE:
-                _note(showall_note(len(rows)))
-            elif pages > 1:
+                _note(showall_note(len(rows), state=state))
+            elif not rows:
+                _note("listing: no records in the '{}' state".format(
+                    STATE_LABELS.get(state, state)))
+            else:
                 # Not a request count: the first page of the first state
                 # comes from the driver navigation, not from urllib.
-                _note("listing: {} record(s) over {} page(s)"
-                      .format(len(rows), pages))
+                _note("listing: {} record(s) in the '{}' state{}".format(
+                    len(rows), STATE_LABELS.get(state, state),
+                    " over {} page(s)".format(pages) if pages > 1 else ""))
             break
         check_pause_stop()
         url = urljoin(url, nxt)
@@ -6126,7 +6340,11 @@ def plan_item_jobs(base_url, ctx, item, record_state, gallery, opts, cookie,
     art = item["article"]
 
     # ---- access state, and optionally the embargo date -------------------
-    # Access comes free with the listing. The embargo date does not: it
+    # Access came free with the listing until the late-2026 admin pages
+    # dropped its Type column; where a structure's records carry a release
+    # option only on their Submission details page (release_source() says
+    # "details"), it is read there, one page per record, and the embargo
+    # date comes from the same page. The embargo date otherwise does not: it
     # lives on the record's admin page, so it costs one extra request per
     # restricted record. That is why it is opt-in and why it is fetched
     # ONLY for records already flagged restricted — on the collection this
@@ -6137,14 +6355,35 @@ def plan_item_jobs(base_url, ctx, item, record_state, gallery, opts, cookie,
     # metadata page would not load is the partial-failure-becomes-total-
     # loss shape this module has already had four times.
     release = item.get("release", "")
-    access = item.get("access") or access_state(release)
-    embargo = ""
-    if opts.get("embargo") and access == ACCESS_RESTRICTED:
+    meta = None
+    if item.get("release_from") == "details" and not release:
         _throttle("page")
         try:
             meta = parse_record_metadata(
                 fetch_html(admin_record_url(base_url, ctx, art, gallery),
                            cookie))
+            _present, release = release_from_metadata(meta)
+            item["release"] = release
+            item["access"] = access_state(release)
+            if not release:
+                warn("item {}: its Submission details page states no "
+                     "release option; access is unknown".format(art))
+        except LoginRequired:
+            raise
+        except Exception as e:
+            meta = None
+            warn("item {}: could not read its release option — {}; access "
+                 "is reported unknown, and the record's files are "
+                 "unaffected".format(art, describe_error(e)))
+    access = item.get("access") or access_state(release)
+    embargo = ""
+    if opts.get("embargo") and access == ACCESS_RESTRICTED:
+        try:
+            if meta is None:
+                _throttle("page")
+                meta = parse_record_metadata(
+                    fetch_html(admin_record_url(base_url, ctx, art, gallery),
+                               cookie))
             embargo = embargo_from_metadata(meta)
             if not embargo:
                 warn("item {}: restricted, but its record page states no "
@@ -6662,7 +6901,7 @@ def download_worker(session, out_dir, scope_mode, parents_sel, opts,
 
     try:
         set_state(phase="starting", summary="", last_file=None,
-                  run_dir=None, paused=False,
+                  run_dir=None, paused=False, fetching=False,
                   # 1.0.2: the page words the phase by it
                   inventory=bool(opts.get("inventory")))
         driver = _attach_or_fail(session)
@@ -6767,7 +7006,7 @@ def download_worker(session, out_dir, scope_mode, parents_sel, opts,
             if _bounced:
                 master.append((s_idx, ctx, type_label, 0, 0, 0, len(warns),
                                "LOGIN REQUIRED", timestr, ""))
-                finish_master("session expired; {} of {} structures done"
+                finish_master("session expired; {} of {} structure(s) done"
                               .format(s_idx - 1, total))
                 return fail(
                     "Digital Commons session expired at '{}'. Log in inside "
@@ -6834,7 +7073,7 @@ def download_worker(session, out_dir, scope_mode, parents_sel, opts,
             except LoginRequired:
                 master.append((s_idx, ctx, type_label, 0, 0, 0, len(warns),
                                "LOGIN REQUIRED", timestr, ""))
-                finish_master("session expired; {} of {} structures done"
+                finish_master("session expired; {} of {} structure(s) done"
                               .format(s_idx - 1, total))
                 return fail(
                     "Digital Commons session expired at '{}'. Log in inside "
@@ -6881,10 +7120,27 @@ def download_worker(session, out_dir, scope_mode, parents_sel, opts,
             # plain document type is a fact about the structure, so it is
             # settled once, here, with every record in hand — not per row
             # and not per page.
-            if resolve_listing_access([it for it, _s in items]) == "type-only":
-                log("{}: this listing's Type column carries a document type, "
-                    "not a release option, so it says nothing about access. "
-                    "Rows are marked '{}'.".format(ctx, ACCESS_NA))
+            source = release_source(base_url, ctx, items, gallery, cookie,
+                                    warn)
+            if source == "details":
+                for it, _s in items:
+                    it["release_from"] = "details"
+                log("{}: its listing shows no release option, so each "
+                    "record's is read from its Submission details page (one "
+                    "more admin page per record).".format(ctx))
+            elif source == "unread":
+                pass                       # warned; access stays unknown
+            elif resolve_listing_access([it for it, _s in items]) == "type-only":
+                if source == "none" and not gallery:
+                    log("{}: neither its listing nor its first record's "
+                        "Submission details shows a release option, so "
+                        "access does not apply. Rows are marked '{}'."
+                        .format(ctx, ACCESS_NA))
+                elif source == "listing":
+                    log("{}: this listing's Type column carries a document "
+                        "type, not a release option, so it says nothing "
+                        "about access. Rows are marked '{}'."
+                        .format(ctx, ACCESS_NA))
 
             # -- per-item download loop -----------------------------------
             t_struct = time.time()          # this structure's own pace
@@ -7239,7 +7495,7 @@ def download_worker(session, out_dir, scope_mode, parents_sel, opts,
                 master.append((s_idx, ctx, type_label, len(items), n_files,
                                n_hidden, len(warns), "LOGIN REQUIRED",
                                timestr, report_name))
-                finish_master("session expired; {} of {} structures done"
+                finish_master("session expired; {} of {} structure(s) done"
                               .format(s_idx - 1, total))
                 return fail(
                     "Digital Commons session expired at '{}'. Log in inside "
@@ -8124,10 +8380,15 @@ def live_listing(base_url, ctx, gallery, states, cookie, warn=None):
                      "the plan's labels.".format(label, describe_error(e)))
             continue
         resolve_listing_access(rows)
+        # A listing with no release option anywhere (every listing since the
+        # late-2026 admin pages; a gallery; a plain series) says nothing
+        # about access, so it re-labels no row's access: an absent reading
+        # is not a reading of n/a. reconcile_rows() skips empty values.
+        speaks = any((r.get("release") or "").strip() for r in rows)
         for row in rows:
             live[str(row["article"])] = {
-                "access": row.get("access", ""),
-                "release": row.get("release", ""),
+                "access": row.get("access", "") if speaks else "",
+                "release": row.get("release", "") if speaks else "",
                 "record_state": label,
             }
         _throttle("page")
@@ -8175,6 +8436,27 @@ def read_failed_rows(path: str, include_unconfirmed: bool = False):
             found += glob.glob(os.path.join(path, pattern))
         found = sorted(found, key=report_sort_key)
         if not found:
+            # A run folder keeps each structure's plan and reports in that
+            # structure's own folder, one level down, so a re-run pointed at
+            # the run folder found nothing and said only that.
+            below = []
+            for sub in sorted(os.listdir(path)):
+                inner = os.path.join(path, sub)
+                if os.path.isdir(inner) and any(
+                        glob.glob(os.path.join(inner, pattern))
+                        for pattern in ("DC_FileDownload_Plan_*.xlsx",
+                                        "DC_FileDownload_Report_*.xlsx",
+                                        "DC_FileDownload_Retry_*.xlsx")):
+                    below.append(sub)
+            if below:
+                raise ValueError(
+                    "No plan or download reports in {} itself. They are in "
+                    "the folder{} inside it: {}. Point the re-run at {}."
+                    .format(path, "s" if len(below) > 1 else "",
+                            ", ".join(below[:8])
+                            + (", ..." if len(below) > 8 else ""),
+                            "that folder" if len(below) == 1
+                            else "one of those folders"))
             raise ValueError(
                 "No plan or download reports in " + path)
     elif os.path.isfile(path):
@@ -8572,13 +8854,14 @@ def retry_worker(session, out_dir, report_path, opts, report_dir=""):
         # every row records a definite absence is true but unhelpful, and
         # reads like the report was not understood.
         if absent:
-            return fail(
-                "Nothing to re-run: every row that did not download records "
-                "a file the server said is not there ({} of them). Those do "
-                "not become present on a second ask.".format(absent))
-        return fail("That report has no failed rows — nothing to re-run. "
-                    "(Only rows whose Status does not begin 'Downloaded' "
-                    "are retried.)")
+            return finished(
+                "Nothing left to re-run: every row that did not download "
+                "records a file the server said is not there ({} of them). "
+                "Those do not become present on a second ask.".format(absent))
+        return finished(
+            "Nothing left to re-run: every row in that report downloaded. "
+            "(Only rows whose Status does not begin 'Downloaded' are "
+            "retried.)")
 
     # This session's share of what is still outstanding.
     outstanding = len(rows)
@@ -8619,7 +8902,8 @@ def retry_worker(session, out_dir, report_path, opts, report_dir=""):
 
     try:
         set_state(phase="starting", summary="", last_file=None,
-                  run_dir=None, paused=False, inventory=False)
+                  run_dir=None, paused=False, inventory=False,
+                  fetching=False)
         driver = _attach_or_fail(session)
         if driver is None:
             return
@@ -9348,8 +9632,8 @@ PAGE = r"""<!DOCTYPE html>
  .msg-x:hover{background:rgba(60,60,70,.12)}
  #cerr .msg-x{position:absolute;top:.35rem;right:.4rem;margin:0}
  @media (prefers-reduced-motion: no-preference){ #status{transition:background .3s} }
-/* DC-LOG 1 styles */
-.logbar{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap}
+/* DC-LOG 2 styles */
+.logbar{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;margin-bottom:1rem}
 .logbar h2{margin:0}
 .logbar #logcopy{margin-left:auto}
 .logbar #logcopy,.logbar #logclear{padding:.25rem .6rem;font-size:.85rem}
@@ -9852,14 +10136,14 @@ PAGE = r"""<!DOCTYPE html>
 
 <div id="status" role="status" aria-live="polite">Idle.</div>
 <progress id="prog" max="1" value="0" hidden aria-label="Job progress"></progress>
-<!-- DC-LOG 1: the log bar, the inline Clear question, the box, and the
+<!-- DC-LOG 2: the log bar, the inline Clear question, the box, and the
      whole-run fallback for a browser that will not write the clipboard.
      Shared verbatim; see the script's DC-LOG block. -->
 <div class="logbar">
  <h2 style="font-size:1rem">Log</h2>
  <span id="logheld" class="lognote" hidden></span>
  <span id="logmsg" class="lognote" role="status" aria-live="polite"></span>
- <button type="button" id="logcopy" class="secondary">Copy log</button>
+ <button type="button" id="logcopy" class="secondary">Copy status and log</button>
  <button type="button" id="logclear" class="secondary" disabled>Clear for a new run</button>
 </div>
 <div id="clearask" class="clearask" hidden>
@@ -9871,7 +10155,7 @@ PAGE = r"""<!DOCTYPE html>
 </div>
 <div id="log" tabindex="0" aria-label="Activity log"></div>
 <textarea id="logfull" class="logfull" hidden readonly rows="8"
- aria-label="The whole log of the current run, selected for copying"></textarea>
+ aria-label="The status and the whole log of the current run, selected for copying"></textarea>
 <!-- /DC-LOG -->
 </main>
 <script>
@@ -9944,42 +10228,101 @@ function logSelectAll(){
   box.focus();
 }
 
-/* DC-LOG 1: Copy log and Clear for a new run. Shared by every module with
-   a log and duplicated verbatim; modules/_verify_pages.py fails if any
-   copy differs. There is no backslash anywhere in it, because some pages
-   are raw strings and some are not, and the same bytes must serve both.
-   Copy log copies the WHOLE current run from the module (/api/log), not
-   whatever the box holds: the box keeps the last 200 lines and may still
-   show the end of the previous run. Every page's poll() calls
-   logStateSeen(s) with the state it just read. */
+/* DC-LOG 2: Copy status and log, Clear for a new run, and the one way a
+   page writes its status line. Shared by every module with a log and
+   duplicated verbatim; modules/_verify_pages.py fails if any copy
+   differs. There is no backslash anywhere in it, because some pages are
+   raw strings and some are not, and the same bytes must serve both.
+   Copy status and log copies the status line, then the WHOLE current run
+   from the module (/api/log), not whatever the box holds: the box keeps
+   the last 200 lines and may still show the end of the previous run. A
+   link in the status line that carries data-path is copied as its label
+   and that path. Every page's poll() calls logStateSeen(s) with the state
+   it just read, and writes #status only through logShow(). */
 var LOG_NL = String.fromCharCode(10);
 var logLastCleared = null;
+var logPhase = '';
+var logShown = null;
+/* #status is a live region and every page polls every 1.5 s, so the line
+   is written only when it changes: rewriting the same words can have them
+   read out again each time. */
+function logShow(cls, html){
+  var st = document.getElementById('status');
+  if(!st) return;
+  if(st.className !== cls) st.className = cls;
+  if(logShown !== html){ st.innerHTML = html; logShown = html; }
+}
+/* For a value going into an attribute, such as data-path. */
+function logAttr(t){
+  return String(t).split('&').join('&amp;').split('"').join('&quot;')
+    .split('<').join('&lt;').split('>').join('&gt;');
+}
+/* The status line as text: a line break for each br, a list item on a
+   line of its own, and a link as its label, then its path if it has one. */
+function logStatusText(){
+  var st = document.getElementById('status');
+  if(!st) return '';
+  var out = [];
+  (function walk(n){
+    var kids = n.childNodes || [];
+    for(var i = 0; i < kids.length; i++){
+      var c = kids[i];
+      if(c.nodeType === 3){ out.push(c.nodeValue); continue; }
+      if(c.nodeType !== 1) continue;
+      var tag = String(c.nodeName).toUpperCase();
+      if(tag === 'BR'){ out.push(LOG_NL); continue; }
+      if(tag === 'A'){
+        var p = c.getAttribute('data-path');
+        out.push(c.textContent + (p ? ': ' + p : ''));
+        continue;
+      }
+      if(tag === 'LI') out.push(LOG_NL + '- ');
+      walk(c);
+    }
+  })(st);
+  return out.join('').split(LOG_NL).map(function(l){ return l.trim(); })
+    .join(LOG_NL).trim();
+}
 function logLines(txt){
   if(!txt) return 0;
   var t = txt.charAt(txt.length - 1) === LOG_NL ? txt.slice(0, -1) : txt;
   return t.split(LOG_NL).length;
 }
-function logOffer(txt){
+function logOffer(txt, what){
   var ta = document.getElementById('logfull');
   if(!ta){ logSelectAll(); return; }
   ta.value = txt; ta.hidden = false; ta.focus(); ta.select();
-  var n = logLines(txt);
-  logSay('The whole current run (' + n + ' line' + (n === 1 ? '' : 's') +
-         ') is selected below. Press Ctrl+C (Cmd+C) to copy.');
+  logSay(what + ' selected below. Press Ctrl+C (Cmd+C) to copy.');
 }
+/* The status line is copied with the log unless the page is idle, when
+   the line is only an instruction, not a result. */
 function copyLog(){
   fetch('/api/log', {cache:'no-store'})
     .then(function(r){ return r.ok ? r.text() : Promise.reject(r.status); })
     .then(function(txt){
-      if(!txt){ logSay('Nothing has been logged since the last clean start.'); return; }
+      var st = logPhase === 'idle' ? '' : logStatusText();
+      if(!txt && !st){ logSay('Nothing has been logged since the last clean start.'); return; }
       var n = logLines(txt);
-      var said = 'The whole current run, ' + n + ' line' +
-                 (n === 1 ? '' : 's') + ', copied to the clipboard.';
-      if(navigator.clipboard && navigator.clipboard.writeText){
-        navigator.clipboard.writeText(txt).then(
-          function(){ logSay(said); }, function(){ logOffer(txt); });
+      var lines = n + ' line' + (n === 1 ? '' : 's');
+      var all, said, what;
+      if(!txt){
+        all = 'Status:' + LOG_NL + st + LOG_NL;
+        said = 'The status line copied to the clipboard. Nothing has been logged since the last clean start.';
+        what = 'The status line is';
+      }else if(st){
+        all = 'Status:' + LOG_NL + st + LOG_NL + LOG_NL + 'Log:' + LOG_NL + txt;
+        said = 'The status and the whole current run, ' + lines + ', copied to the clipboard.';
+        what = 'The status and the whole current run (' + lines + ') are';
       }else{
-        logOffer(txt);
+        all = txt;
+        said = 'The whole current run, ' + lines + ', copied to the clipboard.';
+        what = 'The whole current run (' + lines + ') is';
+      }
+      if(navigator.clipboard && navigator.clipboard.writeText){
+        navigator.clipboard.writeText(all).then(
+          function(){ logSay(said); }, function(){ logOffer(all, what); });
+      }else{
+        logOffer(all, what);
       }
     }, function(){
       logSay('Could not read the log from the module. Is it still running?');
@@ -9991,6 +10334,7 @@ function logRunning(s){
   return !!s && ['idle', 'done', 'error'].indexOf(s.phase) < 0;
 }
 function logStateSeen(s){
+  logPhase = (s && s.phase) || '';
   var running = logRunning(s),
       btn = document.getElementById('logclear'),
       ask = document.getElementById('clearask');
@@ -10579,8 +10923,13 @@ function applyVerifyTitle(holding){
 function goWord(){
   return kinventory.checked?'Start inventory':'Start downloads';
 }
+/* Until the run's first file request a download run is planning:
+   reading listings and record pages. "Downloading…" before any download
+   was untrue. */
 function phaseWord(s){
-  return s.inventory&&s.phase==='downloading'?'Inventorying…':cap(s.phase);
+  if(s.phase==='downloading'&&s.inventory) return 'Inventorying…';
+  if(s.phase==='downloading'&&!s.fetching) return 'Planning…';
+  return cap(s.phase);
 }
 
 /* Says what to do NEXT, in the mode the page is in. v1.34.2: it was
@@ -10593,10 +10942,8 @@ function idleStatus(){
     :(hierLoaded
       ?'Idle — choose the scope and options, then '+goWord()+'.'
       :'Idle — load or map a hierarchy first.');
-  /* Written only when it changes: #status is a live region, and the
-     poller runs every 1.5 s. */
-  if(status.className!=='') status.className='';
-  if(status.textContent!==want) status.textContent=want;
+  /* Written only when it changes: logShow() (DC-LOG). */
+  logShow('',esc(want));
 }
 
 async function refreshHierarchy(){
@@ -10667,12 +11014,12 @@ async function poll(){
   const v=s.verify||{};
   applyVerifyTitle(!!v.holding);
   let links='';
-  if(s.last_file) links+='<br><a href="/download">Download master log</a>';
-  if(s.report_file) links+='<br><a href="/download-report">Download hierarchy report</a>';
+  if(s.last_file) links+='<br><a href="/download"'+(s.last_file?' data-path="'+logAttr(s.last_file)+'"':'')+'>Download master log</a>';
+  if(s.report_file) links+='<br><a href="/download-report"'+(s.report_file?' data-path="'+logAttr(s.report_file)+'"':'')+'>Download hierarchy report</a>';
   if(s.phase==='done'){
-    status.className=logTone(s); status.innerHTML='Done: '+esc(s.summary)+links;
+    logShow(logTone(s),'Done: '+esc(s.summary)+links);
   }else if(s.phase==='error'){
-    status.className='error'; status.innerHTML='Error: '+esc(s.summary)+links;
+    logShow('error','Error: '+esc(s.summary)+links);
   }else if(s.phase==='idle'){
     idleStatus();
   }else if(v.holding){
@@ -10680,13 +11027,11 @@ async function poll(){
        not an error and not the operator's own Pause: it is the run
        waiting to be told a person is here. Worded as the instruction it
        is, and it says what happens if nobody does. */
-    status.className='';
-    status.textContent='Verification needed — clear it in the Chrome '+
+    logShow('',esc('Verification needed — clear it in the Chrome '+
       'window. Waiting '+v.left+'s more, then this run writes out what '+
-      'it has.'+counts;
+      'it has.'+counts));
   }else{
-    status.className='';
-    status.textContent=(paused?'Paused':phaseWord(s))+counts+msg;
+    logShow('',esc((paused?'Paused':phaseWord(s))+counts+msg));
   }
 }
 const esc=t=>t.replace(/&/g,'&amp;').replace(/</g,'&lt;');

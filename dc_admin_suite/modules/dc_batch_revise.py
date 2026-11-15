@@ -77,7 +77,7 @@ MANIFEST = {
     "id": "batch-revise-harvester",
     "name": "Batch Revise Manager",
     "description": "Generate, download, and bulk-upload batch revise Excel reports for selected structures.",
-    "version": "1.6.0",
+    "version": "1.6.3",
     "requires": ["selenium", "beautifulsoup4", "openpyxl"],
 }
 
@@ -220,13 +220,111 @@ def _soup(html: str):
         return BeautifulSoup(html, "html.parser")
 
 
-def find_cttypes_table(html: str):
-    """Return the <table class="cttypes"> captioned 'Contents of this site'."""
-    for tbl in _soup(html).find_all("table", class_="cttypes"):
+# ---- DC-INDEX 1 ------------------------------------------------------------
+# The site-wide structure listing (user_config.cgi?...&x_showall=1) is one
+# <table class="cttypes"> in both layouts Digital Commons has served: one
+# captioned "Contents of this site" whose row headers are structure codes
+# (ir_series, ...), and one captioned "Site index" whose row headers are
+# plural headings (Series, ...). Both are read. A row whose header is
+# neither is reported by index_unknown_headers(), never guessed at, and a
+# page without the table is described by what it showed.
+INDEX_CAPTIONS = ("site index", "contents of this site")
+INDEX_HEADINGS = {
+    "communities": "ir_community",
+    "journals": "ir_journal",
+    "etds": "ir_etd",
+    "galleries": "ir_gallery",
+    "series": "ir_series",
+    "books": "ir_book",
+    "conferences": "ir_event_community",
+}
+
+
+def _index_soup(html):
+    from bs4 import BeautifulSoup
+    try:
+        return BeautifulSoup(html, "lxml")
+    except Exception:
+        return BeautifulSoup(html, "html.parser")
+
+
+def find_cttypes_table(html):
+    """Return the site-wide listing table (either caption), or None."""
+    for tbl in _index_soup(html).find_all("table", class_="cttypes"):
         cap = tbl.find("caption")
-        if cap and "contents of this site" in cap.get_text(strip=True).lower():
+        text = " ".join(cap.get_text(" ", strip=True).split()).lower() \
+            if cap else ""
+        if any(c in text for c in INDEX_CAPTIONS):
             return tbl
     return None
+
+
+def index_row_code(header):
+    """The structure code a row header names: the code itself (the older
+    layout) or a plural heading (the newer). None when it is neither."""
+    h = " ".join(header.split())
+    if h.startswith("ir_"):
+        return h
+    return INDEX_HEADINGS.get(h.lower())
+
+
+def index_rows(table):
+    """[(code or None, header, [context, ...])] for each row of the table.
+    Sub-documents (a context with "/") and the platform itself (a context
+    starting "http") are skipped, per Digital Commons conventions."""
+    rows = []
+    for tr in table.find_all("tr"):
+        th, td = tr.find("th"), tr.find("td")
+        if not th or not td:
+            continue
+        header = " ".join(th.get_text(" ", strip=True).split())
+        ctxs = []
+        for a in td.find_all("a", href=True):
+            qs = parse_qs(urlparse(a["href"]).query)
+            for ctx in qs.get("context", []):
+                ctx = ctx.strip()
+                if (ctx and "/" not in ctx and not ctx.startswith("http")
+                        and ctx not in ctxs):
+                    ctxs.append(ctx)
+        rows.append((index_row_code(header), header, ctxs))
+    return rows
+
+
+def index_unknown_headers(html):
+    """[(header, count)] for rows with structures whose header names no
+    known structure type; [] when there are none or no table at all."""
+    table = find_cttypes_table(html)
+    if table is None:
+        return []
+    return [(h, len(c)) for code, h, c in index_rows(table)
+            if code is None and c]
+
+
+def index_unknown_note(header, count):
+    return ('A row of the site index is headed "{}", which is not a '
+            "structure type this module knows, so its {} structure(s) "
+            "cannot be chosen by type.".format(header, count))
+
+
+def index_missing_message(html):
+    """What to say when the listing table is not on the page: what the
+    page showed, then the possible causes, none of them asserted."""
+    soup = _index_soup(html)
+    title = " ".join(soup.title.get_text(" ", strip=True).split()) \
+        if soup.title else ""
+    caps = [" ".join(c.get_text(" ", strip=True).split())[:60]
+            for c in soup.find_all("caption")]
+    seen = ('The page served was titled "{}"'.format(title) if title
+            else "The page served had no title")
+    seen += ("; its table captions were " + ", ".join(
+        '"{}"'.format(c) for c in caps) if caps
+        else "; it had no captioned table")
+    return ("Couldn't find the structure listing (the site index) on the "
+            "listing page. {}. Check that you are logged in as an "
+            "administrator in the debug Chrome window and that the base URL "
+            "in Settings is correct; if both are, Digital Commons may have "
+            "changed this page.".format(seen))
+# ---- /DC-INDEX ---------------------------------------------------------------
 
 
 def looks_like_login_page(html: str, current_url: str) -> bool:
@@ -239,7 +337,7 @@ def looks_like_login_page(html: str, current_url: str) -> bool:
 
 def extract_contexts(html: str):
     """Return {context: type_label} from the listing page, or None if the
-    'Contents of this site' table is missing (login / permissions problem).
+    site index table (DC-INDEX) is missing (login / permissions problem).
     Sub-documents (contain "/") and the platform itself (starts with
     "http") are skipped per DC conventions."""
     table = find_cttypes_table(html)
@@ -247,18 +345,10 @@ def extract_contexts(html: str):
         return None
 
     found = {}
-    for tr in table.find_all("tr"):
-        th, td = tr.find("th"), tr.find("td")
-        if not th or not td:
-            continue
-        code = th.get_text(strip=True)
-        label = CODE_TO_LABEL.get(code, code)
-        for a in td.find_all("a", href=True):
-            qs = parse_qs(urlparse(a["href"]).query)
-            for ctx in qs.get("context", []):
-                ctx = ctx.strip()
-                if ctx and "/" not in ctx and not ctx.startswith("http"):
-                    found.setdefault(ctx, label)
+    for code, header, ctxs in index_rows(table):
+        label = CODE_TO_LABEL.get(code, header)
+        for ctx in ctxs:
+            found.setdefault(ctx, label)
     return found
 
 
@@ -311,8 +401,16 @@ def parse_history(html: str):
     page has no history table at all (no batch revise on this structure,
     or an unexpected page). Only batch_revise_retrieve_spreadsheet links
     count — Delete links are ignored. A legacy bare "Download" link with an
-    empty part= is treated as part 1."""
-    table = _soup(html).find("table", id="batch-history")
+    empty part= is treated as part 1.
+
+    Since the late-2026 admin pages the id is on a <div> around the table
+    (a table.manage-results), not on the table; both are read. The history
+    is now paged, newest first; this reads the page it is given, which
+    holds a run's own reports because they are the newest."""
+    holder = _soup(html).find(id="batch-history")
+    if holder is None:
+        return None
+    table = holder if holder.name == "table" else holder.find("table")
     if table is None:
         return None
 
@@ -842,7 +940,7 @@ CLEAR_RESETS = {"last_file": None, "report_file": None,
                 "run_dir": None, "paused": False}
 
 
-# ---- DC-LOG 1 -------------------------------------------------------------
+# ---- DC-LOG 2 -------------------------------------------------------------
 # The whole log of the current run, and Clear for a new run. Shared by
 # every module with a log and duplicated verbatim, because modules are
 # standalone: modules/_verify_pages.py fails if any copy differs.
@@ -1315,10 +1413,9 @@ def map_worker(session, out_dir):
         set_progress(0, 0, "Parsing structure table…")
         ctx_types = extract_contexts(html)
         if ctx_types is None:
-            return fail(
-                "Couldn't find the 'Contents of this site' table. Confirm "
-                "you're logged in as an administrator in the debug Chrome "
-                "window and that the base URL in Settings is correct.")
+            return fail(index_missing_message(html))
+        for header, count in index_unknown_headers(html):
+            log(index_unknown_note(header, count))
         if not ctx_types:
             return fail("No structures found on the listing page.")
 
@@ -1962,8 +2059,8 @@ PAGE = r"""<!DOCTYPE html>
  .msg-x:hover{background:rgba(60,60,70,.12)}
  #cerr .msg-x{position:absolute;top:.35rem;right:.4rem;margin:0}
  @media (prefers-reduced-motion: no-preference){ #status{transition:background .3s} }
-/* DC-LOG 1 styles */
-.logbar{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap}
+/* DC-LOG 2 styles */
+.logbar{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;margin-bottom:1rem}
 .logbar h2{margin:0}
 .logbar #logcopy{margin-left:auto}
 .logbar #logcopy,.logbar #logclear{padding:.25rem .6rem;font-size:.85rem}
@@ -2188,14 +2285,14 @@ PAGE = r"""<!DOCTYPE html>
 
 <div id="status" role="status" aria-live="polite">Idle — load or map a hierarchy first.</div>
 <progress id="prog" max="1" value="0" hidden aria-label="Job progress"></progress>
-<!-- DC-LOG 1: the log bar, the inline Clear question, the box, and the
+<!-- DC-LOG 2: the log bar, the inline Clear question, the box, and the
      whole-run fallback for a browser that will not write the clipboard.
      Shared verbatim; see the script's DC-LOG block. -->
 <div class="logbar">
  <h2 style="font-size:1rem">Log</h2>
  <span id="logheld" class="lognote" hidden></span>
  <span id="logmsg" class="lognote" role="status" aria-live="polite"></span>
- <button type="button" id="logcopy" class="secondary">Copy log</button>
+ <button type="button" id="logcopy" class="secondary">Copy status and log</button>
  <button type="button" id="logclear" class="secondary" disabled>Clear for a new run</button>
 </div>
 <div id="clearask" class="clearask" hidden>
@@ -2207,7 +2304,7 @@ PAGE = r"""<!DOCTYPE html>
 </div>
 <div id="log" tabindex="0" aria-label="Activity log"></div>
 <textarea id="logfull" class="logfull" hidden readonly rows="8"
- aria-label="The whole log of the current run, selected for copying"></textarea>
+ aria-label="The status and the whole log of the current run, selected for copying"></textarea>
 <!-- /DC-LOG -->
 </main>
 <script>
@@ -2280,42 +2377,101 @@ function logSelectAll(){
   box.focus();
 }
 
-/* DC-LOG 1: Copy log and Clear for a new run. Shared by every module with
-   a log and duplicated verbatim; modules/_verify_pages.py fails if any
-   copy differs. There is no backslash anywhere in it, because some pages
-   are raw strings and some are not, and the same bytes must serve both.
-   Copy log copies the WHOLE current run from the module (/api/log), not
-   whatever the box holds: the box keeps the last 200 lines and may still
-   show the end of the previous run. Every page's poll() calls
-   logStateSeen(s) with the state it just read. */
+/* DC-LOG 2: Copy status and log, Clear for a new run, and the one way a
+   page writes its status line. Shared by every module with a log and
+   duplicated verbatim; modules/_verify_pages.py fails if any copy
+   differs. There is no backslash anywhere in it, because some pages are
+   raw strings and some are not, and the same bytes must serve both.
+   Copy status and log copies the status line, then the WHOLE current run
+   from the module (/api/log), not whatever the box holds: the box keeps
+   the last 200 lines and may still show the end of the previous run. A
+   link in the status line that carries data-path is copied as its label
+   and that path. Every page's poll() calls logStateSeen(s) with the state
+   it just read, and writes #status only through logShow(). */
 var LOG_NL = String.fromCharCode(10);
 var logLastCleared = null;
+var logPhase = '';
+var logShown = null;
+/* #status is a live region and every page polls every 1.5 s, so the line
+   is written only when it changes: rewriting the same words can have them
+   read out again each time. */
+function logShow(cls, html){
+  var st = document.getElementById('status');
+  if(!st) return;
+  if(st.className !== cls) st.className = cls;
+  if(logShown !== html){ st.innerHTML = html; logShown = html; }
+}
+/* For a value going into an attribute, such as data-path. */
+function logAttr(t){
+  return String(t).split('&').join('&amp;').split('"').join('&quot;')
+    .split('<').join('&lt;').split('>').join('&gt;');
+}
+/* The status line as text: a line break for each br, a list item on a
+   line of its own, and a link as its label, then its path if it has one. */
+function logStatusText(){
+  var st = document.getElementById('status');
+  if(!st) return '';
+  var out = [];
+  (function walk(n){
+    var kids = n.childNodes || [];
+    for(var i = 0; i < kids.length; i++){
+      var c = kids[i];
+      if(c.nodeType === 3){ out.push(c.nodeValue); continue; }
+      if(c.nodeType !== 1) continue;
+      var tag = String(c.nodeName).toUpperCase();
+      if(tag === 'BR'){ out.push(LOG_NL); continue; }
+      if(tag === 'A'){
+        var p = c.getAttribute('data-path');
+        out.push(c.textContent + (p ? ': ' + p : ''));
+        continue;
+      }
+      if(tag === 'LI') out.push(LOG_NL + '- ');
+      walk(c);
+    }
+  })(st);
+  return out.join('').split(LOG_NL).map(function(l){ return l.trim(); })
+    .join(LOG_NL).trim();
+}
 function logLines(txt){
   if(!txt) return 0;
   var t = txt.charAt(txt.length - 1) === LOG_NL ? txt.slice(0, -1) : txt;
   return t.split(LOG_NL).length;
 }
-function logOffer(txt){
+function logOffer(txt, what){
   var ta = document.getElementById('logfull');
   if(!ta){ logSelectAll(); return; }
   ta.value = txt; ta.hidden = false; ta.focus(); ta.select();
-  var n = logLines(txt);
-  logSay('The whole current run (' + n + ' line' + (n === 1 ? '' : 's') +
-         ') is selected below. Press Ctrl+C (Cmd+C) to copy.');
+  logSay(what + ' selected below. Press Ctrl+C (Cmd+C) to copy.');
 }
+/* The status line is copied with the log unless the page is idle, when
+   the line is only an instruction, not a result. */
 function copyLog(){
   fetch('/api/log', {cache:'no-store'})
     .then(function(r){ return r.ok ? r.text() : Promise.reject(r.status); })
     .then(function(txt){
-      if(!txt){ logSay('Nothing has been logged since the last clean start.'); return; }
+      var st = logPhase === 'idle' ? '' : logStatusText();
+      if(!txt && !st){ logSay('Nothing has been logged since the last clean start.'); return; }
       var n = logLines(txt);
-      var said = 'The whole current run, ' + n + ' line' +
-                 (n === 1 ? '' : 's') + ', copied to the clipboard.';
-      if(navigator.clipboard && navigator.clipboard.writeText){
-        navigator.clipboard.writeText(txt).then(
-          function(){ logSay(said); }, function(){ logOffer(txt); });
+      var lines = n + ' line' + (n === 1 ? '' : 's');
+      var all, said, what;
+      if(!txt){
+        all = 'Status:' + LOG_NL + st + LOG_NL;
+        said = 'The status line copied to the clipboard. Nothing has been logged since the last clean start.';
+        what = 'The status line is';
+      }else if(st){
+        all = 'Status:' + LOG_NL + st + LOG_NL + LOG_NL + 'Log:' + LOG_NL + txt;
+        said = 'The status and the whole current run, ' + lines + ', copied to the clipboard.';
+        what = 'The status and the whole current run (' + lines + ') are';
       }else{
-        logOffer(txt);
+        all = txt;
+        said = 'The whole current run, ' + lines + ', copied to the clipboard.';
+        what = 'The whole current run (' + lines + ') is';
+      }
+      if(navigator.clipboard && navigator.clipboard.writeText){
+        navigator.clipboard.writeText(all).then(
+          function(){ logSay(said); }, function(){ logOffer(all, what); });
+      }else{
+        logOffer(all, what);
       }
     }, function(){
       logSay('Could not read the log from the module. Is it still running?');
@@ -2327,6 +2483,7 @@ function logRunning(s){
   return !!s && ['idle', 'done', 'error'].indexOf(s.phase) < 0;
 }
 function logStateSeen(s){
+  logPhase = (s && s.phase) || '';
   var running = logRunning(s),
       btn = document.getElementById('logclear'),
       ask = document.getElementById('clearask');
@@ -2900,16 +3057,15 @@ function setMsg(el,text,isError,isOk){
 function flash(msg){ showNote(msg); }
 function flashErr(msg){ showErr(msg); }
 function idleStatus(){
-  status.className='';
   const wf=workflow();
-  status.textContent=wf==='upload'
+  logShow('',esc(wf==='upload'
     ?(uplChecked.size?'Idle — review the checked files, then Start uploads.'
                      :'Idle — scan a folder of revised .xls files first.')
     :wf==='download'
     ?(queueLoaded?'Idle — choose the destination, then Start downloads.'
                  :'Idle — load a queue workbook first.')
     :(hierLoaded?'Idle — choose the scope, then Start generation.'
-                :'Idle — load or map a hierarchy first.');
+                :'Idle — load or map a hierarchy first.')));
 }
 
 async function refreshHierarchy(){
@@ -2956,17 +3112,16 @@ async function poll(){
   const counts=p.total>0?' ('+p.current+'/'+p.total+')':'';
   const msg=p.msg?' — '+p.msg:'';
   let links='';
-  if(s.last_file) links+='<br><a href="/download">Download run workbook</a>';
-  if(s.report_file) links+='<br><a href="/download-report">Download hierarchy report</a>';
+  if(s.last_file) links+='<br><a href="/download"'+(s.last_file?' data-path="'+logAttr(s.last_file)+'"':'')+'>Download run workbook</a>';
+  if(s.report_file) links+='<br><a href="/download-report"'+(s.report_file?' data-path="'+logAttr(s.report_file)+'"':'')+'>Download hierarchy report</a>';
   if(s.phase==='done'){
-    status.className=logTone(s); status.innerHTML='Done: '+esc(s.summary)+links;
+    logShow(logTone(s),'Done: '+esc(s.summary)+links);
   }else if(s.phase==='error'){
-    status.className='error'; status.innerHTML='Error: '+esc(s.summary)+links;
+    logShow('error','Error: '+esc(s.summary)+links);
   }else if(s.phase==='idle'){
-    if(!status.textContent||status.className!==''){ idleStatus(); }
+    idleStatus();
   }else{
-    status.className='';
-    status.textContent=(paused?'Paused':cap(s.phase))+counts+msg;
+    logShow('',esc((paused?'Paused':cap(s.phase))+counts+msg));
   }
 }
 const esc=t=>t.replace(/&/g,'&amp;').replace(/</g,'&lt;');

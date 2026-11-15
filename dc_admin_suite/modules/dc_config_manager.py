@@ -15,9 +15,12 @@ UPDATE — load a config report (usually a scraped one you've edited), then:
      The proposed changes are written to DC_Config_DryRun_<timestamp>.xlsx
      and summarized in the UI.
   2. APPLY: with the dry-run plan on screen, a second confirmed start
-     pushes exactly those changes into each config form, clicks
-     "Submit Changes", and (optional toggle, default ON) triggers the
-     structure's regeneration. Every attempt is recorded in
+     waits for each page's scripts to finish (as scrape and dry run do),
+     sets exactly those changes in each config form (never typed: a
+     typed tab or line break is a keypress), reads them back, presses
+     Save Changes, reads the page again and records what it holds, and
+     (optional toggle, default ON) regenerates a structure saved as
+     planned. Every attempt is recorded in
      DC_Config_UpdateLog_<timestamp>.xlsx.
 
 Stop or a mid-run login redirect still writes a partial workbook
@@ -63,7 +66,7 @@ MANIFEST = {
     "id": "config-manager",
     "name": "Configuration Manager",
     "description": "Scrape, preview, and update most structure configurations using a spreadsheet.",
-    "version": "1.5.0",
+    "version": "1.5.8",
     "requires": ["selenium", "beautifulsoup4", "openpyxl"],
 }
 
@@ -173,13 +176,111 @@ def _soup(html: str):
         return BeautifulSoup(html, "html.parser")
 
 
-def find_cttypes_table(html: str):
-    """Return the <table class="cttypes"> captioned 'Contents of this site'."""
-    for tbl in _soup(html).find_all("table", class_="cttypes"):
+# ---- DC-INDEX 1 ------------------------------------------------------------
+# The site-wide structure listing (user_config.cgi?...&x_showall=1) is one
+# <table class="cttypes"> in both layouts Digital Commons has served: one
+# captioned "Contents of this site" whose row headers are structure codes
+# (ir_series, ...), and one captioned "Site index" whose row headers are
+# plural headings (Series, ...). Both are read. A row whose header is
+# neither is reported by index_unknown_headers(), never guessed at, and a
+# page without the table is described by what it showed.
+INDEX_CAPTIONS = ("site index", "contents of this site")
+INDEX_HEADINGS = {
+    "communities": "ir_community",
+    "journals": "ir_journal",
+    "etds": "ir_etd",
+    "galleries": "ir_gallery",
+    "series": "ir_series",
+    "books": "ir_book",
+    "conferences": "ir_event_community",
+}
+
+
+def _index_soup(html):
+    from bs4 import BeautifulSoup
+    try:
+        return BeautifulSoup(html, "lxml")
+    except Exception:
+        return BeautifulSoup(html, "html.parser")
+
+
+def find_cttypes_table(html):
+    """Return the site-wide listing table (either caption), or None."""
+    for tbl in _index_soup(html).find_all("table", class_="cttypes"):
         cap = tbl.find("caption")
-        if cap and "contents of this site" in cap.get_text(strip=True).lower():
+        text = " ".join(cap.get_text(" ", strip=True).split()).lower() \
+            if cap else ""
+        if any(c in text for c in INDEX_CAPTIONS):
             return tbl
     return None
+
+
+def index_row_code(header):
+    """The structure code a row header names: the code itself (the older
+    layout) or a plural heading (the newer). None when it is neither."""
+    h = " ".join(header.split())
+    if h.startswith("ir_"):
+        return h
+    return INDEX_HEADINGS.get(h.lower())
+
+
+def index_rows(table):
+    """[(code or None, header, [context, ...])] for each row of the table.
+    Sub-documents (a context with "/") and the platform itself (a context
+    starting "http") are skipped, per Digital Commons conventions."""
+    rows = []
+    for tr in table.find_all("tr"):
+        th, td = tr.find("th"), tr.find("td")
+        if not th or not td:
+            continue
+        header = " ".join(th.get_text(" ", strip=True).split())
+        ctxs = []
+        for a in td.find_all("a", href=True):
+            qs = parse_qs(urlparse(a["href"]).query)
+            for ctx in qs.get("context", []):
+                ctx = ctx.strip()
+                if (ctx and "/" not in ctx and not ctx.startswith("http")
+                        and ctx not in ctxs):
+                    ctxs.append(ctx)
+        rows.append((index_row_code(header), header, ctxs))
+    return rows
+
+
+def index_unknown_headers(html):
+    """[(header, count)] for rows with structures whose header names no
+    known structure type; [] when there are none or no table at all."""
+    table = find_cttypes_table(html)
+    if table is None:
+        return []
+    return [(h, len(c)) for code, h, c in index_rows(table)
+            if code is None and c]
+
+
+def index_unknown_note(header, count):
+    return ('A row of the site index is headed "{}", which is not a '
+            "structure type this module knows, so its {} structure(s) "
+            "cannot be chosen by type.".format(header, count))
+
+
+def index_missing_message(html):
+    """What to say when the listing table is not on the page: what the
+    page showed, then the possible causes, none of them asserted."""
+    soup = _index_soup(html)
+    title = " ".join(soup.title.get_text(" ", strip=True).split()) \
+        if soup.title else ""
+    caps = [" ".join(c.get_text(" ", strip=True).split())[:60]
+            for c in soup.find_all("caption")]
+    seen = ('The page served was titled "{}"'.format(title) if title
+            else "The page served had no title")
+    seen += ("; its table captions were " + ", ".join(
+        '"{}"'.format(c) for c in caps) if caps
+        else "; it had no captioned table")
+    return ("Couldn't find the structure listing (the site index) on the "
+            "listing page. {}. Check that you are logged in as an "
+            "administrator in the debug Chrome window and that the base URL "
+            "in Settings is correct; if both are, Digital Commons may have "
+            "changed this page.".format(seen))
+# ---- /DC-INDEX ---------------------------------------------------------------
 
 
 def looks_like_login_page(html: str, current_url: str) -> bool:
@@ -192,7 +293,7 @@ def looks_like_login_page(html: str, current_url: str) -> bool:
 
 def extract_contexts(html: str):
     """Return {type_label: sorted [context, ...]} from the listing page, or
-    None if the 'Contents of this site' table is missing (login/permissions).
+    None if the site index table (DC-INDEX) is missing (login/permissions).
     Sub-documents (contain "/") and the platform itself (starts with "http")
     are skipped per DC conventions."""
     table = find_cttypes_table(html)
@@ -200,18 +301,10 @@ def extract_contexts(html: str):
         return None
 
     found = {}
-    for tr in table.find_all("tr"):
-        th, td = tr.find("th"), tr.find("td")
-        if not th or not td:
-            continue
-        label = CODE_TO_LABEL.get(th.get_text(strip=True),
-                                  th.get_text(strip=True))
-        for a in td.find_all("a", href=True):
-            qs = parse_qs(urlparse(a["href"]).query)
-            for ctx in qs.get("context", []):
-                ctx = ctx.strip()
-                if ctx and "/" not in ctx and not ctx.startswith("http"):
-                    found.setdefault(label, set()).add(ctx)
+    for code, header, ctxs in index_rows(table):
+        label = CODE_TO_LABEL.get(code, header)
+        if ctxs:
+            found.setdefault(label, set()).update(ctxs)
     return {label: sorted(v) for label, v in found.items() if v}
 
 
@@ -230,6 +323,8 @@ def extract_fields(html: str):
                       tool, a later unchecked radio never clobbers this)
       select        → the selected option's visible text (first option if
                       nothing is explicitly selected)
+      select multiple → its items joined by "; " (multi_value; never the
+                      first option)
     """
     soup = _soup(html)
     scope = soup.find(id="user-config")
@@ -263,12 +358,45 @@ def extract_fields(html: str):
         name = tag.get("name")
         if not name:
             continue
+        if tag.has_attr("multiple"):
+            fields[name] = multi_value(tag)
+            continue
         selected = tag.find("option", selected=True)
         if selected is None:
             selected = tag.find("option")
         fields[name] = selected.get_text(strip=True) if selected else ""
 
     return fields, scoped
+
+
+def multi_value(tag):
+    """A multiple-choice list as the items it holds, joined by "; ". The
+    disciplines widget lists a structure's items in its "Selected" list
+    (class selectedMultiSelectOptions), read as every item listed there,
+    beside one empty-valued placeholder option (with text until its script
+    has run, emptied after) that is never an item; any
+    other multiple list is read as its selected options. Never the first
+    option, as a single select is: a multiple list with nothing chosen
+    submits nothing."""
+    if "selectedMultiSelectOptions" in (tag.get("class") or []):
+        opts = [o for o in tag.find_all("option")
+                if (o.get("value") or "") != ""]
+    else:
+        opts = [o for o in tag.find_all("option") if o.has_attr("selected")]
+    return "; ".join(o.get_text(strip=True) for o in opts)
+
+
+def multi_fields(html):
+    """Names of the multiple-choice lists on a config page."""
+    soup = _soup(html)
+    scope = soup.find(id="user-config") or soup
+    return {t.get("name") for t in scope.find_all("select")
+            if t.get("name") and t.has_attr("multiple")}
+
+
+def item_count(value):
+    """How many items a multiple-choice value holds."""
+    return len([x for x in (value or "").split(";") if x.strip()])
 
 
 def cell_str(value) -> str:
@@ -505,7 +633,9 @@ def write_dryrun_workbook(path, changes, header_rgb):
 
 def write_updatelog_workbook(path, results, header_rgb):
     """Update run log: one row per structure attempted, in execution order.
-    results = [(order, ctx, type_label, fields_str, status, timestr, url)]"""
+    results = [(order, ctx, type_label, fields_str, status, read_back,
+                timestr, url)]. Status and Read Back say what the page held
+    when it was read again after Save Changes."""
     from openpyxl import Workbook
 
     st = _styles(header_rgb)
@@ -513,16 +643,17 @@ def write_updatelog_workbook(path, results, header_rgb):
     ws = wb.active
     ws.title = "Update Log"
 
-    headers = ["Order", "Context ID", "Type", "Fields Changed",
-               "Status", "Time", "Config URL"]
+    headers = ["Order", "Context ID", "Type", "Fields Planned",
+               "Status", "Read Back", "Time", "Config URL"]
     ws.append(headers)
     _style_header(ws, len(headers), st)
 
-    for i, (order, ctx, label, fields_str, status, timestr, url) in \
-            enumerate(results):
-        ws.append([order, ctx, label, fields_str, status, timestr, url])
+    for i, (order, ctx, label, fields_str, status, read_back, timestr,
+            url) in enumerate(results):
+        ws.append([order, ctx, label, fields_str, status, read_back,
+                   timestr, url])
         r = i + 2
-        link_cell = ws.cell(row=r, column=7)
+        link_cell = ws.cell(row=r, column=8)
         link_cell.hyperlink = url
         link_cell.font = st["link_font"]
         if i % 2 == 1:
@@ -530,7 +661,7 @@ def write_updatelog_workbook(path, results, header_rgb):
                 ws.cell(row=r, column=col).fill = st["alt_fill"]
 
     _finish_sheet(ws, len(headers), len(results),
-                  [8, 32, 22, 48, 26, 20, 72])
+                  [8, 32, 22, 40, 30, 60, 12, 72])
     wb.save(path)
 
 
@@ -578,7 +709,7 @@ RUN_LOG_NAME = None
 CLEAR_RESETS = {"last_file": None, "plan_file": None, "paused": False}
 
 
-# ---- DC-LOG 1 -------------------------------------------------------------
+# ---- DC-LOG 2 -------------------------------------------------------------
 # The whole log of the current run, and Clear for a new run. Shared by
 # every module with a log and duplicated verbatim, because modules are
 # standalone: modules/_verify_pages.py fails if any copy differs.
@@ -940,6 +1071,7 @@ def set_scrape_model(model):
         STATE["targets"] = {
             "loaded": True,
             "source": model["source"],
+            "path": model.get("path", ""),
             "count": sum(len(v) for v in model["types"].values()),
             "version": STATE["targets"]["version"] + 1,
         }
@@ -955,6 +1087,7 @@ def set_upd_model(model):
         STATE["report"] = {
             "loaded": True,
             "source": model["source"],
+            "path": model.get("path", ""),
             "count": sum(len(v) for v in model["types"].values()),
             "version": STATE["report"]["version"] + 1,
         }
@@ -1037,17 +1170,60 @@ def _primary_rgb(session) -> str:
                   .get("primary", FALLBACK_BRAND["primary"]).lstrip("#")
 
 
+# The late-2026 configuration pages finish themselves with scripts after
+# they load. One loads the disciplines list, whose box is marked
+# multiSelectLoading until it has (its empty-valued placeholder option
+# stays afterwards, with its text emptied); a page read before then gives a
+# placeholder for a value. Another marks the Save Changes bar ready, from an
+# animation-frame callback that Chrome does not run while the window is
+# covered by other windows, so nothing here waits for the bar: Apply presses
+# Save Changes with a script click (CLICK_JS), which submits the form as the
+# button does, whatever Chrome has drawn. SETTLE_JS answers
+# [document loaded, lists still loading].
+SETTLE_JS = (
+    "return [document.readyState === 'complete',"
+    " document.querySelectorAll('.multiSelectLoading').length];")
+SETTLE_WAIT = 15.0    # seconds for a page's scripts to finish
+
+
+def unsettled_reason(state):
+    """What has not finished on a page, from SETTLE_JS's answer; '' when
+    everything has."""
+    loaded, left = state
+    why = []
+    if not loaded:
+        why.append("the page is still loading")
+    if left:
+        why.append("the disciplines list has not loaded")
+    return "; ".join(why)
+
+
+def _wait_settled(driver, timeout=None):
+    """'' once the page's scripts have finished; otherwise, when the time
+    runs out, what had not."""
+    end = time.time() + (SETTLE_WAIT if timeout is None else timeout)
+    while True:
+        try:
+            why = unsettled_reason(driver.execute_script(SETTLE_JS))
+        except Exception as e:
+            why = "it could not be checked ({})".format(first_line(e))
+        if not why or time.time() >= end:
+            return why
+        time.sleep(0.25)
+
+
 def _load_config_page(driver, url):
-    """GET a config page and return settled page_source. Config forms are
-    simple pages: 1.5 s settle + one 2 s retry if no form markup appears —
-    bump these if fields come back empty during testing."""
+    """GET a config page and wait for its scripts to finish. Returns
+    (page_source, why): why is '' when the page settled, else what had not
+    finished when SETTLE_WAIT ran out. One 2 s retry if no form markup
+    appears."""
     driver.get(url)
-    time.sleep(1.5)
+    why = _wait_settled(driver)
     html = driver.page_source
     if "user-config" not in html and "<form" not in html.lower():
         time.sleep(2.0)
         html = driver.page_source
-    return html
+    return html, why
 
 
 def _selected_targets(model, labels):
@@ -1086,10 +1262,9 @@ def harvest_worker(session):
 
         types = extract_contexts(html)
         if types is None:
-            return fail(
-                "Couldn't find the 'Contents of this site' table. Confirm "
-                "you're logged in as an administrator in the debug Chrome "
-                "window and that the base URL in Settings is correct.")
+            return fail(index_missing_message(html))
+        for header, count in index_unknown_headers(html):
+            log(index_unknown_note(header, count))
         if not types:
             return fail("No structures found on the listing page.")
 
@@ -1155,17 +1330,18 @@ def scrape_worker(session, out_dir, labels):
             return
 
         set_state(phase="scraping")
-        log("Scraping configuration fields for {} structures across "
+        log("Scraping configuration fields for {} structure(s) across "
             "{} type(s) (~2 s each; Pause/Stop available)…"
             .format(total, len(labels)))
 
         unscoped = 0
+        unsettled = 0
         t0 = time.time()
         for idx, (label, ctx) in enumerate(pairs, start=1):
             check_pause_stop()
 
             url = config_url(base_url, ctx)
-            html = _load_config_page(driver, url)
+            html, why = _load_config_page(driver, url)
 
             if looks_like_login_page(html, driver.current_url):
                 path = finish_report("session expired; {} of {} scraped"
@@ -1174,6 +1350,15 @@ def scrape_worker(session, out_dir, labels):
                     "Digital Commons session expired at '{}'. Log in inside "
                     "the debug Chrome window and start again — the partial "
                     "report holds what was scraped.".format(ctx))
+
+            if why:
+                unsettled += 1
+                log("WARNING: '{}': the page did not finish loading within "
+                    "{:.0f} s ({}) — not recorded.".format(
+                        ctx, SETTLE_WAIT, why))
+                set_progress(idx, total, "{} · {} · not recorded · {}".format(
+                    label, ctx, eta_text(idx, total, t0)))
+                continue
 
             fields, scoped = extract_fields(html)
             if not scoped:
@@ -1190,7 +1375,11 @@ def scrape_worker(session, out_dir, labels):
 
         path = finish_report()
         set_progress(total, total, "Done")
-        summary = "{} structures scraped".format(total)
+        summary = "{} of {} structure(s) scraped".format(total - unsettled,
+                                                       total)
+        if unsettled:
+            summary += ("; {} not recorded — the page did not finish "
+                        "loading (see log)".format(unsettled))
         if unscoped:
             summary += " ({} parsed unscoped — see log)".format(unscoped)
         if path:
@@ -1237,6 +1426,8 @@ def dryrun_worker(session, out_dir, labels):
     items = []            # [(ctx, label, [(field, old, new), ...]), ...]
     changes = []          # dry-run workbook rows
     skipped = 0           # fields in the sheet but absent on the live page
+    unsettled = 0         # pages whose scripts did not finish: not checked
+    unplanned = 0         # multiple-choice differences: never applied
     primary = _primary_rgb(session)
 
     def finish_plan_workbook(partial_reason=None):
@@ -1270,7 +1461,7 @@ def dryrun_worker(session, out_dir, labels):
             check_pause_stop()
 
             url = config_url(base_url, ctx)
-            html = _load_config_page(driver, url)
+            html, why = _load_config_page(driver, url)
 
             if looks_like_login_page(html, driver.current_url):
                 finish_plan_workbook("session expired; {} of {} checked"
@@ -1280,7 +1471,17 @@ def dryrun_worker(session, out_dir, labels):
                     "the debug Chrome window and run the dry run again."
                     .format(ctx))
 
+            if why:
+                unsettled += 1
+                log("WARNING: '{}': the page did not finish loading within "
+                    "{:.0f} s ({}) — not checked, and not in the plan."
+                    .format(ctx, SETTLE_WAIT, why))
+                set_progress(idx, total, "{} · {} · not checked · {}".format(
+                    label, ctx, eta_text(idx, total, t0)))
+                continue
+
             live, scoped = extract_fields(html)
+            multis = multi_fields(html)
             if not scoped:
                 log("No id=\"user-config\" element on '{}' — comparing "
                     "against the whole page.".format(ctx))
@@ -1294,6 +1495,13 @@ def dryrun_worker(session, out_dir, labels):
                         "live page — skipped.".format(ctx, field))
                     continue
                 old = live[field]
+                if old != new and field in multis:
+                    unplanned += 1
+                    log("'{}': '{}' differs from the sheet ({} item(s) on "
+                        "the page, {} in the sheet), but Apply does not "
+                        "change a multiple-choice list — not in the plan."
+                        .format(ctx, field, item_count(old), item_count(new)))
+                    continue
                 if old != new:
                     diffs.append((field, old, new))
                     order += 1
@@ -1312,6 +1520,13 @@ def dryrun_worker(session, out_dir, labels):
                        len(changes), n_structs, total,
                        "; {} sheet field(s) not on the live pages — see "
                        "log".format(skipped) if skipped else "")
+        if unsettled:
+            summary += ("; {} structure(s) not checked — the page did not "
+                        "finish loading (see log)".format(unsettled))
+        if unplanned:
+            summary += ("; {} difference(s) in multiple-choice lists not "
+                        "planned — Apply does not change them (see log)"
+                        .format(unplanned))
         if path:
             summary += " → " + os.path.basename(path)
         if changes:
@@ -1319,7 +1534,7 @@ def dryrun_worker(session, out_dir, labels):
         else:
             summary += ". Nothing to apply."
         set_state(phase="done", summary=summary, paused=False,
-                  outcome=outcome_tone(skipped + run_warnings()))
+                  outcome=outcome_tone(skipped + unplanned + run_warnings()))
         log(summary)
     except StopRequested:
         finish_plan_workbook("stopped early; {} of {} checked"
@@ -1334,10 +1549,46 @@ def dryrun_worker(session, out_dir, labels):
 
 
 # ---------------------------------------------------------------------------
-# Worker 4: APPLY — execute the dry-run plan: push each structure's changed
-# fields into the config form, click "Submit Changes", optionally trigger
-# regeneration. Only structures the dry run found changes for are touched.
+# Worker 4: APPLY — execute the dry-run plan: set each structure's changed
+# fields in its config form (never typed), read them back, press Save
+# Changes, read the page again and record what it holds; regenerate only a
+# structure saved as planned. Only structures the dry run found changes
+# for are touched.
 # ---------------------------------------------------------------------------
+def apply_summary(results, total):
+    """'N of M structure(s) saved as planned', then every other outcome
+    counted by name, from the Status each structure's page was read back
+    to. A save whose outcome is not known is never counted as a failure."""
+    counts = {}
+    regen_failed = 0
+    for r in results:
+        status = r[4]
+        if "regeneration failed" in status:
+            regen_failed += 1
+        key = status.split(" (")[0].split(" +")[0]
+        counts[key] = counts.get(key, 0) + 1
+    text = "{} of {} structure(s) saved as planned".format(
+        counts.pop("Saved", 0), total)
+    words = (("NOT AS PLANNED", "{} changed NOT as planned — check "
+              "these first"),
+             ("PARTLY SAVED", "{} partly saved"),
+             ("UNKNOWN", "{} unknown — run a dry run to see what the "
+              "page holds"),
+             ("NOT SAVED", "{} not saved"),
+             ("ERROR before Save Changes", "{} stopped by an error before "
+              "Save Changes"),
+             ("LOGIN REQUIRED", "{} stopped by the login page"))
+    for key, word in words:
+        if counts.get(key):
+            text += "; " + word.format(counts.pop(key))
+    for key, n in sorted(counts.items()):
+        text += "; {} {}".format(n, key)
+    if regen_failed:
+        text += "; {} saved but not regenerated (regeneration failed)".format(
+            regen_failed)
+    return text
+
+
 def apply_worker(session, out_dir, regen):
     base_url = session["base_url"].rstrip("/")
     with LOCK:
@@ -1391,10 +1642,13 @@ def apply_worker(session, out_dir, regen):
             timestr = time.strftime("%H:%M:%S")
 
             try:
-                status = _apply_one(driver, base_url, ctx, diffs, regen)
+                status, readback = _apply_one(driver, base_url, ctx,
+                                              diffs, regen)
             except LoginRedirect:
                 results.append((idx, ctx, label, fields_str,
-                                "LOGIN REQUIRED", timestr, url))
+                                "LOGIN REQUIRED",
+                                "not known: run a dry run to see what the "
+                                "page holds", timestr, url))
                 finish_log("session expired; {} of {} done"
                            .format(idx - 1, total))
                 return fail(
@@ -1403,21 +1657,22 @@ def apply_worker(session, out_dir, regen):
                     "structures may already be updated), then apply again."
                     .format(ctx))
             except Exception as e:
-                status = "ERROR: {}".format(e.__class__.__name__)
-                log("'{}': {}: {}".format(ctx, e.__class__.__name__, e))
+                status = "ERROR before Save Changes ({})".format(first_line(e))
+                readback = "nothing was saved"
+                log("'{}': {} — nothing was saved.".format(ctx, first_line(e)))
 
-            results.append((idx, ctx, label, fields_str, status,
+            results.append((idx, ctx, label, fields_str, status, readback,
                             time.strftime("%H:%M:%S"), url))
             set_progress(idx, total, "{} · {} · {} · {}".format(
                 label, ctx, status, eta_text(idx, total, t0)))
 
         path = finish_log()
         set_progress(total, total, "Done")
-        ok = sum(1 for r in results if r[4].startswith("Updated"))
-        summary = "{} of {} structure(s) updated".format(ok, total)
+        ok = sum(1 for r in results if r[4].startswith("Saved"))
+        summary = apply_summary(results, total)
         if path:
             summary += " → " + os.path.basename(path)
-        summary += ". Run a new SCRAPE to capture the updated state."
+        summary += ". Run a new SCRAPE to capture the current state."
         set_state(phase="done", summary=summary, paused=False,
                   outcome=outcome_tone(total - ok + run_warnings(),
                                        succeeded=ok))
@@ -1429,24 +1684,26 @@ def apply_worker(session, out_dir, regen):
                              "skipped": 0, "report_version": 0,
                              "version": STATE["plan"]["version"] + 1}
     except StopRequested:
-        log("Stop requested — {} of {} updated.".format(len(results), total))
+        log("Stop requested after {} of {} structure(s).".format(
+            len(results), total))
         path = finish_log("stopped early; {} of {} done"
                           .format(len(results), total))
         if path:
             set_state(phase="done", paused=False,
                       outcome=outcome_tone(
                           sum(1 for r in results
-                              if not r[4].startswith("Updated"))
+                              if not r[4].startswith("Saved"))
                           + run_warnings()),
-                      summary="Stopped early ({} of {} updated). Partial "
-                              "update log: {}. Run a fresh dry run before "
-                              "applying again.".format(
+                      summary="Stopped early after {} of {} structure(s): "
+                              "{}. Partial update log: {}. Run a fresh dry "
+                              "run before applying again.".format(
                                   len(results), total,
+                                  apply_summary(results, total),
                                   os.path.basename(path)))
         else:
             set_state(phase="idle", paused=False)
             set_progress(0, 0, "")
-            log("Stopped before any structure was updated.")
+            log("Stopped before any structure was tried.")
         with LOCK:
             globals()["PLAN"] = None
             STATE["plan"] = {"ready": False, "structures": 0, "changes": 0,
@@ -1462,14 +1719,183 @@ class LoginRedirect(Exception):
     """Raised by _apply_one when DC bounces to a login page mid-run."""
 
 
-def _apply_one(driver, base_url, ctx, diffs, regen) -> str:
-    """Apply one structure's field changes and submit. Returns a status
-    string for the update log. Raises LoginRedirect on a login bounce."""
+# Values are SET in the page, never typed. Typing sends each character as a
+# keypress: a tab moves focus to the next field, and a line break typed into
+# a one-line field submits the form half-filled.
+SET_VALUE_JS = (
+    "var el = arguments[0], v = arguments[1];"
+    "var proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype"
+    " : HTMLInputElement.prototype;"
+    "Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, v);"
+    "el.dispatchEvent(new Event('input', {bubbles: true}));"
+    "el.dispatchEvent(new Event('change', {bubbles: true}));")
+READ_VALUE_JS = "return arguments[0].value;"
+CLICK_JS = "arguments[0].click();"
+# Which document is showing, and whether it has finished loading: a new
+# page has another performance.timeOrigin. Read only.
+DOC_JS = "return [document.readyState, performance.timeOrigin];"
+IN_BAR_JS = "return !!arguments[0].closest('td.config-actions-sticky');"
+TEXT_TYPES = ("text", "email", "url", "number", "password", "")
+SAVE_WAIT = 20.0      # seconds for the page after Save Changes to load
+# A page read back right after Save Changes was answered can still show the
+# value from before the save, and the save show on a later read. Seconds to
+# wait before each further read: about 2, 5 and 10 s after the first.
+READ_AGAIN = (2.0, 3.0, 5.0)
+
+
+def first_line(e):
+    """An exception named by its class and the first line of its message.
+    A Selenium message carries a stack trace that tells staff nothing."""
+    lines = str(e).strip().splitlines()
+    msg = lines[0].strip() if lines else ""
+    if msg.startswith("Message:"):
+        msg = msg[len("Message:"):].strip()
+    name = e.__class__.__name__
+    return "{}: {}".format(name, msg) if msg else name
+
+
+def _lines(s):
+    return (s or "").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def form_holds(kind, new, observed):
+    """True when a field set in the form holds its planned value. `kind`
+    is "text", "checkbox", "radio" or "select"; `observed` is what the form
+    reports: the value, whether the box is checked, the checked radio's
+    value, or the selected option's (text, value)."""
+    if kind == "text":
+        return _lines(observed) == _lines(new)
+    if kind == "checkbox":
+        return bool(observed) == bool(new)
+    if kind == "radio":
+        return (observed or "") == new
+    if kind == "select":
+        text, value = observed
+        return new in (text, value) if new else "" in (text, value)
+    return False
+
+
+def form_mismatch(kind, new, observed, one_line):
+    """Why a field does not hold its planned value — sizes, never content."""
+    if kind == "text":
+        why = "the form holds {} character(s), planned {}".format(
+            len(_lines(observed)), len(_lines(new)))
+        if one_line and "\n" in _lines(new):
+            why += "; a one-line field cannot hold a line break"
+        return why
+    return "the form shows {!r}, planned {!r}".format(observed, new)
+
+
+def field_outcomes(diffs, live):
+    """[(field, outcome)] for each planned field, by the dry run's own
+    comparison with the page as read again after saving."""
+    out = []
+    for field, old, new in diffs:
+        if field not in live:
+            out.append((field, "not on the page after saving"))
+        elif live[field] == new:
+            out.append((field, "saved as planned"))
+        elif live[field] == old:
+            out.append((field, "unchanged"))
+        else:
+            out.append((field, "changed, NOT as planned: holds {} "
+                        "character(s), planned {}".format(len(live[field]),
+                                                          len(new))))
+    return out
+
+
+def saved_status(outcomes, skipped):
+    """The update log's Status for a structure whose page was read back."""
+    planned = sum(1 for _f, o in outcomes if o == "saved as planned")
+    unchanged = sum(1 for _f, o in outcomes if o == "unchanged")
+    if planned == len(outcomes):
+        if skipped:
+            return "Saved ({} field(s) skipped)".format(skipped)
+        return "Saved"
+    if unchanged == len(outcomes):
+        return "NOT SAVED"
+    if planned + unchanged == len(outcomes):
+        return "PARTLY SAVED"
+    return "NOT AS PLANNED"
+
+
+def read_back_text(notes):
+    return "; ".join("{}: {}".format(f, n) for f, n in notes)
+
+
+def _form_value(driver, kind, elements):
+    el0 = elements[0]
+    if kind == "text":
+        return driver.execute_script(READ_VALUE_JS, el0)
+    if kind == "checkbox":
+        return el0.is_selected()
+    if kind == "radio":
+        for el in elements:
+            if el.is_selected():
+                return el.get_attribute("value") or ""
+        return ""
+    from selenium.webdriver.support.ui import Select
+    opt = Select(el0).first_selected_option
+    return ((opt.text or "").strip(), opt.get_attribute("value") or "")
+
+
+def _save_button(driver, scope):
+    """The Save Changes button to press: the one in the sticky Save bar of
+    the late-2026 pages, else the first one shown and enabled (older
+    pages); never one the page's own layout hides, such as the top row
+    those pages hide. Returns (button or None, how many the page has)."""
     from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import Select, WebDriverWait
+    xp = "input[@type='submit' and @name='x_process_changes']"
+    found = scope.find_elements(By.XPATH, ".//" + xp)
+    if not found:
+        found = driver.find_elements(By.XPATH, "//" + xp)
+    for btn in found:
+        try:
+            if driver.execute_script(IN_BAR_JS, btn):
+                return btn, len(found)
+        except Exception:
+            continue
+    for btn in found:
+        try:
+            if btn.is_displayed() and btn.is_enabled():
+                return btn, len(found)
+        except Exception:
+            continue
+    return None, len(found)
+
+
+def _after_press(driver, origin, timeout):
+    """What the page did after Save Changes was pressed: "loaded" once a new
+    document (another performance.timeOrigin) has finished loading;
+    "unchanged" if the old one is still there, answering, when the time
+    runs out; "pending" if a new one began, or the page stopped answering
+    while it navigated, and had not finished. A script click returns at
+    once, before the form's request has been answered, and a page read
+    back before then is read before the save is written."""
+    end = time.time() + timeout
+    began = False
+    while True:
+        try:
+            ready, now = driver.execute_script(DOC_JS)
+            if now != origin:
+                began = True
+                if ready == "complete":
+                    return "loaded"
+        except Exception:
+            began = True         # navigating: the old document has gone
+        if time.time() >= end:
+            return "pending" if began else "unchanged"
+        time.sleep(0.25)
+
+
+def _open_form(driver, url):
+    """Load a config page for Apply and wait for its scripts to finish.
+    Returns (scope, why): why is '' when the page settled. Raises
+    LoginRedirect, or RuntimeError when the form is not on the page."""
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
 
-    url = config_url(base_url, ctx)
     driver.get(url)
     try:
         WebDriverWait(driver, 15).until(
@@ -1479,15 +1905,105 @@ def _apply_one(driver, base_url, ctx, diffs, regen) -> str:
         if looks_like_login_page(driver.page_source, driver.current_url):
             raise LoginRedirect()
         raise RuntimeError("config form (id=user-config) not found")
+    return scope, _wait_settled(driver)
 
-    problems = []
-    for field, _old, new in diffs:
+
+def _answer_page(driver, planned):
+    """The page that answered Save Changes, for the log: its title, its
+    address, and each planned field as that page's own form shows it.
+    Never raises."""
+    try:
+        title = " ".join((driver.title or "").split())[:80] or "(no title)"
+    except Exception:
+        title = "(title not read)"
+    try:
+        here = driver.current_url or "(no address)"
+    except Exception:
+        here = "(address not read)"
+    try:
+        live, scoped = extract_fields(driver.page_source)
+    except Exception as e:
+        return '"{}" at {}, whose contents could not be read ({})'.format(
+            title, here, first_line(e))
+    if not scoped:
+        return '"{}" at {}, with no configuration form'.format(title, here)
+    return '"{}" at {}, whose form shows {}'.format(
+        title, here, _shown(field_outcomes(planned, live)))
+
+
+def _shown(outcomes):
+    return "; ".join("{} {}".format(f, o) for f, o in outcomes)
+
+
+def _all_saved(outcomes):
+    return all(o == "saved as planned" for _f, o in outcomes)
+
+
+def _read_again(driver, url, ctx, planned, outcomes, notes):
+    """After a press that brought a new page: while the page read back does
+    not show every planned field saved as planned, wait each READ_AGAIN
+    pause and read it again, logging every read. Returns the outcomes of
+    the last read made; adds a Read Back note when the save showed only on
+    a later read. Raises LoginRedirect."""
+    waited = 0.0
+    for n, pause in enumerate(READ_AGAIN, start=2):
+        if _all_saved(outcomes):
+            break
+        log("'{}': read {} of the page shows {} — reading it again in "
+            "{:.0f} s.".format(ctx, n - 1, _shown(outcomes), pause))
+        time.sleep(pause)
+        waited += pause
+        try:
+            html, why = _load_config_page(driver, url)
+            here = driver.current_url
+        except Exception as e:
+            log("'{}': read {} could not be made ({}); the status is from "
+                "read {}.".format(ctx, n, first_line(e), n - 1))
+            return outcomes
+        if looks_like_login_page(html, here):
+            raise LoginRedirect()
+        live, scoped = ({}, False) if why else extract_fields(html)
+        if not scoped:
+            log("'{}': read {} found no settled configuration form{}; the "
+                "status is from read {}.".format(
+                    ctx, n, " ({})".format(why) if why else "", n - 1))
+            return outcomes
+        outcomes = field_outcomes(planned, live)
+        log("'{}': read {}, after waiting {:.0f} s, shows {}.".format(
+            ctx, n, waited, _shown(outcomes)))
+        if _all_saved(outcomes):
+            notes.append(("Read back", "saved as planned only at read {}, "
+                          "after waiting {:.0f} s".format(n, waited)))
+    return outcomes
+
+
+def _apply_attempt(driver, url, ctx, diffs):
+    """One try at saving a structure's planned changes. Returns either
+    {"final": (status, notes)} — nothing more to do — or {"outcomes",
+    "notes", "skipped", "replaced"} once Save Changes was pressed and the
+    page read back. Raises LoginRedirect."""
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import Select
+
+    scope, why = _open_form(driver, url)
+    if why:
+        log("'{}': the page did not finish loading within {:.0f} s ({}) — "
+            "nothing was saved.".format(ctx, SETTLE_WAIT, why))
+        return {"final": ("NOT SAVED (the page did not finish loading)",
+                          [(f, "not saved: the page did not finish "
+                            "loading") for f, _o, _n in diffs])}
+
+    notes = []          # (field, what happened) for the Read Back column
+    skipped = 0
+    to_check = []       # (field, old, new, kind, elements, one_line)
+    for field, old, new in diffs:
         try:
             elements = scope.find_elements(By.NAME, field)
         except Exception:
             elements = []
         if not elements:
-            problems.append(field)
+            skipped += 1
+            notes.append((field, "skipped: not on the live page"))
             log("'{}': field '{}' vanished from the live page — skipped."
                 .format(ctx, field))
             continue
@@ -1495,34 +2011,43 @@ def _apply_one(driver, base_url, ctx, diffs, regen) -> str:
         el0 = elements[0]
         tag = el0.tag_name.lower()
         itype = (el0.get_attribute("type") or "").lower()
+        if tag == "select" and el0.get_attribute("multiple"):
+            skipped += 1
+            notes.append((field, "skipped: Apply does not change a "
+                          "multiple-choice list"))
+            log("'{}': '{}' is a multiple-choice list, which Apply does not "
+                "change — skipped.".format(ctx, field))
+            continue
         try:
-            if tag == "textarea" or (
-                    tag == "input" and itype in
-                    ("text", "email", "url", "number", "password", "")):
-                el0.clear()
-                if new:
-                    el0.send_keys(new)
+            if tag == "textarea" or (tag == "input" and itype in TEXT_TYPES):
+                driver.execute_script(SET_VALUE_JS, el0, new)
+                kind = "text"
             elif tag == "input" and itype == "checkbox":
-                should_check = bool(new)
-                if el0.is_selected() != should_check:
+                if el0.is_selected() != bool(new):
                     el0.click()
+                kind = "checkbox"
             elif tag == "input" and itype == "radio":
                 if not new:
-                    problems.append(field)
+                    skipped += 1
+                    notes.append((field, "skipped: a radio group cannot be "
+                                  "blanked"))
                     log("'{}': can't blank radio group '{}' — skipped."
                         .format(ctx, field))
                     continue
-                hit = False
+                hit = None
                 for el in elements:
                     if (el.get_attribute("value") or "") == new:
-                        if not el.is_selected():
-                            el.click()
-                        hit = True
+                        hit = el
                         break
-                if not hit:
-                    problems.append(field)
+                if hit is None:
+                    skipped += 1
+                    notes.append((field, "skipped: no such option"))
                     log("'{}': no radio option '{}' in group '{}' — skipped."
                         .format(ctx, new, field))
+                    continue
+                if not hit.is_selected():
+                    hit.click()
+                kind = "radio"
             elif tag == "select":
                 sel = Select(el0)
                 if new:
@@ -1532,47 +2057,175 @@ def _apply_one(driver, base_url, ctx, diffs, regen) -> str:
                         sel.select_by_value(new)
                 else:
                     sel.select_by_index(0)
+                kind = "select"
             else:
-                problems.append(field)
+                skipped += 1
+                notes.append((field, "skipped: unsupported element"))
                 log("'{}': unsupported element for field '{}' — skipped."
                     .format(ctx, field))
+                continue
         except Exception as e:
-            problems.append(field)
+            skipped += 1
+            notes.append((field, "skipped: could not be set ({})"
+                          .format(first_line(e))))
             log("'{}': couldn't set field '{}' ({}).".format(
-                ctx, field, e.__class__.__name__))
+                ctx, field, first_line(e)))
+            continue
+        to_check.append((field, old, new, kind, elements,
+                         tag == "input" and kind == "text"))
 
-    if len(problems) == len(diffs):
-        return "SKIPPED (no field could be set)"
+    if not to_check:
+        return {"final": ("NOT SAVED (no field could be set)", notes)}
 
-    # Submit the form — this is what persists the changes.
-    try:
-        btn = scope.find_element(
-            By.XPATH,
-            ".//input[@type='submit' and @name='x_process_changes']")
-    except Exception:
+    # Read every field back from the form before anything is saved.
+    for field, _old, new, kind, elements, one_line in to_check:
         try:
-            btn = driver.find_element(
-                By.XPATH,
-                "//input[@type='submit' and @name='x_process_changes']")
-        except Exception:
-            return "ERROR: Submit Changes button not found"
-    btn.click()
-    time.sleep(1.0)   # let the submit round-trip settle
+            observed = _form_value(driver, kind, elements)
+            held = form_holds(kind, new, observed)
+            why = "" if held else form_mismatch(kind, new, observed,
+                                                one_line)
+        except Exception as e:
+            held, why = False, "could not be read ({})".format(first_line(e))
+        if not held:
+            notes.append((field, "not saved: " + why))
+            log("'{}': field '{}' does not hold its planned value in the "
+                "form ({}) — nothing was saved for this structure."
+                .format(ctx, field, why))
+            return {"final": ("NOT SAVED (a field would not hold its value)",
+                              notes)}
 
-    if looks_like_login_page(driver.page_source, driver.current_url):
+    btn, count = _save_button(driver, scope)
+    if btn is None:
+        log("'{}': no Save Changes button is shown ({} on the page) — "
+            "nothing was saved.".format(ctx, count))
+        return {"final": ("NOT SAVED (no Save Changes button shown; {} on "
+                          "the page)".format(count), notes)}
+
+    try:
+        origin = driver.execute_script(DOC_JS)[1]
+    except Exception:
+        origin = None
+    # From here on the outcome is read from the page, never assumed.
+    try:
+        driver.execute_script(CLICK_JS, btn)
+    except Exception as e:
+        log("'{}': pressing Save Changes raised {} — the page is read "
+            "back to see what it holds.".format(ctx, first_line(e)))
+    after = _after_press(driver, origin, SAVE_WAIT)
+    if after == "pending":
+        log("'{}': Save Changes was pressed and a new page began, but it did "
+            "not finish loading within {:.0f} s, so what was saved is not "
+            "known. Run a dry run to see what the page holds."
+            .format(ctx, SAVE_WAIT))
+        return {"final": ("UNKNOWN (Save Changes pressed; the page after it "
+                          "did not finish loading)", notes)}
+    replaced = after == "loaded"
+    planned = [(f, o, n) for f, o, n, _k, _e, _l in to_check]
+    if replaced:
+        log("'{}': Save Changes was answered with the page {}."
+            .format(ctx, _answer_page(driver, planned)))
+    else:
+        log("'{}': the page did not change within {:.0f} s of Save Changes "
+            "— the page is read back to see what it holds."
+            .format(ctx, SAVE_WAIT))
+
+    try:
+        html, why = _load_config_page(driver, url)
+        here = driver.current_url
+    except Exception as e:
+        log("'{}': the configuration page could not be read back after "
+            "Save Changes ({}). Run a dry run to see what it holds."
+            .format(ctx, first_line(e)))
+        return {"final": ("UNKNOWN (Save Changes pressed; the page could not "
+                          "be read back)", notes)}
+    if looks_like_login_page(html, here):
         raise LoginRedirect()
+    if why:
+        log("'{}': the page read back after Save Changes did not finish "
+            "loading within {:.0f} s ({}). Run a dry run to see what it "
+            "holds.".format(ctx, SETTLE_WAIT, why))
+        return {"final": ("UNKNOWN (Save Changes pressed; the page read back "
+                          "did not finish loading)", notes)}
+    live, scoped = extract_fields(html)
+    if not scoped:
+        log("'{}': the page read back after Save Changes has no "
+            "configuration form. Run a dry run to see what it holds."
+            .format(ctx))
+        return {"final": ("UNKNOWN (Save Changes pressed; no configuration "
+                          "form on the page read back)", notes)}
+    outcomes = field_outcomes(planned, live)
+    if replaced:
+        outcomes = _read_again(driver, url, ctx, planned, outcomes, notes)
+    return {"outcomes": outcomes, "notes": notes, "skipped": skipped,
+            "replaced": replaced}
 
-    status = "Updated"
-    if problems:
-        status = "Updated ({} field(s) skipped)".format(len(problems))
+
+def _apply_one(driver, base_url, ctx, diffs, regen):
+    """Apply one structure's planned changes. Returns (status, read_back)
+    for the update log. Raises LoginRedirect on a login bounce.
+
+    1. The page is loaded and its scripts are waited for (SETTLE_JS); a
+       page that does not finish is not touched.
+    2. Each field is SET in the form, never typed (SET_VALUE_JS); a
+       multiple-choice list is never changed.
+    3. Each field set is read back from the form. If one does not hold its
+       planned value, nothing is saved for this structure.
+    4. Save Changes is pressed by a script click on the Save bar's button
+       (CLICK_JS), which does not depend on what Chrome has drawn.
+    5. The page that follows the press is waited for until it has finished
+       loading (DOC_JS); one that does not is UNKNOWN. Then the
+       configuration page is loaded again and each planned field is
+       compared with the plan as a dry run compares it, so the status says
+       what the page holds, whatever happened in between. The page that
+       answered the press is described in the log; if the page read back
+       does not show every field as planned, it is read again after about
+       2, 5 and 10 s (READ_AGAIN), each read logged.
+    6. If the press did not change the page and every planned field is
+       still unchanged, steps 1-5 run once more; never otherwise.
+    7. Regeneration only when every field set was saved as planned."""
+    url = config_url(base_url, ctx)
+    got = _apply_attempt(driver, url, ctx, diffs)
+    pressed_twice = False
+    if ("final" not in got and not got["replaced"]
+            and all(o == "unchanged" for _f, o in got["outcomes"])):
+        log("'{}': Save Changes did not change the page and every planned "
+            "field is unchanged — trying once more.".format(ctx))
+        pressed_twice = True
+        got = _apply_attempt(driver, url, ctx, diffs)
+    if "final" in got:
+        status, notes = got["final"]
+        return status, read_back_text(notes)
+
+    outcomes, notes = got["outcomes"], got["notes"]
+    for field, outcome in outcomes:
+        log("'{}': {} — {}.".format(ctx, field, outcome))
+    status = saved_status(outcomes, got["skipped"])
+    notes = outcomes + notes
+    if pressed_twice:
+        notes.append(("Save Changes", "pressed twice; the first press did "
+                      "not change the page"))
 
     if regen:
-        driver.get(regen_url(base_url, ctx))
-        time.sleep(0.8)   # let the regeneration request settle
-        if looks_like_login_page(driver.page_source, driver.current_url):
-            raise LoginRedirect()
-        status += " + regenerated"
-    return status
+        if status.startswith("Saved"):
+            try:
+                driver.get(regen_url(base_url, ctx))
+                time.sleep(0.8)   # let the regeneration request settle
+                if looks_like_login_page(driver.page_source,
+                                         driver.current_url):
+                    raise LoginRedirect()
+                status += " + regenerated"
+                log("'{}': regeneration requested.".format(ctx))
+            except LoginRedirect:
+                raise
+            except Exception as e:
+                status += " + regeneration failed ({})".format(first_line(e))
+                log("'{}': regeneration failed ({}).".format(
+                    ctx, first_line(e)))
+        else:
+            status += " (not regenerated)"
+            log("'{}': not regenerated, because a field was not saved as "
+                "planned.".format(ctx))
+    return status, read_back_text(notes)
 
 
 # ---------------------------------------------------------------------------
@@ -1645,8 +2298,8 @@ PAGE = """<!DOCTYPE html>
  .msg-x:hover{background:rgba(60,60,70,.12)}
  #cerr .msg-x{position:absolute;top:.35rem;right:.4rem;margin:0}
  @media (prefers-reduced-motion: no-preference){ #status{transition:background .3s} }
-/* DC-LOG 1 styles */
-.logbar{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap}
+/* DC-LOG 2 styles */
+.logbar{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;margin-bottom:1rem}
 .logbar h2{margin:0}
 .logbar #logcopy{margin-left:auto}
 .logbar #logcopy,.logbar #logclear{padding:.25rem .6rem;font-size:.85rem}
@@ -1797,14 +2450,14 @@ PAGE = """<!DOCTYPE html>
 
 <div id="status" role="status" aria-live="polite">Idle — choose an operation and load a workbook.</div>
 <progress id="prog" max="1" value="0" hidden aria-label="Job progress"></progress>
-<!-- DC-LOG 1: the log bar, the inline Clear question, the box, and the
+<!-- DC-LOG 2: the log bar, the inline Clear question, the box, and the
      whole-run fallback for a browser that will not write the clipboard.
      Shared verbatim; see the script's DC-LOG block. -->
 <div class="logbar">
  <h2 style="font-size:1rem">Log</h2>
  <span id="logheld" class="lognote" hidden></span>
  <span id="logmsg" class="lognote" role="status" aria-live="polite"></span>
- <button type="button" id="logcopy" class="secondary">Copy log</button>
+ <button type="button" id="logcopy" class="secondary">Copy status and log</button>
  <button type="button" id="logclear" class="secondary" disabled>Clear for a new run</button>
 </div>
 <div id="clearask" class="clearask" hidden>
@@ -1816,7 +2469,7 @@ PAGE = """<!DOCTYPE html>
 </div>
 <div id="log" tabindex="0" aria-label="Activity log"></div>
 <textarea id="logfull" class="logfull" hidden readonly rows="8"
- aria-label="The whole log of the current run, selected for copying"></textarea>
+ aria-label="The status and the whole log of the current run, selected for copying"></textarea>
 <!-- /DC-LOG -->
 </main>
 <script>
@@ -1889,42 +2542,101 @@ function logSelectAll(){
   box.focus();
 }
 
-/* DC-LOG 1: Copy log and Clear for a new run. Shared by every module with
-   a log and duplicated verbatim; modules/_verify_pages.py fails if any
-   copy differs. There is no backslash anywhere in it, because some pages
-   are raw strings and some are not, and the same bytes must serve both.
-   Copy log copies the WHOLE current run from the module (/api/log), not
-   whatever the box holds: the box keeps the last 200 lines and may still
-   show the end of the previous run. Every page's poll() calls
-   logStateSeen(s) with the state it just read. */
+/* DC-LOG 2: Copy status and log, Clear for a new run, and the one way a
+   page writes its status line. Shared by every module with a log and
+   duplicated verbatim; modules/_verify_pages.py fails if any copy
+   differs. There is no backslash anywhere in it, because some pages are
+   raw strings and some are not, and the same bytes must serve both.
+   Copy status and log copies the status line, then the WHOLE current run
+   from the module (/api/log), not whatever the box holds: the box keeps
+   the last 200 lines and may still show the end of the previous run. A
+   link in the status line that carries data-path is copied as its label
+   and that path. Every page's poll() calls logStateSeen(s) with the state
+   it just read, and writes #status only through logShow(). */
 var LOG_NL = String.fromCharCode(10);
 var logLastCleared = null;
+var logPhase = '';
+var logShown = null;
+/* #status is a live region and every page polls every 1.5 s, so the line
+   is written only when it changes: rewriting the same words can have them
+   read out again each time. */
+function logShow(cls, html){
+  var st = document.getElementById('status');
+  if(!st) return;
+  if(st.className !== cls) st.className = cls;
+  if(logShown !== html){ st.innerHTML = html; logShown = html; }
+}
+/* For a value going into an attribute, such as data-path. */
+function logAttr(t){
+  return String(t).split('&').join('&amp;').split('"').join('&quot;')
+    .split('<').join('&lt;').split('>').join('&gt;');
+}
+/* The status line as text: a line break for each br, a list item on a
+   line of its own, and a link as its label, then its path if it has one. */
+function logStatusText(){
+  var st = document.getElementById('status');
+  if(!st) return '';
+  var out = [];
+  (function walk(n){
+    var kids = n.childNodes || [];
+    for(var i = 0; i < kids.length; i++){
+      var c = kids[i];
+      if(c.nodeType === 3){ out.push(c.nodeValue); continue; }
+      if(c.nodeType !== 1) continue;
+      var tag = String(c.nodeName).toUpperCase();
+      if(tag === 'BR'){ out.push(LOG_NL); continue; }
+      if(tag === 'A'){
+        var p = c.getAttribute('data-path');
+        out.push(c.textContent + (p ? ': ' + p : ''));
+        continue;
+      }
+      if(tag === 'LI') out.push(LOG_NL + '- ');
+      walk(c);
+    }
+  })(st);
+  return out.join('').split(LOG_NL).map(function(l){ return l.trim(); })
+    .join(LOG_NL).trim();
+}
 function logLines(txt){
   if(!txt) return 0;
   var t = txt.charAt(txt.length - 1) === LOG_NL ? txt.slice(0, -1) : txt;
   return t.split(LOG_NL).length;
 }
-function logOffer(txt){
+function logOffer(txt, what){
   var ta = document.getElementById('logfull');
   if(!ta){ logSelectAll(); return; }
   ta.value = txt; ta.hidden = false; ta.focus(); ta.select();
-  var n = logLines(txt);
-  logSay('The whole current run (' + n + ' line' + (n === 1 ? '' : 's') +
-         ') is selected below. Press Ctrl+C (Cmd+C) to copy.');
+  logSay(what + ' selected below. Press Ctrl+C (Cmd+C) to copy.');
 }
+/* The status line is copied with the log unless the page is idle, when
+   the line is only an instruction, not a result. */
 function copyLog(){
   fetch('/api/log', {cache:'no-store'})
     .then(function(r){ return r.ok ? r.text() : Promise.reject(r.status); })
     .then(function(txt){
-      if(!txt){ logSay('Nothing has been logged since the last clean start.'); return; }
+      var st = logPhase === 'idle' ? '' : logStatusText();
+      if(!txt && !st){ logSay('Nothing has been logged since the last clean start.'); return; }
       var n = logLines(txt);
-      var said = 'The whole current run, ' + n + ' line' +
-                 (n === 1 ? '' : 's') + ', copied to the clipboard.';
-      if(navigator.clipboard && navigator.clipboard.writeText){
-        navigator.clipboard.writeText(txt).then(
-          function(){ logSay(said); }, function(){ logOffer(txt); });
+      var lines = n + ' line' + (n === 1 ? '' : 's');
+      var all, said, what;
+      if(!txt){
+        all = 'Status:' + LOG_NL + st + LOG_NL;
+        said = 'The status line copied to the clipboard. Nothing has been logged since the last clean start.';
+        what = 'The status line is';
+      }else if(st){
+        all = 'Status:' + LOG_NL + st + LOG_NL + LOG_NL + 'Log:' + LOG_NL + txt;
+        said = 'The status and the whole current run, ' + lines + ', copied to the clipboard.';
+        what = 'The status and the whole current run (' + lines + ') are';
       }else{
-        logOffer(txt);
+        all = txt;
+        said = 'The whole current run, ' + lines + ', copied to the clipboard.';
+        what = 'The whole current run (' + lines + ') is';
+      }
+      if(navigator.clipboard && navigator.clipboard.writeText){
+        navigator.clipboard.writeText(all).then(
+          function(){ logSay(said); }, function(){ logOffer(all, what); });
+      }else{
+        logOffer(all, what);
       }
     }, function(){
       logSay('Could not read the log from the module. Is it still running?');
@@ -1936,6 +2648,7 @@ function logRunning(s){
   return !!s && ['idle', 'done', 'error'].indexOf(s.phase) < 0;
 }
 function logStateSeen(s){
+  logPhase = (s && s.phase) || '';
   var running = logRunning(s),
       btn = document.getElementById('logclear'),
       ask = document.getElementById('clearask');
@@ -2288,6 +3001,14 @@ function syncOp(){
   goscrape.hidden=upd; godry.hidden=!upd; goapply.hidden=!upd;
 }
 
+// The workbook each side has loaded, by path, from the polled state, so a
+// Scan keeps it selected: the list is newest first, and a list showing one
+// workbook while another is loaded invites loading the wrong one.
+const loadedPath={inventory:'',report:''};
+function noteLoaded(s){
+  loadedPath.inventory=(s.targets&&s.targets.path)||'';
+  loadedPath.report=(s.report&&s.report.path)||'';
+}
 async function doScan(kind,folder,sel,loadBtn,noun){
   const {ok,j}=await api('/api/scan',{kind:kind,folder:folder});
   if(!ok){flashErr(j.error||'Scan failed.');return;}
@@ -2295,10 +3016,13 @@ async function doScan(kind,folder,sel,loadBtn,noun){
   if(!j.files.length){
     sel.append(new Option('— no '+noun+' found —',''));
     sel.disabled=true; loadBtn.disabled=true;
-    flashErr('No matching workbooks in that folder.');
+    flashErr('No '+(j.pattern||'matching')+' workbooks in that folder.'+
+      (kind==='inventory'?' To load a config report, choose Update configurations first.':''));
     return;
   }
   j.files.forEach(f=>sel.append(new Option(f.name+'  ('+f.modified+')',f.path)));
+  const keep=loadedPath[kind];
+  if(keep&&j.files.some(f=>f.path===keep)){sel.value=keep;}
   sel.disabled=false; loadBtn.disabled=false;
   flash(j.files.length+' workbook(s) found — pick one and click Load.');
 }
@@ -2395,7 +3119,7 @@ stopBtn.addEventListener('click', async ()=>{
 
 async function poll(){
   const s=await (await fetch('/api/state')).json();
-  renderLog(s.log); formSeen(s); logStateSeen(s);
+  renderLog(s.log); formSeen(s); logStateSeen(s); noteLoaded(s);
   paused=!!s.paused;
   pauseBtn.textContent=paused?'Resume':'Pause';
   const running=['starting','harvesting','scraping','checking','updating','writing'].includes(s.phase);
@@ -2407,11 +3131,11 @@ async function poll(){
   }
   if(s.targets.loaded){
     tgtsum.className='sum loaded';
-    tgtsum.textContent=s.targets.count+' structures · '+s.targets.source;
+    tgtsum.textContent=s.targets.count+(s.targets.count===1?' structure · ':' structures · ')+s.targets.source;
   }
   if(s.report.loaded){
     repsum.className='sum loaded';
-    repsum.textContent=s.report.count+' structures · '+s.report.source;
+    repsum.textContent=s.report.count+(s.report.count===1?' structure · ':' structures · ')+s.report.source;
   }
   planInfo=s.plan;
   if(s.plan.ready){
@@ -2440,20 +3164,17 @@ async function poll(){
   const counts=p.total>0?' ('+p.current+'/'+p.total+')':'';
   const msg=p.msg?' — '+p.msg:'';
   let links='';
-  if(s.last_file) links+='<br><a href="/download">Download workbook</a>';
-  if(s.plan_file) links+='<br><a href="/download-plan">Download dry-run preview</a>';
+  if(s.last_file) links+='<br><a href="/download"'+(s.last_file?' data-path="'+logAttr(s.last_file)+'"':'')+'>Download workbook</a>';
+  if(s.plan_file) links+='<br><a href="/download-plan"'+(s.plan_file?' data-path="'+logAttr(s.plan_file)+'"':'')+'>Download dry-run preview</a>';
   if(s.phase==='done'){
-    status.className=logTone(s); status.innerHTML='Done: '+esc(s.summary)+links;
+    logShow(logTone(s),'Done: '+esc(s.summary)+links);
   }else if(s.phase==='error'){
-    status.className='error'; status.innerHTML='Error: '+esc(s.summary)+links;
+    logShow('error','Error: '+esc(s.summary)+links);
   }else if(s.phase==='idle'){
-    if(!status.textContent||status.className!==''){
-      status.className='';
-      status.textContent='Idle — choose an operation and load a workbook.';
-    }
+    logShow('',esc(s.summary?'Idle — '+s.summary
+                   :'Idle — choose an operation and load a workbook.'));
   }else{
-    status.className='';
-    status.textContent=(paused?'Paused':cap(s.phase))+counts+msg;
+    logShow('',esc((paused?'Paused':cap(s.phase))+counts+msg));
   }
 }
 syncOp(); refreshTargets(); poll(); setInterval(poll,1500);
@@ -3010,7 +3731,8 @@ def make_handler(session: dict, page: bytes):
                 if err_:
                     return self._json({"error": err_}, 400)
                 return self._json(
-                    {"files": scan_workbooks(folder, SCAN_GLOBS[kind])})
+                    {"files": scan_workbooks(folder, SCAN_GLOBS[kind]),
+                     "pattern": SCAN_GLOBS[kind]})
 
             if self.path == "/api/load":
                 if self._running():
@@ -3030,12 +3752,13 @@ def make_handler(session: dict, page: bytes):
                     if kind == "inventory":
                         types = parse_inventory(path)
                         set_scrape_model(
-                            {"types": types,
+                            {"types": types, "path": path,
                              "source": "loaded from " + os.path.basename(path)})
                     else:
                         types, rows, fields = parse_config_report(path)
                         set_upd_model(
                             {"types": types, "rows": rows, "fields": fields,
+                             "path": path,
                              "source": "loaded from " + os.path.basename(path)})
                 except ValueError as e:
                     return self._json({"error": str(e)}, 400)

@@ -521,7 +521,7 @@ APP_HTML = r"""<!DOCTYPE html>
 
 </main>
 <footer>
-  <p>DC Admin Suite · shell v1.13.0 · runs locally on your computer; nothing is
+  <p>DC Admin Suite · shell v1.13.1 · runs locally on your computer; nothing is
      sent anywhere except to your Digital Commons instance through your own
      Chrome session.</p>
 </footer>
@@ -593,10 +593,17 @@ function applyBranding() {
 
 function renderInstructions() {
   const ins = STATE.instructions;
+  // A platform may give one command per shell (Windows: PowerShell and
+  // Command Prompt), each labeled, each with its own Copy button.
+  const cmd = (c) => {
+    const what = c.label ? "Copy " + c.label + " command" : "Copy command";
+    return `${c.label ? `<p class="cmd-label">${esc(c.label)}:</p>` : ""}
+    <pre class="cmd" tabindex="0">${esc(c.command)}</pre>
+    <button class="secondary copy-btn" data-cmd="${esc(c.command)}" data-label="${esc(what)}">${esc(what)}</button>`;
+  };
   const block = (o) => `
     <ol class="steps">${o.steps.map(s => `<li>${esc(s)}</li>`).join("")}</ol>
-    <pre class="cmd" tabindex="0">${esc(o.command)}</pre>
-    <button class="secondary copy-btn" data-cmd="${esc(o.command)}">Copy command</button>`;
+    ${(o.commands || [{label: "", command: o.command}]).map(cmd).join("")}`;
   $("winInstructions").innerHTML = block(ins.windows);
   $("macInstructions").innerHTML = block(ins.mac);
   $("winInstructions2").innerHTML = block(ins.windows);
@@ -610,7 +617,7 @@ function renderInstructions() {
       try { await navigator.clipboard.writeText(btn.dataset.cmd);
             btn.textContent = "Copied!"; }
       catch { btn.textContent = "Select the command above and copy it"; }
-      setTimeout(() => btn.textContent = "Copy command", 2500);
+      setTimeout(() => btn.textContent = btn.dataset.label || "Copy command", 2500);
     });
   });
 }

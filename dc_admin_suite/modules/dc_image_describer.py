@@ -115,7 +115,7 @@ MANIFEST = {
     "id": "image-describer",
     "name": "Image Description Generator",
     "description": "Generate reviewable alt-text and transcription sidecar files for folders of scanned images, using a Gemini, OpenAI, or Claude endpoint.",
-    "version": "1.12.3",
+    "version": "1.12.4",
     "requires": ["openpyxl", "pymupdf"],
 }
 
@@ -2617,7 +2617,7 @@ CLEAR_RESETS = {"last_file": None, "out_dir": None, "warnings": 0,
                 "paused": False}
 
 
-# ---- DC-LOG 1 -------------------------------------------------------------
+# ---- DC-LOG 2 -------------------------------------------------------------
 # The whole log of the current run, and Clear for a new run. Shared by
 # every module with a log and duplicated verbatim, because modules are
 # standalone: modules/_verify_pages.py fails if any copy differs.
@@ -4118,8 +4118,8 @@ PAGE = r"""<!DOCTYPE html>
  .msg-x:hover{background:rgba(60,60,70,.12)}
  #cerr .msg-x{position:absolute;top:.35rem;right:.4rem;margin:0}
  @media (prefers-reduced-motion: no-preference){ #status{transition:background .3s} }
-/* DC-LOG 1 styles */
-.logbar{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap}
+/* DC-LOG 2 styles */
+.logbar{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;margin-bottom:1rem}
 .logbar h2{margin:0}
 .logbar #logcopy{margin-left:auto}
 .logbar #logcopy,.logbar #logclear{padding:.25rem .6rem;font-size:.85rem}
@@ -4387,14 +4387,14 @@ PAGE = r"""<!DOCTYPE html>
  <div id="prevout" tabindex="0" aria-label="Preview of the generated sidecar"></div>
 </div>
 
-<!-- DC-LOG 1: the log bar, the inline Clear question, the box, and the
+<!-- DC-LOG 2: the log bar, the inline Clear question, the box, and the
      whole-run fallback for a browser that will not write the clipboard.
      Shared verbatim; see the script's DC-LOG block. -->
 <div class="logbar">
  <h2 style="font-size:1rem">Log</h2>
  <span id="logheld" class="lognote" hidden></span>
  <span id="logmsg" class="lognote" role="status" aria-live="polite"></span>
- <button type="button" id="logcopy" class="secondary">Copy log</button>
+ <button type="button" id="logcopy" class="secondary">Copy status and log</button>
  <button type="button" id="logclear" class="secondary" disabled>Clear for a new run</button>
 </div>
 <div id="clearask" class="clearask" hidden>
@@ -4406,7 +4406,7 @@ PAGE = r"""<!DOCTYPE html>
 </div>
 <div id="log" tabindex="0" aria-label="Activity log"></div>
 <textarea id="logfull" class="logfull" hidden readonly rows="8"
- aria-label="The whole log of the current run, selected for copying"></textarea>
+ aria-label="The status and the whole log of the current run, selected for copying"></textarea>
 <!-- /DC-LOG -->
 </main>
 
@@ -4507,42 +4507,101 @@ function logSelectAll(){
   box.focus();
 }
 
-/* DC-LOG 1: Copy log and Clear for a new run. Shared by every module with
-   a log and duplicated verbatim; modules/_verify_pages.py fails if any
-   copy differs. There is no backslash anywhere in it, because some pages
-   are raw strings and some are not, and the same bytes must serve both.
-   Copy log copies the WHOLE current run from the module (/api/log), not
-   whatever the box holds: the box keeps the last 200 lines and may still
-   show the end of the previous run. Every page's poll() calls
-   logStateSeen(s) with the state it just read. */
+/* DC-LOG 2: Copy status and log, Clear for a new run, and the one way a
+   page writes its status line. Shared by every module with a log and
+   duplicated verbatim; modules/_verify_pages.py fails if any copy
+   differs. There is no backslash anywhere in it, because some pages are
+   raw strings and some are not, and the same bytes must serve both.
+   Copy status and log copies the status line, then the WHOLE current run
+   from the module (/api/log), not whatever the box holds: the box keeps
+   the last 200 lines and may still show the end of the previous run. A
+   link in the status line that carries data-path is copied as its label
+   and that path. Every page's poll() calls logStateSeen(s) with the state
+   it just read, and writes #status only through logShow(). */
 var LOG_NL = String.fromCharCode(10);
 var logLastCleared = null;
+var logPhase = '';
+var logShown = null;
+/* #status is a live region and every page polls every 1.5 s, so the line
+   is written only when it changes: rewriting the same words can have them
+   read out again each time. */
+function logShow(cls, html){
+  var st = document.getElementById('status');
+  if(!st) return;
+  if(st.className !== cls) st.className = cls;
+  if(logShown !== html){ st.innerHTML = html; logShown = html; }
+}
+/* For a value going into an attribute, such as data-path. */
+function logAttr(t){
+  return String(t).split('&').join('&amp;').split('"').join('&quot;')
+    .split('<').join('&lt;').split('>').join('&gt;');
+}
+/* The status line as text: a line break for each br, a list item on a
+   line of its own, and a link as its label, then its path if it has one. */
+function logStatusText(){
+  var st = document.getElementById('status');
+  if(!st) return '';
+  var out = [];
+  (function walk(n){
+    var kids = n.childNodes || [];
+    for(var i = 0; i < kids.length; i++){
+      var c = kids[i];
+      if(c.nodeType === 3){ out.push(c.nodeValue); continue; }
+      if(c.nodeType !== 1) continue;
+      var tag = String(c.nodeName).toUpperCase();
+      if(tag === 'BR'){ out.push(LOG_NL); continue; }
+      if(tag === 'A'){
+        var p = c.getAttribute('data-path');
+        out.push(c.textContent + (p ? ': ' + p : ''));
+        continue;
+      }
+      if(tag === 'LI') out.push(LOG_NL + '- ');
+      walk(c);
+    }
+  })(st);
+  return out.join('').split(LOG_NL).map(function(l){ return l.trim(); })
+    .join(LOG_NL).trim();
+}
 function logLines(txt){
   if(!txt) return 0;
   var t = txt.charAt(txt.length - 1) === LOG_NL ? txt.slice(0, -1) : txt;
   return t.split(LOG_NL).length;
 }
-function logOffer(txt){
+function logOffer(txt, what){
   var ta = document.getElementById('logfull');
   if(!ta){ logSelectAll(); return; }
   ta.value = txt; ta.hidden = false; ta.focus(); ta.select();
-  var n = logLines(txt);
-  logSay('The whole current run (' + n + ' line' + (n === 1 ? '' : 's') +
-         ') is selected below. Press Ctrl+C (Cmd+C) to copy.');
+  logSay(what + ' selected below. Press Ctrl+C (Cmd+C) to copy.');
 }
+/* The status line is copied with the log unless the page is idle, when
+   the line is only an instruction, not a result. */
 function copyLog(){
   fetch('/api/log', {cache:'no-store'})
     .then(function(r){ return r.ok ? r.text() : Promise.reject(r.status); })
     .then(function(txt){
-      if(!txt){ logSay('Nothing has been logged since the last clean start.'); return; }
+      var st = logPhase === 'idle' ? '' : logStatusText();
+      if(!txt && !st){ logSay('Nothing has been logged since the last clean start.'); return; }
       var n = logLines(txt);
-      var said = 'The whole current run, ' + n + ' line' +
-                 (n === 1 ? '' : 's') + ', copied to the clipboard.';
-      if(navigator.clipboard && navigator.clipboard.writeText){
-        navigator.clipboard.writeText(txt).then(
-          function(){ logSay(said); }, function(){ logOffer(txt); });
+      var lines = n + ' line' + (n === 1 ? '' : 's');
+      var all, said, what;
+      if(!txt){
+        all = 'Status:' + LOG_NL + st + LOG_NL;
+        said = 'The status line copied to the clipboard. Nothing has been logged since the last clean start.';
+        what = 'The status line is';
+      }else if(st){
+        all = 'Status:' + LOG_NL + st + LOG_NL + LOG_NL + 'Log:' + LOG_NL + txt;
+        said = 'The status and the whole current run, ' + lines + ', copied to the clipboard.';
+        what = 'The status and the whole current run (' + lines + ') are';
       }else{
-        logOffer(txt);
+        all = txt;
+        said = 'The whole current run, ' + lines + ', copied to the clipboard.';
+        what = 'The whole current run (' + lines + ') is';
+      }
+      if(navigator.clipboard && navigator.clipboard.writeText){
+        navigator.clipboard.writeText(all).then(
+          function(){ logSay(said); }, function(){ logOffer(all, what); });
+      }else{
+        logOffer(all, what);
       }
     }, function(){
       logSay('Could not read the log from the module. Is it still running?');
@@ -4554,6 +4613,7 @@ function logRunning(s){
   return !!s && ['idle', 'done', 'error'].indexOf(s.phase) < 0;
 }
 function logStateSeen(s){
+  logPhase = (s && s.phase) || '';
   var running = logRunning(s),
       btn = document.getElementById('logclear'),
       ask = document.getElementById('clearask');
@@ -5302,8 +5362,6 @@ async function poll(){
   }
   if(s.tools&&Object.keys(s.tools).length&&!Object.keys(tools).length)
    renderTools(s.tools);
-  const st=$('status');
-  st.className=logTone(s);
   let msg='';
   if(s.phase==='idle')msg='Idle — scan a folder to queue images.';
   else if(running){
@@ -5311,11 +5369,11 @@ async function poll(){
     (s.progress.total?' ('+s.progress.current+'/'+s.progress.total+')':'');
   }
   else msg=s.summary||s.phase;
-  st.innerHTML=esc(msg)+
+  logShow(logTone(s),esc(msg)+
    (s.phase==='done'&&s.last_file
-    ?' — <a href="/download">Download the report</a>':'')+
+    ?' — <a href="/download"'+(s.last_file?' data-path="'+logAttr(s.last_file)+'"':'')+'>Download the report</a>':'')+
    (s.phase==='error'&&s.last_file
-    ?' — <a href="/download">Download the partial report</a>':'');
+    ?' — <a href="/download"'+(s.last_file?' data-path="'+logAttr(s.last_file)+'"':'')+'>Download the partial report</a>':''));
   const prog=$('prog');
   if(s.progress.total&&running){
    prog.hidden=false;prog.max=s.progress.total;prog.value=s.progress.current;

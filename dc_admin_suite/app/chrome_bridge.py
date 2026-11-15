@@ -233,6 +233,13 @@ def chrome_instructions(port: int) -> dict:
         '--remote-debugging-port={p} '
         '--user-data-dir="%LOCALAPPDATA%\\DCAdminSuiteChrome"'
     ).format(p=port)
+    # PowerShell does not expand %LOCALAPPDATA%, and runs a quoted path
+    # only after the call operator &, so it gets a command of its own.
+    ps_cmd = (
+        '& "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" '
+        '--remote-debugging-port={p} '
+        '--user-data-dir="$env:LOCALAPPDATA\\DCAdminSuiteChrome"'
+    ).format(p=port)
     mac_cmd = (
         '"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" '
         "--remote-debugging-port={p} "
@@ -244,16 +251,21 @@ def chrome_instructions(port: int) -> dict:
                 "You do NOT need to close Chrome windows you already have "
                 "open — the command below starts a separate debug instance "
                 "with its own profile that runs alongside your normal Chrome.",
-                "Press Windows key + R, type cmd, and press Enter.",
-                "Paste the command below and press Enter. A new Chrome window "
-                "opens using a separate profile just for this suite.",
-                "If you see 'The system cannot find the path specified' or "
-                "'not recognized', Chrome is installed somewhere other than "
-                "the standard location — see the note below.",
+                "Open PowerShell (Start menu, type PowerShell, press Enter), "
+                "or Command Prompt (Windows key + R, type cmd, press Enter).",
+                "Paste the command for the one you opened and press Enter. A "
+                "new Chrome window opens using a separate profile just for "
+                "this suite.",
+                "If you see 'not recognized', 'cannot find the path' or 'The "
+                "system cannot find the path specified', Chrome is installed "
+                "somewhere other than the standard location — see the note "
+                "below.",
                 "In that Chrome window, go to your Digital Commons instance "
                 "and log in as an administrator.",
             ],
-            "command": win_cmd,
+            "command": ps_cmd,
+            "commands": [{"label": "PowerShell", "command": ps_cmd},
+                         {"label": "Command Prompt", "command": win_cmd}],
         },
         "mac": {
             "steps": [

@@ -2536,7 +2536,10 @@ def test_the_paged_fallback_still_works_if_showall_is_ignored():
         rows, gallery = M.crawl_listing(BASE, "etd", False, "pending",
                                         "cookie")
         check("note . an empty state yields no rows", len(rows), 0)
-        check("note . and says nothing at all", said, [])
+        # 1.0.8: an empty state is said to be empty, as the admin-page path
+        # already said it; nothing in it claims a success.
+        check("note . and says only that it is empty", said,
+              ["listing: no records in the 'Not yet posted' state"])
 
         # A structure that fits in one page anyway proves nothing about
         # x_showall either way, so it is silent too.
@@ -2544,7 +2547,10 @@ def test_the_paged_fallback_still_works_if_showall_is_ignored():
         calls.clear(); said.clear()
         rows, gallery = M.crawl_listing(BASE, "etd", False, "published",
                                         "cookie")
-        check("note . a structure smaller than one page is silent", said, [])
+        # 1.0.8: every state that holds records says how many. A staff
+        # test read the silence of one-page states as records missing.
+        check("note . a structure smaller than one page says its count",
+              said, ["listing: 12 record(s) in the 'Posted' state"])
         check("note . though its rows still come back", len(rows), 12)
     finally:
         M.fetch_html = real_fetch
@@ -4174,6 +4180,10 @@ def test_the_browser_never_loads_the_big_listing():
     check_true("bridge-line . and no FAILED anywhere in it",
                "FAILED" not in ok_line.upper().replace("NOT SET", ""),
                ok_line)
+    # 1.0.8: a connection that has its time does not list Selenium's levers
+    # to staff ("class-level lever unavailable (AttributeError)").
+    check("bridge-line . a connection that got its time names no levers",
+          ok_line, "command timeout 300s, as asked; page-load timeout set")
     short = M.timeout_report(120, 300, "instance: _timeout", True)
     check_true("bridge-line . a connection short of it says NOT, with the "
                "number", "is 120s, NOT the 300s asked" in short, short)
@@ -4184,6 +4194,8 @@ def test_the_browser_never_loads_the_big_listing():
     check_true("bridge-line . a page-load timeout that failed is named",
                "page-load timeout NOT set (WebDriverException)" in unread,
                unread)
+    check_true("bridge-line . a connection short of it names its levers",
+               "(levers: instance: _timeout)" in short, short)
     src2 = Path(M.__file__).read_text(encoding="utf-8")
     body2 = src2[src2.index("def download_worker("):]
     body2 = body2[:body2.index("def read_failed_rows(")]
@@ -7524,6 +7536,39 @@ def test_the_modules_wording_names_no_vendor_and_no_agreement():
                re.search(r"\bbepress\b", lowered) is None, "")
     check_true("wording . and it does say what actually happens",
                "verify that you are present" in lowered, "")
+
+
+def test_a_built_copy_unzips_on_windows():
+    """No path in a build is too long for Windows' built-in unzip, and the
+    build's final check refuses one that is. A field template named for
+    every structure type it applies to once stopped a staff install."""
+    build = _private_terms()
+    limit = build.MAX_PATH_IN_COPY
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        ok = "a/" + "b" * (limit - 7) + ".html"
+        long = "a/" + "c" * (limit - 6) + ".html"
+        for rel in (ok, long):
+            (base / rel).parent.mkdir(parents=True, exist_ok=True)
+            (base / rel).write_text("x", encoding="utf-8")
+        check("build-paths . a path at the limit passes and one over it "
+              "does not", [len(ok), len(long), [p.split(" ")[0] for p in
+                           build._long_path_problems(base)]],
+              [limit, limit + 1, [long]])
+        check_true("build-paths . the final check refuses it",
+                   any(p.startswith(long + " is ") and "characters long"
+                       in p for p in build._verify(base)), "")
+    repo = Path(build.REPO)
+    too_long = []
+    for path in repo.rglob("*"):
+        rel = path.relative_to(repo)
+        if build._skip(path) or any(part in build.SKIP_DIRS
+                                     for part in rel.parts):
+            continue
+        if len(rel.as_posix()) > limit:
+            too_long.append(rel.as_posix())
+    check("build-paths . no path in this tree is too long to ship",
+          too_long, [])
 
 
 def test_both_endpoints_refuse_a_fetch_path_they_cannot_take():
@@ -12217,6 +12262,8 @@ def test_the_idle_line_says_what_to_do_next():
              (False, True, False), (True, False, True))
     for loaded, resume, inv in cases:
         harness = ("const status={className:'',textContent:'Idle.'};\n"
+                   "function esc(t){ return t; }\n"
+                   "function logShow(c,h){ status.className=c; status.textContent=h; }\n"
                    "const jobResume={checked:%s}; let hierLoaded=%s;\n"
                    "const kinventory={checked:%s};\n"
                    "const cap=t=>t.charAt(0).toUpperCase()+t.slice(1)+'…';\n"
@@ -12241,14 +12288,15 @@ def test_the_idle_line_says_what_to_do_next():
                + words +
                "\nconsole.log([goWord(),"
                "phaseWord({phase:'downloading',inventory:true}),"
-               "phaseWord({phase:'downloading',inventory:false}),"
+               "phaseWord({phase:'downloading',inventory:false,fetching:true}),"
+               "phaseWord({phase:'downloading',inventory:false,fetching:false}),"
                "phaseWord({phase:'starting',inventory:true})].join('|'));"
                "kinventory.checked=false; console.log(goWord());")
     r = _run_node(node, harness)
     check("idle . an inventory is worded as one, a download as one",
           r.stdout.strip().splitlines() if r.returncode == 0
           else r.stderr[-200:],
-          ["Start inventory|Inventorying…|Downloading…|Starting…",
+          ["Start inventory|Inventorying…|Downloading…|Planning…|Starting…",
            "Start downloads"])
     check_true("idle . and the poller repaints it every time it is idle",
                "}else if(s.phase==='idle'){\n    idleStatus();" in page,
@@ -12855,6 +12903,463 @@ def test_stop_does_not_wait_for_the_planning_listing():
           [l for l in lines if "LATE NOTE" in str(l)], [])
 
 
+# ---------------------------------------------------------------------------
+# The late-2026 admin pages. Markup copied from pages saved on the live
+# server (an ETD collection, an event community, a series, a gallery);
+# names, titles, slugs and numbers invented.
+# ---------------------------------------------------------------------------
+def _late_listing(rows, nxt=True, people="Author"):
+    body = "".join(
+        '<tr><td class="field-articleno" valign="top"> {0}  </td>'
+        '<td>Person {0}</td><td>Title {0}</td><td>{1}</td>'
+        '<td>Mon Nov  2 2026</td><td>No</td><td>No</td>'
+        '<td><a href="#">Assign</a></td></tr>'.format(a, ev)
+        for a, ev in rows)
+    pager = ('<a href="editor.cgi?context=example-etd&amp;page=0">Previous</a>'
+             ' Page 1 of 2 '
+             '<a href="editor.cgi?context=example-etd&amp;page=2">Next</a>'
+             if nxt else "")
+    return ('<html><head><script>window.pageData = {};</script></head><body>'
+            '<table class="MenuMain"><tr><td>'
+            '<table class="manage-submissions"><tr><td>Theses list</td></tr>'
+            '<tr><td>State: <select><option>All</option></select></td></tr>'
+            '<tr><td>Table preferences</td></tr></table>'
+            '<table class="manage-results"><tr><th>ID</th><th>' + people +
+            '</th><th>Title</th><th>Last Event</th><th>Date of Last Event'
+            '</th><th>Waiting for Administrator</th><th>Locked by '
+            'Administrator</th><th>Administrator</th></tr>' + body +
+            '</table>' + pager + '</td></tr></table></body></html>')
+
+
+def _late_revision(user, date, comment, links, show="NO_SHOW"):
+    cells = "".join(
+        '<td class="act"><span class="selected"> </span>'
+        '<p class="file"><label for="r{n}">Select</label>'
+        '<input{chk} id="r{n}" name="text.{k}" type="radio" value="{n}"/>'
+        '<a href="viewcontent.cgi?type={k}&amp;article=101&amp;unstamped=yes'
+        '&amp;date={n}&amp;preview_mode=1&amp;context=example-etd">{k}</a>'
+        '</p></td>'.format(n=n, k=k, chk=' checked="checked"' if c else "")
+        for n, k, c in links) if links else '<td class="act"> </td>'
+    sel = ('<td class="act"><label for="x.show_previous_9">Show Previous'
+           '</label><select id="x.show_previous_9" name="x.show_previous_9">'
+           '<option value="SHOW"{0}> Show </option><option value="NO_SHOW"'
+           '{1}> Don\'t show </option></select></td>'.format(
+               ' selected="selected"' if show == "SHOW" else "",
+               ' selected="selected"' if show != "SHOW" else "")
+           if links else '<td class="act"> </td>')
+    return ('<tr align="left"><td class="revision-details"><div class="'
+            'revision-details-content"><div class="revision-details-group">'
+            '<div class="revision-details-items"><div class="revision-detail-'
+            'line revision-detail-user"><strong>User:</strong><span>{u}'
+            '</span></div><div class="revision-detail-line revision-detail-'
+            'date"><strong>Date:</strong><span>{d}</span><span>(Pacific '
+            'Time)</span></div><div class="revision-detail-comment"><strong>'
+            'Comment:</strong> <div><div>{c}</div></div></div></div></div>'
+            '</div></td>{cells}<td class="act"> </td>{sel}<td class="version">'
+            '</td></tr>'.format(u=user, d=date, c=comment, cells=cells, sel=sel))
+
+
+def _late_pickvers(rows):
+    return ('<html><body><table id="revision"><caption>Revision History'
+            '</caption><thead><tr><th id="rev-details">Revision details</th>'
+            '<th>Original files</th><th>PDF</th><th>Hide</th><th colspan="2">'
+            'Previous versions</th></tr></thead><tbody>' + "".join(rows) +
+            '</tbody></table></body></html>')
+
+
+def _late_details(release=None, embargo="", label="Release Option"):
+    row = ("<tr><th>{}</th><td>{}</td></tr>".format(label, release)
+           if release is not None else "")
+    return ('<html><body><table class="submission-metadata-table">'
+            '<tr><th>Title</th><td>T</td></tr>' + row +
+            '<tr><th>Embargo Period</th><td>{}</td></tr></table></body>'
+            '</html>'.format(embargo))
+
+
+def test_the_late_2026_listing_is_read():
+    """The listing inside an outer layout table, with no Type, Submitted or
+    Additional Files column and a "Next" link. Before 1.41.0 the outer
+    table was taken for the listing and EVERY structure read as empty."""
+    res = M.parse_edikit_listing(_late_listing(
+        [("102", "Published to web"), ("101", "Revision uploaded")]))
+    check_true("late-listing . it parses", res is not None)
+    rows = (res or {}).get("rows", [])
+    check("late-listing . both records are read",
+          [r["article"] for r in rows], ["102", "101"])
+    check("late-listing . last event read",
+          [r["last_event"] for r in rows],
+          ["Published to web", "Revision uploaded"])
+    check("late-listing . no release option in the listing: unknown",
+          {r["access"] for r in rows}, {M.ACCESS_UNKNOWN})
+    check("late-listing . no Additional Files column: af unknown",
+          {r["af"] for r in rows}, {None})
+    check_true("late-listing . the Next link is followed",
+               ((res or {}).get("next") or "").endswith("page=2"),
+               repr((res or {}).get("next")))
+    ev = M.parse_edikit_listing(_late_listing([("7", "Posted")], nxt=False,
+                                              people="Presenter"))
+    check("late-listing . an event's Presenter column changes nothing",
+          [r["article"] for r in ev["rows"]], ["7"])
+    check("late-listing . the last page has no next", ev["next"], None)
+
+
+def test_the_late_2026_revisions_are_read():
+    html = _late_pickvers([
+        _late_revision("Editor C", "Mon Jan  5 06:43:00 2026",
+                       "Metadata updated", []),
+        _late_revision("Editor B", "Thu Dec 11 08:58:00 2025", "Revision",
+                       [(3, "pdf", True)]),
+        _late_revision("Author A", "Thu Dec 11 05:51:00 2025",
+                       "Initial Submission", [(1, "native", True),
+                                              (2, "pdf", False)], "SHOW"),
+    ])
+    revs = M.parse_pickvers(html)
+    check("late-pickvers . three revisions", len(revs or []), 3)
+    check("late-pickvers . users from the labelled lines",
+          [r["user"] for r in revs], ["Editor C", "Editor B", "Author A"])
+    check("late-pickvers . dates without the time zone, as before",
+          [r["date"] for r in revs], ["Mon Jan  5 06:43:00 2026",
+                                      "Thu Dec 11 08:58:00 2025",
+                                      "Thu Dec 11 05:51:00 2025"])
+    check("late-pickvers . comments",
+          [r["comment"] for r in revs],
+          ["Metadata updated", "Revision", "Initial Submission"])
+    check("late-pickvers . Show Previous read from its select",
+          [r["show_prev"] for r in revs], [False, False, True])
+    M.label_versions(revs)
+    files = [(f["kind"], f["version"]) for r in revs for f in r["files"]]
+    check("late-pickvers . the selected PDF is current, the native too",
+          files, [("primary", "current"), ("native", "current"),
+                  ("primary", "original")])
+
+
+def test_release_option_from_submission_details():
+    check("details . present with its value",
+          M.release_from_metadata(M.parse_record_metadata(
+              _late_details("Open Access"))), (True, "Open Access"))
+    check("details . an ETD's row is named differently",
+          M.release_from_metadata(M.parse_record_metadata(_late_details(
+              "Thesis (open access)",
+              label="Document Type and Release Option"))),
+          (True, "Thesis (open access)"))
+    check("details . a page with no row says so",
+          M.release_from_metadata(M.parse_record_metadata(
+              _late_details(None))), (False, ""))
+    real_fetch, real_throttle = M.fetch_html, M._throttle
+    calls, warns = [], []
+    items = [({"article": "101", "release": ""}, "published"),
+             ({"article": "102", "release": ""}, "published")]
+    try:
+        M._throttle = lambda *a, **k: None
+
+        def serve(page):
+            def f(url, cookie, timeout=0):
+                calls.append(url)
+                if isinstance(page, Exception):
+                    raise page
+                return page
+            return f
+        M.fetch_html = serve(_late_details("Open Access"))
+        check("details . a structure with release options: details",
+              M.release_source(BASE, "e", items, False, "c", warns.append),
+              "details")
+        check_true("details . asked once, of the first record",
+                   len(calls) == 1 and "article=101" in calls[0], calls)
+        M.fetch_html = serve(_late_details(None))
+        check("details . a structure without them: none",
+              M.release_source(BASE, "e", items, False, "c", warns.append),
+              "none")
+        del calls[:]
+        check("details . a gallery is not asked",
+              M.release_source(BASE, "g", items, True, "c", warns.append),
+              "none")
+        check("details . (no request)", calls, [])
+        listed = [({"article": "1", "release": "Thesis (open access)"}, "p")]
+        check("details . a listing that carries them still wins",
+              M.release_source(BASE, "e", listed, False, "c", warns.append),
+              "listing")
+        check("details . (no request)", calls, [])
+        M.fetch_html = serve(OSError("HTTP 502"))
+        check("details . a page that will not load: unread",
+              M.release_source(BASE, "e", items, False, "c", warns.append),
+              "unread")
+        check_true("details . and it is said", bool(warns)
+                   and "502" in warns[-1], warns)
+
+        # plan_item_jobs reads each record's page once, embargo included.
+        opts = {"primary": True, "supp": False, "native": False,
+                "public": True, "hidden": True, "versions": "current",
+                "embargo": True}
+        del calls[:], warns[:]
+        M.fetch_html = serve(_late_details("Restricted to campus",
+                                           "11-7-2027"))
+        item = {"article": "101", "release": "", "access": "unknown",
+                "release_from": "details"}
+        jobs = M.plan_item_jobs(BASE, "e", item, "published", False, opts,
+                                "c", warns.append)
+        check("details . the release option is read",
+              [(j["release"], j["access"], j["embargo"]) for j in jobs],
+              [("Restricted to campus", M.ACCESS_RESTRICTED, "11-7-2027")])
+        check("details . one page for both", len(calls), 1)
+        del calls[:], warns[:]
+        M.fetch_html = serve(OSError("HTTP 502"))
+        item = {"article": "102", "release": "", "access": "unknown",
+                "release_from": "details"}
+        jobs = M.plan_item_jobs(BASE, "e", item, "published", False, opts,
+                                "c", warns.append)
+        check("details . a failed page costs the access and nothing else",
+              [(j["kind"], j["access"]) for j in jobs],
+              [("primary", M.ACCESS_UNKNOWN)])
+        check_true("details . and it is said", len(warns) == 1
+                   and "release option" in warns[0], warns)
+        del calls[:]
+        item = {"article": "103", "release": "Thesis (open access)",
+                "access": M.ACCESS_OPEN}
+        M.plan_item_jobs(BASE, "e", item, "published", False, opts, "c",
+                         warns.append)
+        check("details . a record whose listing gave it is not asked",
+              calls, [])
+    finally:
+        M.fetch_html, M._throttle = real_fetch, real_throttle
+
+
+def test_a_listing_without_release_relabels_nothing():
+    real = M.crawl_listing
+    try:
+        M.crawl_listing = lambda *a, **k: ([
+            {"article": "101", "release": "", "access": M.ACCESS_UNKNOWN},
+            {"article": "102", "release": "", "access": M.ACCESS_UNKNOWN}],
+            False)
+        live, failed = M.live_listing(BASE, "e", False, ["published"], "c")
+    finally:
+        M.crawl_listing = real
+    check("drift-late . the listing is read", sorted(live), ["101", "102"])
+    rows = [{"article": "101", "access": M.ACCESS_RESTRICTED,
+             "release": "Restricted to campus", "record_state": "Posted"},
+            {"article": "102", "access": M.ACCESS_OPEN,
+             "release": "Open Access", "record_state": "Posted"}]
+    out = M.reconcile_rows(rows, live)
+    check("drift-late . no access or release is relabelled",
+          [c for c in out["changed"] if c[1] in ("access", "release")], [])
+    check("drift-late . the plan's access stands",
+          [r["access"] for r in rows],
+          [M.ACCESS_RESTRICTED, M.ACCESS_OPEN])
+
+
+def test_a_rerun_checks_the_late_2026_listing_for_drift():
+    """The re-run's drift check, the worker in the mode: the listing is the
+    late-2026 page (no release option, a layout table around it), read by
+    the real crawl_listing. A record the listing no longer carries is
+    skipped and named; one that is still there is requested; and a check
+    that finds nothing moved says that it checked."""
+    import tempfile
+
+    base = "https://dc.example.edu"
+    adm = base + "/cgi/editor.cgi?display=submission&article={}&context=etd"
+
+    class _FakeDriver:
+        page_source = "<html><body>admin</body></html>"
+        current_url = base + "/"
+        title = "Digital Commons"
+
+        def get(self, url):
+            pass
+
+    def run(listed):
+        rows = [_row(i, str(i), "primary", "public", "current",
+                     "Failed: HTTP 429 Too Many Requests",
+                     base + "/cgi/viewcontent.cgi?article={}&context=etd"
+                     .format(i), adm.format(i), access=M.ACCESS_OPEN,
+                     release="Thesis (open access)")
+                for i in (1, 2, 3)]
+        pages, asked, logs = [], [], []
+
+        def _fetch_html(url, cookie, timeout=0):
+            pages.append(url)
+            return _late_listing([(a, "Published to web") for a in listed],
+                                 nxt=False)
+
+        def _fetch(url, cookie, native_url=None, **kw):
+            asked.append(url)
+            return (b"x" * 16, "f.pdf", "application/pdf", False)
+
+        saved = {k: getattr(M, k) for k in
+                 ("_attach_or_fail", "cookie_header", "fetch_record_file",
+                  "fetch_html", "_throttle", "LISTING_SETTLE")}
+        real_log = M.log
+        with tempfile.TemporaryDirectory() as d:
+            path = _fake_report(d, "DC_FileDownload_Report_etd_S.xlsx", rows)
+            out = os.path.join(d, "out")
+            os.makedirs(out, exist_ok=True)
+            try:
+                M._attach_or_fail = lambda session: _FakeDriver()
+                M.cookie_header = lambda driver: "c=1"
+                M.LISTING_SETTLE = 0
+                M._throttle = lambda *a, **k: None
+                M.fetch_html = _fetch_html
+                M.fetch_record_file = _fetch
+                M.log = lambda msg: (logs.append(str(msg)),
+                                     real_log(str(msg)))[0]
+                M.STOP_EVENT.clear()
+                M.retry_worker({"base_url": base, "settings": {}}, out, path,
+                               {"delay": 0, "page_delay": 0, "cooldowns": 0,
+                                "fetch_path": M.FETCH_NETWORK,
+                                "reconcile": True},
+                               report_dir=out)
+            finally:
+                for k, v in saved.items():
+                    setattr(M, k, v)
+                M.log = real_log
+                M.STOP_EVENT.clear()
+            got = _rows_by_article(out)
+        return pages, asked, logs, got
+
+    pages, asked, logs, got = run(["1", "2", "4"])
+    check_true("drift-late-run . the listing is read through the late page",
+               any("editor.cgi" in u for u in pages), repr(pages))
+    line = [l for l in logs if "listing drift" in l]
+    check_true("drift-late-run . the record gone from the listing is named",
+               len(line) == 1 and "1 row(s) name a record the listing no "
+               "longer carries (3)" in line[0], repr(line))
+    check_true("drift-late-run . and nothing is claimed about records added "
+               "without a plan workbook",
+               bool(line) and "cannot be counted" in line[0], repr(line))
+    check("drift-late-run . only the records still listed are requested",
+          sorted(u.split("article=")[1].split("&")[0] for u in asked),
+          ["1", "2"])
+    check_true("drift-late-run . the gone record's row says why",
+               str(got.get("3", ("",))[0]).startswith(M.DRIFT_GONE),
+               repr(got.get("3")))
+
+    pages, asked, logs, got = run(["1", "2", "3"])
+    line = [l for l in logs if "checked 3 planned row(s)" in l]
+    check_true("drift-late-run . a check that finds nothing moved says so",
+               len(line) == 1 and "nothing has been removed" in line[0],
+               repr([l for l in logs if "drift" in l or "checked" in l]))
+    check("drift-late-run . and every row is requested",
+          sorted(u.split("article=")[1].split("&")[0] for u in asked),
+          ["1", "2", "3"])
+
+
+def test_a_rerun_with_nothing_left_is_finished_not_failed():
+    """1.0.8 (staff test): a re-run of a job with nothing left showed a red
+    Error. A finished job is what the operator asked for: done, green."""
+    import tempfile
+    base = "https://dc.example.edu"
+    adm = base + "/cgi/editor.cgi?display=submission&article={}&context=etd"
+    for status, want in (("No file", "every row that did not download"),
+                         ("Downloaded", "every row in that report downloaded")):
+        rows = [_row(1, "1", "primary", "public", "current", status,
+                     base + "/cgi/viewcontent.cgi?article=1&context=etd",
+                     adm.format(1))]
+        with tempfile.TemporaryDirectory() as d:
+            path = _fake_report(d, "DC_FileDownload_Report_etd_S.xlsx", rows)
+            M.STOP_EVENT.clear()
+            M.retry_worker({"base_url": base, "settings": {}}, d, path,
+                           {"delay": 0, "page_delay": 0, "cooldowns": 0,
+                            "fetch_path": M.FETCH_NETWORK}, report_dir=d)
+        with M.LOCK:
+            got = (M.STATE.get("phase"), M.STATE.get("outcome"),
+                   M.STATE.get("summary", ""))
+        check("nothing-left . {!r} ends done and green".format(status),
+              got[:2], ("done", "green"))
+        check_true("nothing-left . and says why ({!r})".format(status),
+                   got[2].startswith("Nothing left to re-run") and want in got[2],
+                   got[2])
+
+
+def test_a_run_folder_names_the_folder_its_reports_are_in():
+    """1.0.8: a run folder keeps each structure's plan and reports one
+    level down, and a re-run pointed at it said only that it found none."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        inner = os.path.join(d, "example-etd")
+        os.makedirs(inner)
+        open(os.path.join(inner, "DC_FileDownload_Plan_example-etd_S.xlsx"),
+             "wb").close()
+        os.makedirs(os.path.join(d, "empty"))
+        try:
+            M.read_failed_rows(d)
+            said = "(no error)"
+        except ValueError as e:
+            said = str(e)
+        check_true("run-folder . it names the folder that holds the plan",
+                   "They are in the folder inside it: example-etd. Point the "
+                   "re-run at that folder." in said, said)
+        with tempfile.TemporaryDirectory() as e:
+            try:
+                M.read_failed_rows(e)
+                bare = "(no error)"
+            except ValueError as x:
+                bare = str(x)
+        check("run-folder . a folder with none anywhere says only that",
+              bare, "No plan or download reports in " + e)
+
+
+def test_the_page_says_planning_until_the_first_file():
+    """1.0.8 (staff test): "Downloading…" showed while listings were read,
+    before any file. The state says when the first request goes out, and
+    both workers start a run without it."""
+    import ast
+    with M.LOCK:
+        M.STATE["fetching"] = False
+
+    class _Fetcher:
+        path = M.FETCH_NETWORK
+
+        def fetch(self, url, native_url="", order=0):
+            return (b"x", "f.pdf", "application/pdf", False)
+
+    verify = M.VerificationWatch(window=0, announce=lambda m: None,
+                                 on_hold=lambda *a, **k: None)
+    try:
+        M.fetch_one(_Fetcher(), verify, "https://dc.example.edu/f.pdf")
+    except Exception:
+        pass   # what the fake fetcher returns is not the point here
+    with M.LOCK:
+        check("planning . the first file request marks the run as fetching",
+              M.STATE.get("fetching"), True)
+    tree = ast.parse(Path(M.__file__).read_text(encoding="utf-8"))
+    starts = {}
+    for fn in tree.body:
+        if isinstance(fn, ast.FunctionDef) and fn.name in ("download_worker",
+                                                           "retry_worker"):
+            for call in ast.walk(fn):
+                if (isinstance(call, ast.Call)
+                        and getattr(call.func, "id", "") == "set_state"
+                        and any(k.arg == "phase" and isinstance(k.value, ast.Constant)
+                                and k.value.value == "starting"
+                                for k in call.keywords)):
+                    starts[fn.name] = [k.arg for k in call.keywords]
+    check("planning . both workers start a run not yet fetching",
+          sorted(n for n, ks in starts.items() if "fetching" in ks),
+          ["download_worker", "retry_worker"])
+
+
+def test_a_fresh_start_reads_access_from_submission_details():
+    """The worker in the mode: a listing with no release option, an ETD
+    whose records carry one on their Submission details page."""
+    def pages(url, cookie, timeout=0):
+        if "window=abstract" in url:
+            return _late_details("Restricted to campus")
+        return "<html><body></body></html>"
+    calls, rows, files, lines, _logs = _start_one_record(
+        "<html></html>", lambda url, native: None,
+        {"primary": True, "supp": False, "native": False, "public": True,
+         "hidden": True, "versions": "current", "published": True,
+         "unpublished": False},
+        stubs={"fetch_html": pages})
+    check_true("details-run . the log says where access comes from",
+               any("Submission details page" in str(l) for l in lines),
+               "\n".join(map(str, lines[-12:])))
+    acc = sorted({r.get("Access") for r in (rows or [])} - {None, ""})
+    check("details-run . the report carries the record's access", acc,
+          [M.ACCESS_RESTRICTED])
+    rel = sorted({r.get("Type / Release Option") for r in (rows or [])}
+                 - {None, ""})
+    check("details-run . and its wording", rel, ["Restricted to campus"])
+
+
 def main():
     for fn in (test_a_check_that_cannot_run_says_so,
                test_stop_does_not_wait_for_the_drift_check,
@@ -12870,6 +13375,15 @@ def main():
                test_one_run_per_chrome_across_processes,
                test_content_link_type, test_native_variant,
                test_parse_pickvers, test_parse_additional_files,
+               test_the_late_2026_listing_is_read,
+               test_the_late_2026_revisions_are_read,
+               test_release_option_from_submission_details,
+               test_a_listing_without_release_relabels_nothing,
+               test_a_fresh_start_reads_access_from_submission_details,
+               test_a_rerun_checks_the_late_2026_listing_for_drift,
+               test_a_rerun_with_nothing_left_is_finished_not_failed,
+               test_a_run_folder_names_the_folder_its_reports_are_in,
+               test_the_page_says_planning_until_the_first_file,
                test_fetch_record_file, test_sniff_extension,
                test_build_filename, test_dedupe_jobs, test_plan_item_jobs,
                test_report_shape, test_endpoints, test_native_file_url,
@@ -12966,6 +13480,7 @@ def main():
                test_a_rerun_nobody_verifies_stops_without_calling_it_a_failure,
                test_the_page_offers_the_fetch_path_and_the_window,
                test_the_modules_wording_names_no_vendor_and_no_agreement,
+               test_a_built_copy_unzips_on_windows,
                test_both_endpoints_refuse_a_fetch_path_they_cannot_take,
                # v1.33.1 — the two ways a prompt went unrecorded
                test_a_prompt_is_seen_while_the_run_waits_for_the_file,
