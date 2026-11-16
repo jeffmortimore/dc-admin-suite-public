@@ -93,6 +93,11 @@ jobs:
           python -m pip install --quiet pikepdf pymupdf python-docx python-pptx
           python modules/_verify_ocr_toolkit.py
 
+      - name: Page Number Generator verification
+        # After the step above, so pikepdf is installed and the counting
+        # tests run; without it they are skipped, by name.
+        run: python modules/_verify_page_numbers.py
+
       - name: Served pages parse, and their element ids exist
         run: python modules/_verify_pages.py
 
@@ -108,7 +113,7 @@ jobs:
           bad = [m for m in mods if m.get("error")]
           for m in mods:
               print("  %-24s v%-5s %s" % (m["id"], m["version"], m["error"] or "ok"))
-          if bad or len(mods) != 10:
+          if bad or len(mods) != 11:
               print("FAIL: %d module(s) scanned, %d with errors" % (len(mods), len(bad)))
               sys.exit(1)
           print("all %d modules scan clean" % len(mods))

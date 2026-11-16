@@ -389,6 +389,110 @@ def _agree(blocks, what, problems):
                                 .format(label, what, first))
 
 
+ISSUE_PY_RE = re.compile(r"# ---- DC-ISSUE (\d+) -+\n.*?# ---- /DC-ISSUE -+\n",
+                         re.S)
+ISSUE_JS_RE = re.compile(r"/\* DC-ISSUE (\d+):.*?/\* /DC-ISSUE \*/", re.S)
+# Rows every copy of issue_ref() must answer alike: (row, registry entry).
+ISSUE_ROWS = (
+    ({"journal": "Sample-J", "volume": "3", "issue": "2"}, None),
+    ({"journal": "sample-j", "volume": "x"}, None),
+    ({"journal": "", "volume": "3"}, None),
+    ({"journal": "yearly-p", "syear": "2025", "issue": "4"},
+     {"id": "yearly-p", "structure": "yearly"}),
+    ({"journal": "yearly-p", "syear": "25"},
+     {"id": "yearly-p", "structure": "yearly"}),
+    ("not a row", None),
+)
+
+
+def check_issue_blocks(served, problems):
+    """DC-ISSUE 1 (1.0.9): the journal / volume / issue choice and the
+    registry's page-numbering fields. Every module that reads the journal
+    registry (config/journals.json, found in its source, never from a list)
+    carries one DC-ISSUE Python block and its page one DC-ISSUE script, the
+    copies agree, and the script carries no backslash. Driven: every copy's
+    issue_ref(), backfill_pagination() and pagination_error() answer the
+    same rows the same way."""
+    py, js, group = {}, {}, []
+    for label, html in served:
+        if not label.startswith("modules/"):
+            continue
+        src = (SUITE / label).read_text(encoding="utf-8")
+        if "journals.json" not in src:
+            continue
+        group.append(label)
+        b = _one_block(label, src, ISSUE_PY_RE, "DC-ISSUE Python", problems)
+        if b is not None:
+            py[label] = b
+        b = _one_block(label, html, ISSUE_JS_RE, "DC-ISSUE script", problems)
+        if b is not None:
+            js[label] = b
+            if "\\" in b:
+                problems.append("{}: its DC-ISSUE script contains a backslash"
+                                .format(label))
+    _agree(py, "DC-ISSUE Python", problems)
+    _agree(js, "DC-ISSUE script", problems)
+    if len(group) < 2:
+        problems.append("DC-ISSUE: {} module(s) read the journal registry; "
+                        "the DOI & XML Generator and the Page Number "
+                        "Generator both do".format(len(group)))
+    answers = {}
+    for label in group:
+        try:
+            M = _import_module(label)
+            got = []
+            for row, entry in ISSUE_ROWS:
+                entries = {entry["id"]: entry} if entry else {}
+                ref, msg = M.issue_ref(row, entries, 7)
+                if ref is not None:
+                    ref = {k: v for k, v in ref.items() if k != "entry"}
+                got.append((ref, msg))
+            for j in ({"id": "a"}, {"id": "a", "page_numbering": "continue",
+                                    "cover_pages": 2},
+                      {"id": "a", "page_numbering": "sometimes"},
+                      {"id": "a", "cover_pages": True},
+                      {"id": "a", "cover_pages": 10}):
+                e = M.backfill_pagination(dict(j))
+                got.append((e, M.pagination_error(e, "a")))
+            answers[label] = got
+        except Exception as e:  # a copy that cannot be driven is a finding
+            problems.append("{}: DC-ISSUE could not be driven ({}: {})"
+                            .format(label, e.__class__.__name__, e))
+    if answers:
+        first = next(iter(answers))
+        for label, got in answers.items():
+            if got != answers[first]:
+                problems.append("{}: its DC-ISSUE answers differ from {}'s"
+                                .format(label, first))
+        got = answers[first]
+        want = [
+            ({"journal": "sample-j", "volume": "3", "issue": "2",
+              "syear": ""}, ""),
+            (None, "Volume / issue #7: volume and issue must be numbers."),
+            (None, "Volume / issue #7: enter a journal structure ID."),
+            ({"journal": "yearly-p", "volume": "", "issue": "",
+              "syear": "2025"}, ""),
+        ]
+        for i, w in enumerate(want):
+            if got[i] != w:
+                problems.append("DC-ISSUE: issue_ref row {} gave {!r}, want "
+                                "{!r}".format(i + 1, got[i], w))
+        if got[4][0] is not None or "yearly series" not in got[4][1]:
+            problems.append("DC-ISSUE: a yearly series without its year was "
+                            "not refused: {!r}".format(got[4]))
+        if got[5] != (None, "Bad volume / issue #7."):
+            problems.append("DC-ISSUE: a row that is not an object gave {!r}"
+                            .format(got[5]))
+        if got[6] != ({"id": "a", "page_numbering": "restart",
+                       "cover_pages": 1}, ""):
+            problems.append("DC-ISSUE: an entry without the fields was "
+                            "backfilled as {!r}".format(got[6]))
+        if got[7][1] or [g[1] == "" for g in got[8:]] != [False] * 3:
+            problems.append("DC-ISSUE: pagination_error accepted or refused "
+                            "the wrong entries: {!r}".format(got[7:]))
+    return group
+
+
 def log_pages(served):
     """The group: every served module page with a log box."""
     return [(label, html) for label, html in served
@@ -1610,6 +1714,15 @@ FOLDER_DRIVES = (
      {"kind": "inventory", "folder": ""}, "Workbooks folder"),
     ("modules/dc_doi_xml.py", "/api/start", {"out_dir": "", "sets": []},
      "Output folder"),
+    ("modules/dc_page_numbers.py", "/api/plan", {"out_dir": ""},
+     "Save the download plan to"),
+    ("modules/dc_page_numbers.py", "/api/start", {"run_dir": ""},
+     "Downloader run folder"),
+    ("modules/dc_page_numbers.py", "/api/start",
+     {"run_dir": "__TMP__", "report_dir": "__TMP__/no-such-folder"},
+     "Reports folder, if saved elsewhere"),
+    ("modules/dc_page_numbers.py", "/api/start",
+     {"run_dir": "__TMP__", "out_dir": ""}, "Save report to"),
     ("modules/dc_file_downloader.py", "/api/reports/scan", {"folder": ""},
      "Reports folder"),
     ("modules/dc_file_downloader.py", "/api/map", {"out_dir": ""},
@@ -3709,6 +3822,7 @@ def main():
     check_browse_in_node(node_bin, served, browsers, problems)
     win_csharp = check_browse_windows_compile(browsers, problems)
     pickers = check_pick_blocks(served, problems)
+    issue_group = check_issue_blocks(served, problems)
     check_pick_in_node(node_bin, pickers, problems)
     readers = check_index(problems)
     check_batch_history(problems)
@@ -3769,6 +3883,9 @@ def main():
         print("  workbook selected ({} checks, in node and over its own"
               .format(scanned))
         print("  server).")
+        print("  {} module(s) read the journal registry and carry the one"
+              .format(len(issue_group)))
+        print("  DC-ISSUE block, driven alike.")
         print("  {} module(s) with a log carry the one DC-LOG block; each was".format(len(group)))
         print("  driven: Copy log is the whole run, Clear is refused during")
         print("  a run and keeps what is loaded, and one start of many wins.")

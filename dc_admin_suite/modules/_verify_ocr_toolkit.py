@@ -5,7 +5,7 @@ Run it from the suite root with the same Python that launches the suite:
     python3 modules/_verify_ocr_toolkit.py
 
 The leading underscore keeps this file out of the module scanner. That is
-not cosmetic: CI asserts the scan finds exactly ten modules, so a name
+not cosmetic: CI asserts the scan finds exactly eleven modules, so a name
 without it fails the build with a confusing error instead of an obvious one.
 
 What is covered, and why each one is here rather than left to a real run:

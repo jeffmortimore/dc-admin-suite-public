@@ -1,5 +1,59 @@
 # Release notes
 
+## 1.0.9 — 2026-11-16
+
+**A new module, the Page Number Generator,** for numbering the pages of a
+journal issue, which staff have done by hand: download the issue's PDFs,
+put them in order, leave out the cover page, number the first page of the
+first article 1 and count on.
+
+- **It lists the issue** from your public OAI-PMH feed (posted records
+  only), one list per issue, in the order of each item's label to start
+  with. A row with no issue number lists every issue of the volume.
+- **You choose what is paginated, and the order,** every time: a box for
+  each item, and Up, Down and Move to a position, all usable by keyboard.
+  Nothing is assumed from an item's document type.
+- **Numbering restarts each issue or continues through the volume**, as the
+  journal is set in the DOI & XML Generator's registry; either can be
+  changed for an issue, and any issue can be given its first page number.
+- **The PDFs come through the Batch File Downloader.** The module writes a
+  plan of the files it needs — for each ticked item, the copy the public
+  sees and the file as uploaded — and you run it in the downloader, so
+  every download goes through the downloader's watched browser route. The
+  module itself never uses Chrome.
+- **Each article is checked before it is numbered.** The copy the public
+  sees should be the uploaded file plus the cover page(s), so its page
+  count minus the uploaded file's must equal the issue's cover-page count.
+  An article that disagrees, or cannot be checked, is flagged and not
+  numbered, and neither is anything after it in the issue. An item with no
+  PDF can be given its page count by hand.
+- **It writes a report** (pages, a summary per issue, and what was and was
+  not checked). It does not change any record; the page numbers are
+  entered in Digital Commons as before.
+
+**DOI & XML Generator 1.11.0:** the journal registry dialog has two new
+settings for each journal — page numbering (restart each issue or continue
+through the volume) and the number of cover pages on each published
+article. Only the Page Number Generator uses them. A registry saved by an
+earlier version takes "restart" and one cover page.
+
+### What is in it
+
+| Module | Version |
+|---|---|
+| Structure URL Generator | 1.5.2 |
+| Hierarchy Mapping Tool | 1.5.2 |
+| Structure Regenerator | 1.6.2 |
+| Configuration Manager | 1.5.8 |
+| DOI & XML Generator | 1.11.0 |
+| Page Number Generator | 1.0.1 |
+| Structure HTML Drafting Tool | 1.6.3 |
+| Batch Revise Manager | 1.6.3 |
+| Batch File Downloader | 1.41.1 |
+| OCR & Accessibility Toolkit | 1.13.1 |
+| Image Description Generator | 1.12.4 |
+| Shell (start page, settings, Main Menu) | 1.13.1 |
+
 ## 1.0.8 — 2026-11-15
 
 Digital Commons changed its administrator pages, and the site-wide

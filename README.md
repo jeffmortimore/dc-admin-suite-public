@@ -6,11 +6,11 @@ Chrome window that **you** start and log into as an administrator. The
 suite never opens Chrome for you, never sees your password, and never
 closes your browser.
 
-Ten modules ship in this release. Each is one Python file and runs on its
+Eleven modules ship in this release. Each is one Python file and runs on its
 own local port. The modules that work through many records write a
 filterable Excel (`.xlsx`) report of what they did.
 
-**Version 1.0.8** — see [release notes](dc_admin_suite/docs/RELEASE-NOTES.md).
+**Version 1.0.9** — see [release notes](dc_admin_suite/docs/RELEASE-NOTES.md).
 **Install:** see [the install guide](dc_admin_suite/docs/INSTALL.md).
 **License:** MIT. Copyright (c) 2026 Jeffrey Mortimore.
 
@@ -26,7 +26,8 @@ act on your site, so try them on a small selection first.
 | Hierarchy Mapping Tool | `dc_hierarchy_mapper.py` | 1.5.2 | yes | read only | Exports the structure hierarchy to a sortable spreadsheet. Several other modules start from this report. |
 | Structure Regenerator | `dc_regenerator.py` | 1.6.2 | yes | **changes it** | Regenerates the selected structures, children before parents. Regeneration republishes pages on your site. |
 | Configuration Manager | `dc_config_manager.py` | 1.5.8 | yes | **changes it** | Scrapes structure configurations to a spreadsheet, previews the changes you make in it (a dry run), and applies them. Apply only runs a current dry-run plan, and reads each page back to record what it holds. |
-| DOI & XML Generator | `dc_doi_xml.py` | 1.10.1 | no | read only | Builds DOIs for you to add to articles, and bepress, Crossref 5.4.0 and DOAJ XML from your public OAI-PMH feed. It refuses to build a Crossref deposit until you have set who the deposit is credited to. |
+| DOI & XML Generator | `dc_doi_xml.py` | 1.11.0 | no | read only | Builds DOIs for you to add to articles, and bepress, Crossref 5.4.0 and DOAJ XML from your public OAI-PMH feed. It refuses to build a Crossref deposit until you have set who the deposit is credited to. |
+| Page Number Generator | `dc_page_numbers.py` | 1.0.1 | no | read only | Works out first and last page numbers for the articles of journal issues. It lists an issue from your public OAI-PMH feed; you tick the items that are paginated and put them in order; it writes a plan the Batch File Downloader runs to fetch each one's published and uploaded PDF; then it counts the pages and checks each article's cover page before numbering it. It writes a report and changes no record. |
 | Structure HTML Drafting Tool | `dc_field_drafter.py` | 1.6.3 | no | read only | Drafts structure HTML from editable templates. Ships with nine example templates; your own replace them. |
 | Batch Revise Manager | `dc_batch_revise.py` | 1.6.3 | yes | **changes it** | Generates, downloads and uploads batch revise spreadsheets for the selected structures. Upload submits each revised spreadsheet through the structure's own form. |
 | Batch File Downloader | `dc_file_downloader.py` | 1.41.1 | yes | read only | Downloads primary, native, supplemental, hidden and earlier-version files for the selected structures, with a report of every file and its access state. A stopped run records what it never reached and can be resumed from its own report. See "Downloading files" below. Used through one whole collection of about 3,400 records and 18,000 files, in watched sessions. |

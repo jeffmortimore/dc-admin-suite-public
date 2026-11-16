@@ -131,6 +131,17 @@ pattern. Staff add their own in the registry editor; a prepared set is one
 file away (copy profiles/<institution>-journals.json to
 config/journals.json). An existing install is untouched: its own
 config/journals.json wins.
+
+v1.11.0 (suite 1.0.9) — the journal registry is shared with the Page Number
+Generator (the DC-ISSUE block, duplicated verbatim in both modules). Each
+journal gains two settings, edited in the registry dialog: page_numbering
+("restart" each issue, or "continue" through the volume) and cover_pages
+(how many cover pages the published copy of an article carries, 0-9). They
+are defaults the Page Number Generator offers for each issue; this module
+does not use them. A registry written before them takes restart and one
+cover page, without being changed on disk until it is next saved. The
+volume / issue rows' journal, Year, Vol. and Iss. controls, their reading
+and their checking are the shared block's; every message is as before.
 """
 
 # ---------------------------------------------------------------------------
@@ -140,7 +151,7 @@ MANIFEST = {
     "id": "doi-xml-generator",
     "name": "DOI & XML Generator",
     "description": "Mint article DOIs and output bepress, Crossref 5.4.0, and DOAJ XML for journal issues and yearly proceedings.",
-    "version": "1.10.1",
+    "version": "1.11.0",
     "requires": [],
 }
 
@@ -300,6 +311,7 @@ def backfill_registry(reg: dict) -> dict:
         j.setdefault("doaj_enabled", True)
         j.setdefault("doi_pattern", "")
         j.setdefault("structure", "volume_issue")
+        backfill_pagination(j)
     return reg
 
 
@@ -370,6 +382,9 @@ def validate_registry(reg) -> str:
         if str(j.get("structure", "volume_issue")) not in ("volume_issue", "yearly"):
             return ("Journal '{}': structure must be volume_issue or yearly."
                     .format(jid))
+        msg = pagination_error(j, jid)
+        if msg:
+            return msg
         jpat = str(j.get("doi_pattern", "")).strip()
         if jpat and pat_names and jpat not in pat_names:
             return ("Journal '{}': DOI pattern {!r} is not in the pattern "
@@ -576,6 +591,79 @@ class SetError(Exception):
     """A per-set failure: logged as a warning; other sets still run."""
 
 
+# ---- DC-ISSUE 1 ------------------------------------------------------------
+# The journal / volume / issue choice and the journal registry's
+# page-numbering fields, shared by the DOI & XML Generator and the Page
+# Number Generator: both read config/journals.json, which the DOI & XML
+# Generator edits. Duplicated verbatim; modules/_verify_pages.py checks that
+# every module reading the registry carries this block, and the page's half
+# (the DC-ISSUE script block), and that the copies agree.
+#
+#   page_numbering  "restart" (each issue starts at its first page number)
+#                   or "continue" (an issue goes on from the previous issue
+#                   of its volume). A default: the operator can change it
+#                   for each issue when setting up a run.
+#   cover_pages     how many cover pages Digital Commons adds to the
+#                   published copy of an article (normally 1). The Page
+#                   Number Generator checks each article against it.
+ISSUE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+ISSUE_YEAR_RE = re.compile(r"^\d{4}$")
+PAGINATION_MODES = ("restart", "continue")
+COVER_PAGES_MAX = 9
+
+
+def backfill_pagination(j):
+    """Give a registry entry the page-numbering fields it may predate.
+    Mutates and returns j."""
+    j.setdefault("page_numbering", "restart")
+    j.setdefault("cover_pages", 1)
+    return j
+
+
+def pagination_error(j, jid):
+    """"" when an entry's page-numbering fields are usable, else a message."""
+    if str(j.get("page_numbering", "restart")) not in PAGINATION_MODES:
+        return ("Journal '{}': page numbering must be restart or continue."
+                .format(jid))
+    cover = j.get("cover_pages", 1)
+    if (isinstance(cover, bool) or not isinstance(cover, int)
+            or not 0 <= cover <= COVER_PAGES_MAX):
+        return ("Journal '{}': cover pages must be a whole number from 0 to "
+                "{}.".format(jid, COVER_PAGES_MAX))
+    return ""
+
+
+def issue_ref(s, entries, i):
+    """One volume / issue row as the page sent it, checked.
+
+    Returns (ref, "") or (None, a message naming the row). ref holds the
+    journal ID, volume, issue and series year, and the registry entry (None
+    for a structure ID the registry does not carry)."""
+    if not isinstance(s, dict):
+        return None, "Bad volume / issue #{}.".format(i)
+    jid = str(s.get("journal", "")).strip().lower()
+    if not ISSUE_ID_RE.match(jid):
+        return None, ("Volume / issue #{}: enter a journal structure ID."
+                      .format(i))
+    entry = entries.get(jid)
+    vol = str(s.get("volume", "")).strip()
+    iss = str(s.get("issue", "")).strip()
+    if (vol and not vol.isdigit()) or (iss and not iss.isdigit()):
+        return None, ("Volume / issue #{}: volume and issue must be "
+                      "numbers.".format(i))
+    syear = str(s.get("syear", "")).strip()
+    if bool(entry) and entry.get("structure") == "yearly":
+        if not ISSUE_YEAR_RE.match(syear):
+            return None, ("Volume / issue #{}: '{}' is a yearly series — "
+                          "enter its 4-digit year (the harvest targets "
+                          "{}_YYYY).".format(i, jid, jid))
+        iss = ""  # per-year series have no issues
+    else:
+        syear = ""
+    return {"journal": jid, "volume": vol, "issue": iss, "syear": syear,
+            "entry": entry}, ""
+
+
 def oai_url(base_url, jid, vol, iss, year=""):
     """OAI ListRecords URL for one set. Volume/issue publications use
     publication:jid/volN/issN; yearly-series publications (an ir_community
@@ -591,6 +679,9 @@ def oai_url(base_url, jid, vol, iss, year=""):
             setspec += "/iss" + str(int(iss))
     return ("{}/do/oai/?verb=ListRecords&metadataPrefix=document-export"
             "&set={}".format(base_url, setspec))
+# ---- /DC-ISSUE -------------------------------------------------------------
+
+
 
 
 def fetch_url(url: str) -> str:
@@ -1168,7 +1259,7 @@ FORM_FIELDS = ("outdir",
 FORM_NOT_KEPT = (
     "logfull", "patpick", "patname", "pattemplate", "m_id", "m_name",
     "m_abbrev", "m_eissn", "m_type", "m_structure", "m_conf", "m_doi",
-    "m_doaj", "m_pattern",
+    "m_doaj", "m_pattern", "m_numbering", "m_cover",
 )
 
 
@@ -1850,6 +1941,13 @@ PAGE = """<!DOCTYPE html>
    <label><input type="checkbox" id="m_doaj"> DOAJ XML</label></div>
   <div class="field"><label for="m_pattern">DOI suffix pattern</label>
    <select id="m_pattern"></select></div>
+  <div class="field"><label for="m_numbering">Page numbering (Page Number Generator)</label>
+   <select id="m_numbering">
+    <option value="restart">restart each issue</option>
+    <option value="continue">continue through the volume</option>
+   </select></div>
+  <div class="field"><label for="m_cover">Cover pages on each published article (0–9)</label>
+   <input type="text" id="m_cover" inputmode="numeric" autocomplete="off"></div>
   <div class="err" id="m_err" role="alert"></div>
   <div class="actions">
    <button type="button" id="m_save">Save</button>
@@ -2361,20 +2459,49 @@ function patternOptions(sel){
   return h;
 }
 
+/* DC-ISSUE 1: the journal / volume / issue controls of one row, shared by
+   the DOI & XML Generator and the Page Number Generator and duplicated
+   verbatim. The page defines REG (the journal registry as /api/journals
+   sends it) and esc() before using these. issueRowHtml() is the row's
+   controls, issueRowWire(div, changed) their behavior, issueRowRead(div)
+   their values, and issueEntry(div) the registry entry they name. */
 function journalOptions(sel){
   let h=REG.journals.map(j=>'<option value="'+esc(j.id)+'"'+(j.id===sel?' selected':'')+'>'
       +esc(j.name)+' ('+esc(j.id)+')</option>').join('');
   h+='<option value="__custom__"'+(sel==='__custom__'?' selected':'')+'>Custom structure ID…</option>';
   return h;
 }
+function issueRowHtml(){
+  return '<label>Journal <select name="journal" aria-label="Journal">'+journalOptions()+'</select></label>'+
+   '<input type="text" name="customid" class="small" placeholder="custom id" aria-label="Custom structure ID" style="display:none">'+
+   '<label class="syearlab">Year <input type="text" name="syear" class="tiny" inputmode="numeric" aria-label="Series year"></label>'+
+   '<label>Vol. <input type="text" name="volume" class="tiny" inputmode="numeric" aria-label="Volume number"></label>'+
+   '<label class="isslab">Iss. <input type="text" name="issue" class="tiny" inputmode="numeric" aria-label="Issue number"></label>';
+}
+function issueEntry(div){
+  let jid=div.querySelector('[name=journal]').value;
+  if(jid==='__custom__') jid=div.querySelector('[name=customid]').value.trim().toLowerCase();
+  return (REG.journals||[]).find(j=>j.id===jid)||null;
+}
+function issueRowWire(div, changed){
+  const sel=div.querySelector('[name=journal]'), cid=div.querySelector('[name=customid]');
+  sel.addEventListener('change',()=>{
+    cid.style.display=sel.value==='__custom__'?'inline-block':'none';
+    changed();
+  });
+  cid.addEventListener('input',()=>changed());
+}
+function issueRowRead(div){
+  const v=n=>div.querySelector('[name='+n+']').value.trim();
+  let jid=v('journal'); if(jid==='__custom__') jid=v('customid').toLowerCase();
+  return {journal:jid,volume:v('volume'),issue:v('issue'),syear:v('syear')};
+}
+/* /DC-ISSUE */
 const DOI_OFF_MSG='DOI features are turned off for this title in the journal registry.';
 const DOAJ_OFF_MSG='DOAJ is turned off for this title in the journal registry.';
 
 function updateRowAvailability(div){
-  const sel=div.querySelector('[name=journal]');
-  let jid=sel.value;
-  if(jid==='__custom__') jid=div.querySelector('[name=customid]').value.trim().toLowerCase();
-  const entry=(REG.journals||[]).find(j=>j.id===jid)||null;
+  const entry=issueEntry(div);
   const doiOk=!entry||entry.doi_enabled!==false;
   const doajOk=!entry||entry.doaj_enabled!==false;
   const setCtl=(name,ok,msg)=>{
@@ -2399,11 +2526,7 @@ function addSet(){
   div.className='set'; div.dataset.sid=id;
   div.innerHTML=
    '<div class="row">'+
-   '<label>Journal <select name="journal" aria-label="Journal">'+journalOptions()+'</select></label>'+
-   '<input type="text" name="customid" class="small" placeholder="custom id" aria-label="Custom structure ID" style="display:none">'+
-   '<label class="syearlab">Year <input type="text" name="syear" class="tiny" inputmode="numeric" aria-label="Series year"></label>'+
-   '<label>Vol. <input type="text" name="volume" class="tiny" inputmode="numeric" aria-label="Volume number"></label>'+
-   '<label class="isslab">Iss. <input type="text" name="issue" class="tiny" inputmode="numeric" aria-label="Issue number"></label>'+
+   issueRowHtml()+
    '<button type="button" class="linkish" data-remove>Remove</button>'+
    '</div><div class="row">'+
    '<label><input type="checkbox" name="mint"> Mint DOIs</label>'+
@@ -2421,12 +2544,7 @@ function addSet(){
   div.querySelector('[name=mint]').addEventListener('change',e=>{
     div.classList.toggle('minting',e.target.checked);
   });
-  div.querySelector('[name=journal]').addEventListener('change',e=>{
-    div.querySelector('[name=customid]').style.display=
-      e.target.value==='__custom__'?'inline-block':'none';
-    updateRowAvailability(div);
-  });
-  div.querySelector('[name=customid]').addEventListener('input',()=>updateRowAvailability(div));
+  issueRowWire(div,()=>updateRowAvailability(div));
   setsBox.appendChild(div);
   updateRowAvailability(div);
 }
@@ -2447,8 +2565,8 @@ function readSets(){
   for(const div of setsBox.children){
     const v=n=>div.querySelector('[name='+n+']').value.trim();
     const c=n=>div.querySelector('[name='+n+']').checked;
-    let jid=v('journal'); if(jid==='__custom__') jid=v('customid').toLowerCase();
-    out.push({journal:jid,volume:v('volume'),issue:v('issue'),syear:v('syear'),
+    const r=issueRowRead(div);
+    out.push({journal:r.journal,volume:r.volume,issue:r.issue,syear:r.syear,
       mint:c('mint'),year:v('year'),count:v('count'),pattern:v('pattern'),
       bepress:c('bepress'),crossref:c('crossref'),doaj:c('doaj'),
       pubdate:v('pubdate')});
@@ -2605,6 +2723,8 @@ function openJournalModal(index){
   mGet('m_doi').checked=j.doi_enabled!==false;
   mGet('m_doaj').checked=j.doaj_enabled!==false;
   fillModalPatterns(j.doi_pattern||''); toggleConf();
+  mGet('m_numbering').value=j.page_numbering==='continue'?'continue':'restart';
+  mGet('m_cover').value=String(j.cover_pages===undefined?1:j.cover_pages);
   mDelete.style.display=index>=0?'inline-block':'none';
   jbackdrop.classList.add('open'); mGet('m_id').focus();
 }
@@ -2631,12 +2751,15 @@ mGet('m_save').addEventListener('click',async ()=>{
   if(!/^[a-z0-9][a-z0-9_-]*$/.test(id)){
     setMsg(mErr,'Enter a structure ID (lowercase letters, digits, - _).',true);return;}
   if(!mGet('m_name').value.trim()){setMsg(mErr,'Enter the full title.',true);return;}
+  const cov=mGet('m_cover').value.trim();
+  if(!/^[0-9]$/.test(cov)){setMsg(mErr,'Cover pages must be a whole number from 0 to 9.',true);return;}
   const rec={id:id,name:mGet('m_name').value.trim(),abbrev:mGet('m_abbrev').value.trim(),
     eissn:mGet('m_eissn').value.trim(),type:mGet('m_type').value,
     structure:mGet('m_structure').value,
     conference_name:mGet('m_conf').value.trim(),
     doi_enabled:mGet('m_doi').checked,doaj_enabled:mGet('m_doaj').checked,
-    doi_pattern:mGet('m_pattern').value};
+    doi_pattern:mGet('m_pattern').value,
+    page_numbering:mGet('m_numbering').value,cover_pages:parseInt(cov,10)};
   const journals=[...(REG.journals||[])];
   if(mIndex>=0) journals[mIndex]=rec; else journals.push(rec);
   const res=await persistRegistry({...REG,journals});
@@ -2813,30 +2936,13 @@ def validate_sets(raw_sets, reg):
         return None, "Add at least one volume / issue."
     sets = []
     for i, s in enumerate(raw_sets, start=1):
-        if not isinstance(s, dict):
-            return None, "Bad volume / issue #{}.".format(i)
-        jid = str(s.get("journal", "")).strip().lower()
-        if not ID_RE.match(jid):
-            return None, ("Volume / issue #{}: enter a journal structure ID."
-                          .format(i))
-        entry = entries.get(jid)
+        ref, msg = issue_ref(s, entries, i)
+        if msg:
+            return None, msg
+        jid, entry = ref["journal"], ref["entry"]
+        vol, iss, syear = ref["volume"], ref["issue"], ref["syear"]
         doi_ok = entry is None or bool(entry.get("doi_enabled", True))
         doaj_ok = entry is None or bool(entry.get("doaj_enabled", True))
-        vol = str(s.get("volume", "")).strip()
-        iss = str(s.get("issue", "")).strip()
-        if (vol and not vol.isdigit()) or (iss and not iss.isdigit()):
-            return None, ("Volume / issue #{}: volume and issue must be "
-                          "numbers.".format(i))
-        yearly = bool(entry) and entry.get("structure") == "yearly"
-        syear = str(s.get("syear", "")).strip()
-        if yearly:
-            if not YEAR_RE.match(syear):
-                return None, ("Volume / issue #{}: '{}' is a yearly series — "
-                              "enter its 4-digit year (the harvest targets "
-                              "{}_YYYY).".format(i, jid, jid))
-            iss = ""  # per-year series have no issues
-        else:
-            syear = ""
         mint = bool(s.get("mint"))
         bepress = bool(s.get("bepress"))
         crossref = bool(s.get("crossref"))
@@ -3414,6 +3520,9 @@ def make_handler(session: dict, page: bytes):
                     j["doi_enabled"] = bool(j.get("doi_enabled", True))
                     j["doaj_enabled"] = bool(j.get("doaj_enabled", True))
                     j["doi_pattern"] = str(j.get("doi_pattern", "")).strip()
+                    j["page_numbering"] = str(j.get("page_numbering",
+                                                    "restart"))
+                    j["cover_pages"] = int(j.get("cover_pages", 1))
                 for p in reg.get("doi_patterns", []):  # normalize patterns
                     p["name"] = str(p.get("name", "")).strip()
                     p["template"] = str(p.get("template", ""))
